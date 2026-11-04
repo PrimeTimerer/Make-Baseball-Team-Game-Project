@@ -439,13 +439,22 @@ namespace ps2x::iop::detail
         if (relocate)
         {
             base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            if (base + span < IopMemory::HeapBase)
             {
-                result.error = IopImageLoadError::ArenaExhausted;
-                return result;
+                result.nextModuleCursor = base + span;
+            }
+            else
+            {
+                // The module area below the kernel heap is full (YKTK3 loads 29 IRX, 1.4 MB with its network stack):
+                // the module goes into the kernel heap, where the IOP's sysmem places every module.
+                base = memory.allocate(span, 0x100u);
+                if (base == 0u)
+                {
+                    result.error = IopImageLoadError::ArenaExhausted;
+                    return result;
+                }
             }
             delta = static_cast<int64_t>(base) - minVaddr;
-            result.nextModuleCursor = base + span;
         }
         else
         {

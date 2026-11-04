@@ -7,8 +7,11 @@
 #include "ps2recomp/types.h"
 
 #include <algorithm>
+#include <cctype>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 
 namespace ps2recomp
@@ -42,10 +45,11 @@ namespace ps2recomp
 
         if (useHeaders)
         {
+            // Not ps2_recompiled_functions.h: the functions this file calls directly are declared below (see the end),
+            // so a change to the function map rebuilds the files that changed instead of every generated file.
             ss << "#include <stdexcept>\n";
             ss << "#include \"ps2_runtime_macros.h\"\n";
             ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include <ps2_recompiled_functions.h>\n";
             ss << "#include <ps2_recompiled_stubs.h>\n\n";
             ss << "#include \"ps2_syscalls.h\"\n";
             ss << "#include \"ps2_stubs.h\"\n\n";
@@ -53,6 +57,7 @@ namespace ps2recomp
             ss << "#include \"ps2_log.h\"\n";
             ss << "#endif\n\n";
         }
+        const size_t bodyStart = static_cast<size_t>(ss.tellp());
 
         CodeGenerator::AnalysisResult analysisResult = cg.collectInternalBranchTargets(function, instructions);
         std::vector<uint32_t> resumeTargets(analysisResult.resumeEntryPoints.begin(),
@@ -234,6 +239,29 @@ namespace ps2recomp
         }
 
         ss << "}\n";
-        return ss.str();
+        std::string text = ss.str();
+        if (!useHeaders)
+            return text;
+
+        // Declarations of the generated functions called directly (jump-table switches): unqualified names followed
+        // by the guest-call arguments. ps2_syscalls::/ps2_stubs:: handlers come from their own headers.
+        static constexpr std::string_view kCallArguments = "(rdram, ctx, runtime)";
+        std::set<std::string> called;
+        for (size_t at = text.find(kCallArguments, bodyStart); at != std::string::npos;
+             at = text.find(kCallArguments, at + kCallArguments.size()))
+        {
+            size_t begin = at;
+            while (begin > bodyStart && (std::isalnum(static_cast<unsigned char>(text[begin - 1])) || text[begin - 1] == '_'))
+                --begin;
+            if (begin == at || text[begin - 1] == ':' || text[begin - 1] == '>' || text[begin - 1] == '.')
+                continue;
+            called.insert(text.substr(begin, at - begin));
+        }
+        std::string declarations;
+        for (const std::string &name : called)
+            declarations += "void " + name + "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+        if (!declarations.empty())
+            text.insert(bodyStart, declarations + "\n");
+        return text;
     }
 }

@@ -11,4 +11,8 @@ namespace urban::hangdump
 
     // Once set, dumps also include the guest EE kernel state (threads, PCs, wait reasons, semaphores).
     void setRuntime(PS2Runtime *runtime);
+
+    // On a crash (an exception nothing handles), print the faulting address, the native stack of the crashing thread
+    // and the guest EE state to stderr before the process ends. Windows only.
+    void installCrashReport();
 }

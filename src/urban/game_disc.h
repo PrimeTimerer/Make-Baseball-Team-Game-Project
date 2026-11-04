@@ -6,10 +6,10 @@
 
 namespace urban
 {
-    // Urban Reign (USA), SLUS-21209.
-    inline constexpr const char *kSerial = "SLUS-21209";
-    inline constexpr const char *kBootElfPath = "SLUS_212.09";
-    inline constexpr const char *kBootElfSha256 = "60399090fc69ffdb4c39afd30977ab50890b0e33ed6bd9374e4d9497f4246081";
+    // Pro Yakyuu Team wo Tsukurou! 3 (Japan), SLPM-65853.
+    inline constexpr const char *kSerial = "SLPM-65853";
+    inline constexpr const char *kBootElfPath = "SLPM_658.53";
+    inline constexpr const char *kBootElfSha256 = "3697202792fa559312ae1e0f89dd91514d99034cd754f8a608ec50dbee3fd4e0";
 
     struct DiscCheckResult
     {

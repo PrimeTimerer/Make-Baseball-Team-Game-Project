@@ -7,6 +7,7 @@
 #include "ps2_syscalls.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -72,7 +73,56 @@ namespace urban
         constexpr HleAlias kHleAliases[] = {
             // sceCdLayerSearchFile(fp, name, layer): same first two arguments; this disc is single-layer.
             {"sceCdLayerSearchFile", "sceCdSearchFile", "layer argument ignored (single-layer disc)"},
+            // YKTK3 stops (then unloads) its network modules when no network adapter answers.
+            {"sceSifStopModule", "SifStopModule", "same arguments (modid, args, argp, result)"},
         };
+
+        // sceSifUnloadModule(modid): the IOP emulator does not unload modules (their memory stays allocated); success,
+        // with the module ID as libkernl returns it.
+        void unloadModule(uint8_t *, R5900Context *ctx, PS2Runtime *)
+        {
+            const int32_t moduleId = static_cast<int32_t>(getRegU32(ctx, 4));
+            URBAN_INFO(Hook, "sceSifUnloadModule(" << moduleId << ") -> kept loaded");
+            ctx->pc = getRegU32(ctx, 31);
+            setReturnS32(ctx, moduleId > 0 ? moduleId : -1);
+        }
+
+        // libkernl's loadfile RPC client init in SLPM_658.53 (unnamed; ps2sdk's SifLoadFileInit), called by every
+        // loadfile function: it binds sid 0x80000006 and retries until the IOP's loadfile server answers. The runtime
+        // loads modules itself (the sceSifLoadModule family is HLE'd), so there is no such server and the retry loop
+        // never ends. Failing makes the loadfile calls without a handler (sceSifSearchModuleByName/ByAddress...) return
+        // their error at once.
+        constexpr uint32_t kLoadFileInit = 0x00555FA8u;
+
+        void noLoadFileServer(uint8_t *, R5900Context *ctx, PS2Runtime *)
+        {
+            URBAN_INFO(Hook, "loadfile RPC init -> -1 (no IOP loadfile server) ra=0x" << std::hex << getRegU32(ctx, 31));
+            ctx->pc = getRegU32(ctx, 31);
+            setReturnS32(ctx, -1);
+        }
+
+        // fileio calls with no runtime handler. sceFsInit is HLE'd, so the game's fileio RPC client is never bound:
+        // without a handler these send to no server and wait forever for the IOP's completion command. YKTK3 makes them
+        // for its network settings on the HDD (sceMount "pfs1:"), which this PS2 does not have: they fail with -ENODEV,
+        // as on a console without an HDD.
+        constexpr std::string_view kNoDeviceFileIo[] = {
+            "sceMount", "sceDevctl", "sceFormat", "sceSync", "sceMkdir", "sceDopen", "sceGetstat", "sceChstat", "sceRename",
+            "sceSymlink", "sceReadlink", "sceDread", "sceDclose", "sceIoctl2", "sceLseek64",
+        };
+
+        void noDeviceFileIo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+        {
+            const SdkFunction *function = sdkFunctionAt(ctx->pc);
+            const std::string_view name = function ? function->name : std::string_view("?");
+            std::string path;
+            // A path first, except in the descriptor calls.
+            if (name != "sceDread" && name != "sceDclose" && name != "sceIoctl2" && name != "sceLseek64")
+                if (const char *text = reinterpret_cast<const char *>(getMemPtr(rdram, getRegU32(ctx, 4))))
+                    path.assign(text, strnlen(text, 64));
+            URBAN_INFO(Hook, name << "(\"" << path << "\") -> -ENODEV (no HDD) ra=0x" << std::hex << getRegU32(ctx, 31));
+            ctx->pc = getRegU32(ctx, 31);
+            setReturnS32(ctx, -19);
+        }
 
         // Equivalent of the recompiler's generated stub body: return to $ra unless the handler redirects.
         // The dispatcher has set ctx->pc to the called address, which names the SDK function for tracing.
@@ -216,6 +266,22 @@ namespace urban
                                                              resolvedName + ": " + std::string(alias.why)))
                 ++bound;
         }
+        for (const std::string_view name : kNoDeviceFileIo)
+        {
+            const SdkFunction *function = findSdkFunction(name);
+            if (!function || skipped.count(name))
+                continue;
+            if (FunctionHooks::instance().replace(function->address, std::string(name), &noDeviceFileIo, ReplacementStatus::Hle,
+                                                  "-ENODEV: no HDD, and the fileio RPC client is not bound"))
+                ++bound;
+        }
+        if (const SdkFunction *function = findSdkFunction("sceSifUnloadModule"); function && !skipped.count("sceSifUnloadModule") &&
+            FunctionHooks::instance().replace(function->address, "sceSifUnloadModule", &unloadModule, ReplacementStatus::Hle,
+                                              "module kept loaded, success"))
+            ++bound;
+        if (FunctionHooks::instance().replace(kLoadFileInit, "loadfile_init", &noLoadFileServer, ReplacementStatus::Hle,
+                                              "no IOP loadfile server: fails instead of retrying forever"))
+            ++bound;
         URBAN_INFO(Hook, "HLE: bound " << bound << " SDK functions; not located in this ELF:" << missing.str());
     }
 }

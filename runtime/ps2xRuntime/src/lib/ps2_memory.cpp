@@ -2138,6 +2138,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            // PS2X_DMA_START_LOG=<n>: the first n DMA starts (channel, CHCR, MADR, QWC, TADR, D_CTRL).
+            static std::atomic<long> dmaStartLogLeft{[] { const char *v = std::getenv("PS2X_DMA_START_LOG"); return v ? std::atol(v) : 0L; }()};
+            if (dmaStartLogLeft.load(std::memory_order_relaxed) > 0 && dmaStartLogLeft.fetch_sub(1, std::memory_order_relaxed) > 0)
+                std::fprintf(stderr, "[dma-start] ch=0x%08x chcr=0x%08x madr=0x%08x qwc=0x%x tadr=0x%08x dctrl=0x%x\n", channelBase, value,
+                             madr, qwc, m_ioRegisters[channelBase + 0x30], dctrlIt == m_ioRegisters.end() ? 0u : dctrlIt->second);
 
             // VIF1 with CHCR.DIR = 0 runs the other way: GS -> VIF1 FIFO -> memory (libgraph's store-image reads a
             // VRAM download this way, after TRXDIR = 1). The runtime used to treat the destination buffer as VIF

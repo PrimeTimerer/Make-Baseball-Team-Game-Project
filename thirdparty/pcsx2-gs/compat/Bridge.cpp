@@ -42,16 +42,11 @@ namespace
     Display *g_display = nullptr;
 #endif
 
-    // Urban Reign's entry in PCSX2's GameIndex.yaml (SLUS-21209): alignSprite 1, textureInsideRT 1,
-    // halfPixelOffset 4, nativeScaling 2, getSkipCount GSC_UrbanReign. PCSX2 applies them through its game database;
-    // here they are fixed.
+    // YKTK3's entry in PCSX2's GameIndex.yaml (SLPM-65853) has no GS fixes, so the defaults stay. Fixes found for
+    // upscaling are set here, as PCSX2's game database would.
     void ApplyGameFixes(Pcsx2Config::GSOptions &options)
     {
-        options.UserHacks_AlignSpriteX = true;
-        options.UserHacks_TextureInsideRt = GSTextureInRtMode::InsideTargets;
-        options.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native;
-        options.UserHacks_NativeScaling = GSNativeScaling::Aggressive;
-        options.GetSkipCountFunctionId = GSLookupGetSkipCountFunctionId("GSC_UrbanReign");
+        (void)options;
     }
 
     // Pcsx2GsOpenParams::options: "key=value;key=value".

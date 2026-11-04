@@ -3,48 +3,60 @@
 
 namespace ps2_stubs
 {
+    namespace
+    {
+        // DECI2 is the debug protocol to a development kit's host. A retail console has no DECI2 manager: every call
+        // fails, as its kernel's Deci2Call does.
+        void noDeci2Host(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            (void)rdram;
+            (void)runtime;
+            setReturnS32(ctx, -1);
+        }
+    }
+
     void sceDeci2Close(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2Close", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ExLock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ExLock", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ExRecv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ExRecv", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ExReqSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ExReqSend", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ExSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ExSend", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ExUnLock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ExUnLock", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2Open(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2Open", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2Poll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2Poll", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 
     void sceDeci2ReqSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDeci2ReqSend", rdram, ctx, runtime);
+        noDeci2Host(rdram, ctx, runtime);
     }
 }

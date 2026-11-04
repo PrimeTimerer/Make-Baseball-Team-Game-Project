@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(UrbanReignPC LANGUAGES C CXX)
+project(YKTK3PC LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,11 @@ set(PS2X_ENABLE_AGRESSIVE_LOGS OFF CACHE BOOL "" FORCE)
 set(PS2X_ENABLE_SCCACHE OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(runtime EXCLUDE_FROM_ALL)
+# Building ps2_recomp from source comes before any generated code: then only the recompiler is configured.
+if(URBAN_BUILD_RECOMP AND NOT EXISTS "${CMAKE_SOURCE_DIR}/generated/register_functions.cpp")
+    message(STATUS "Recompiled game code not generated yet: configuring ps2_recomp only")
+    return()
+endif()
 add_subdirectory(src)
 
 # The mod kit's example (modsdk/): ExampleMod.dll (ExampleMod.so on Linux) in build/port/bin/mods/ExampleMod, to try
@@ -61,7 +66,7 @@ if(URBAN_BUILD_MOD_EXAMPLE AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
 endif()
 
 # The mods that ship with the game (mods/): built into build/port/bin/mods/<Name>.
-option(URBAN_BUILD_MODS "Build the mods in mods/ (CoopTool)" ON)
+option(URBAN_BUILD_MODS "Build the mods in mods/ (CoopTool: Urban Reign only)" OFF)
 if(URBAN_BUILD_MODS AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set(URBAN_MODS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/mods")
     add_subdirectory(mods/CoopTool)

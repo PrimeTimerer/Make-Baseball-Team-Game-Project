@@ -139,6 +139,10 @@ namespace ps2x::iop::detail
         void reset()
         {
             memory.reset();
+            // The call stacks (RPC server functions, module_start, callbacks) are IOP RAM in use: owned, as allocated
+            // memory is. sceSifSetDma only sends owned memory, and a server that DMAs a partly filled stack buffer
+            // (YKTK3's MCSERV GetInfo: 0xC0 bytes at sp+0x10) otherwise sent nothing: the game saw no memory card.
+            (void)memory.zeroRam(kCallStackBase, kCallStackLimit - kCallStackBase);
             kernel.reset();
             modules.clear();
             imports.reset();

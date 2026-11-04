@@ -19,3 +19,7 @@ dbus/XInput2).
 
 One local change in a PCSX2 file: `pcsx2/GS/Renderers/Vulkan/VKShaderCache.cpp` also tries `libshaderc.so.1` when
 `libshaderc_shared.so.1` does not load (Debian/Ubuntu's name for shaderc's shared library); marked "Urban Reign port".
+
+YKTK3 port: `pcsx2/GS/GSState.cpp` `Transfer` stops a PACKED packet when finishing its current loop ends the packet or
+the data (YKTK3's GIF data comes in pieces that end inside a loop; PCSX2 then ran a register handler past the end with
+size 0 and wrapped size around); marked "YKTK3 port".

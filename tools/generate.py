@@ -1,7 +1,7 @@
-"""Regenerate the recompiled C++ from your own Urban Reign (USA) disc image.
+"""Regenerate the recompiled C++ from your own YKTK3 (SLPM-65853) disc image.
 
-1. Finds the ISO (game/*.iso, URBAN_ISO or --iso), extracts SLUS_212.09 and checks its hash.
-2. Runs ps2_recomp with recomp/urban.toml into a staging directory.
+1. Finds the ISO (game/*.iso, URBAN_ISO or --iso), extracts SLPM_658.53 and checks its hash.
+2. Runs ps2_recomp with recomp/yktk3.toml into a staging directory.
 3. Copies only changed files into generated/, so an incremental build recompiles only what changed.
 """
 import argparse
@@ -15,8 +15,8 @@ import subprocess
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-BOOT_ELF = "SLUS_212.09"
-BOOT_SHA256 = "60399090fc69ffdb4c39afd30977ab50890b0e33ed6bd9374e4d9497f4246081"
+BOOT_ELF = "SLPM_658.53"
+BOOT_SHA256 = "3697202792fa559312ae1e0f89dd91514d99034cd754f8a608ec50dbee3fd4e0"
 
 
 def iso_read_file(iso_path, name):
@@ -54,7 +54,7 @@ def find_iso(arg):
         cnf = iso_read_file(path, "SYSTEM.CNF")
         if cnf and BOOT_ELF.encode() in cnf:
             return path
-    sys.exit("No disc image found. Put your own Urban Reign (USA) image in game/ or pass --iso <path>.")
+    sys.exit("No disc image found. Put your own YKTK3 (SLPM-65853) image in game/ or pass --iso <path>.")
 
 
 def find_recompiler():
@@ -109,11 +109,11 @@ def main():
     with open(os.path.join(build, BOOT_ELF), "wb") as f:
         f.write(elf)
 
-    # Same config as recomp/urban.toml, but written to a staging dir so unchanged files keep their timestamps.
+    # Same config as recomp/yktk3.toml, but written to a staging dir so unchanged files keep their timestamps.
     staging = os.path.join(build, "generated_staging")
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
-    toml = open(os.path.join(ROOT, "recomp", "urban.toml"), encoding="utf-8").read()
+    toml = open(os.path.join(ROOT, "recomp", "yktk3.toml"), encoding="utf-8").read()
     toml = re.sub(r'(?m)^input\s*=.*$', f'input = "{os.path.join(build, BOOT_ELF).replace(os.sep, "/")}"', toml)
     toml = re.sub(r'(?m)^output\s*=.*$', f'output = "{staging.replace(os.sep, "/")}"', toml)
     # ghidra_output is written relative to recomp/; the staged copy lives elsewhere, so make it absolute.
@@ -121,7 +121,13 @@ def main():
         path = os.path.normpath(os.path.join(ROOT, "recomp", m.group(1)))
         return f'ghidra_output = "{path.replace(os.sep, "/")}"' if os.path.exists(path) else '# ghidra map missing: ' + m.group(1)
     toml = re.sub(r'(?m)^ghidra_output\s*=\s*"([^"]+)"', absolute_ghidra, toml)
-    staged_toml = os.path.join(build, "urban.staging.toml")
+    # Jump-table cases as internal entry points (tools/ghidra_functions.py writes the list).
+    entries_path = os.path.join(ROOT, "recomp", "yktk3_entry_points.txt")
+    if os.path.exists(entries_path):
+        entries = [line.strip() for line in open(entries_path, encoding="utf-8") if line.strip() and not line.startswith("#")]
+        toml = re.sub(r'(?m)^\[general\]\s*$', lambda m: m.group(0) + "\nentry_points = [" + ", ".join(f'"{e}"' for e in entries) + "]",
+                      toml, count=1)
+    staged_toml = os.path.join(build, "yktk3.staging.toml")
     open(staged_toml, "w", encoding="utf-8").write(toml)
 
     cmd = [find_recompiler(), staged_toml]

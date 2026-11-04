@@ -48,6 +48,7 @@ set(URBAN_HOST_SOURCES
     urban/mods.cpp
     urban/mod_loader.cpp
     urban/native_profile.cpp
+    urban/opening.cpp
     urban/sha256.cpp
     urban/thread_policy.cpp
 )
@@ -79,6 +80,15 @@ else()
         endif()
     endforeach()
     list(REMOVE_ITEM URBAN_GENERATED_SOURCES ${URBAN_HUGE_SOURCES})
+    if(NOT URBAN_HUGE_SOURCES)
+        # No generated file is above the threshold (YKTK3): one empty source keeps the library and the layout
+        # URBAN_GAME_CODE_LIBRARY expects.
+        set(URBAN_HUGE_EMPTY "${CMAKE_CURRENT_BINARY_DIR}/urban_game_code_huge_empty.cpp")
+        if(NOT EXISTS "${URBAN_HUGE_EMPTY}")
+            file(WRITE "${URBAN_HUGE_EMPTY}" "// No generated source is above URBAN_HUGE_SOURCE_BYTES.\n")
+        endif()
+        set(URBAN_HUGE_SOURCES "${URBAN_HUGE_EMPTY}")
+    endif()
 
     add_library(urban_game_code_huge STATIC ${URBAN_HUGE_SOURCES})
     target_include_directories(urban_game_code_huge PUBLIC "${URBAN_GENERATED_DIR}")
@@ -182,6 +192,7 @@ if(URBAN_VU1_SOURCES)
 endif()
 
 set_target_properties(urban PROPERTIES
+    OUTPUT_NAME "yktk3"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )

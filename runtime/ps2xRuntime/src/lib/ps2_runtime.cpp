@@ -1015,13 +1015,20 @@ bool PS2Runtime::initialize(const char *title)
         // Real vsync (PS2X_VSYNC=0 goes back to the software 60 FPS limiter): the limiter was not aligned with the
         // monitor's refresh, so presents landed at a drifting phase and frames were shown for 1 or 3 refreshes.
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN | (ps2_host_display::vsyncEnabled() ? FLAG_VSYNC_HINT : 0u));
+        // PS2X_START_HIDDEN=1 (scripted test runs): the window is never shown, so a test does not come up over the
+        // desktop; the game runs on (FLAG_WINDOW_ALWAYS_RUN), with PS2X_PCSX2_SNAPSHOT_DIR and PS2X_PAD_FIFO.
+        if (const char *hidden = std::getenv("PS2X_START_HIDDEN"); hidden && *hidden == '1')
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         if (ps2_host_display::startMaximized)
             MaximizeWindow();
         if (ps2_host_display::startFullscreen)
             ToggleBorderlessWindowed();
         SetExitKey(KEY_NULL);
-        InitAudioDevice();
+        // PS2X_AUDIO_MUTE=1 (scripted test runs): no audio device is opened at all, so nothing can be heard; the
+        // emulated SPU2 output is dropped (ps2_audio.cpp without a stream).
+        if (const char *mute = std::getenv("PS2X_AUDIO_MUTE"); !(mute && *mute && *mute != '0'))
+            InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         GSSharedPresent::CaptureHostContext();
         ps2xHostVsyncSetWindow(GetWindowHandle()); // the vblank lock follows the window's monitor (Kernel/host_vsync.cpp)
@@ -1383,6 +1390,17 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // Host functions at guest addresses outside the dense table: code a game loads at run time (YKTK3's OPMV overlay
+    // at 0x01c7f000) is not in the ELF the table was generated from. Filled at startup, before the game runs; read
+    // when a call misses the table.
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_extraFunctions;
+
+    PS2Runtime::RecompiledFunction extraFunction(uint32_t address)
+    {
+        const auto it = g_extraFunctions.find(address);
+        return it != g_extraFunctions.end() ? it->second : nullptr;
+    }
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
@@ -1390,6 +1408,11 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
     uint32_t slot = 0u;
     if (!generatedFunctionTableSlot(address, slot))
     {
+        if ((address & 3u) == 0u && address < PS2_RAM_SIZE)
+        {
+            g_extraFunctions[address] = func;
+            return true;
+        }
         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
                   << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
                   << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
@@ -1409,7 +1432,9 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot))
+        return g_ps2RecompiledFunctionTable[slot] != nullptr;
+    return extraFunction(address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1448,6 +1473,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         {
             return fn;
         }
+    }
+    else if (RecompiledFunction fn = extraFunction(address))
+    {
+        return fn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
@@ -1698,6 +1727,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         uint32_t slot = 0u;
         if (generatedFunctionTableSlot(targetPc, slot))
             targetFn = g_ps2RecompiledFunctionTable[slot];
+        else
+            targetFn = extraFunction(targetPc);
     }
     else if (hasFunction(targetPc))
         targetFn = lookupFunction(targetPc);

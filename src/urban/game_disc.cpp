@@ -29,7 +29,7 @@ namespace urban
         }
 
         // Any ISO whose SYSTEM.CNF boots our ELF counts; the boot ELF hash is checked afterwards.
-        bool bootsUrbanReign(const std::filesystem::path &path)
+        bool bootsGame(const std::filesystem::path &path)
         {
             // PS2CdImage is a singleton; verifyDiscAndPrepare reopens the chosen image afterwards.
             PS2CdImage &probe = PS2CdImage::instance();
@@ -58,7 +58,7 @@ namespace urban
             for (const auto &entry : std::filesystem::directory_iterator(root, error))
             {
                 if (entry.is_regular_file(error) && lower(entry.path().extension().string()) == ".iso" &&
-                    bootsUrbanReign(entry.path()))
+                    bootsGame(entry.path()))
                 {
                     return entry.path();
                 }

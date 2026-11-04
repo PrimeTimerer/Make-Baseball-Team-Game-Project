@@ -292,6 +292,51 @@ namespace urban::hangdump
             CloseHandle(snapshot);
             std::fflush(stderr);
         }
+
+        LONG WINAPI reportCrash(EXCEPTION_POINTERS *info)
+        {
+            static std::atomic<bool> reported{false};
+            if (reported.exchange(true))
+                return EXCEPTION_CONTINUE_SEARCH;
+            HANDLE process = GetCurrentProcess();
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+            SymInitialize(process, nullptr, TRUE);
+            const EXCEPTION_RECORD *record = info->ExceptionRecord;
+            std::fprintf(stderr, "[crash] exception 0x%08lx at %s, thread %lu %s\n", record->ExceptionCode,
+                         symbolize(process, reinterpret_cast<DWORD64>(record->ExceptionAddress)).c_str(), GetCurrentThreadId(),
+                         threadName(GetCurrentThread()).c_str());
+            if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
+                std::fprintf(stderr, "[crash] %s of 0x%llx\n", record->ExceptionInformation[0] ? "write" : "read",
+                             static_cast<unsigned long long>(record->ExceptionInformation[1]));
+            CONTEXT context = *info->ContextRecord;
+            STACKFRAME64 frame{};
+            frame.AddrPC.Offset = context.Rip;
+            frame.AddrPC.Mode = AddrModeFlat;
+            frame.AddrFrame.Offset = context.Rbp;
+            frame.AddrFrame.Mode = AddrModeFlat;
+            frame.AddrStack.Offset = context.Rsp;
+            frame.AddrStack.Mode = AddrModeFlat;
+            for (int i = 0; i < 40 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, GetCurrentThread(), &frame, &context, nullptr,
+                                                  SymFunctionTableAccess64, SymGetModuleBase64, nullptr) &&
+                            frame.AddrPC.Offset != 0;
+                 ++i)
+                std::fprintf(stderr, "[crash]     %s\n", symbolize(process, frame.AddrPC.Offset).c_str());
+            if (PS2Runtime *runtime = g_runtime.load())
+            {
+                const R5900Context &cpu = runtime->cpu();
+                std::fprintf(stderr, "[crash] guest pc=0x%08x ra=0x%08x sp=0x%08x a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x v0=0x%08x\n",
+                             cpu.pc, getRegU32(&cpu, 31), getRegU32(&cpu, 29), getRegU32(&cpu, 4), getRegU32(&cpu, 5),
+                             getRegU32(&cpu, 6), getRegU32(&cpu, 7), getRegU32(&cpu, 2));
+            }
+            dumpGuestKernel();
+            std::fflush(stderr);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
+    void installCrashReport()
+    {
+        SetUnhandledExceptionFilter(&reportCrash);
     }
 
     void startFromEnvironment()
@@ -319,6 +364,7 @@ namespace urban::hangdump
         }).detach();
     }
 #else
+    void installCrashReport() {}
     void startFromEnvironment() {}
 #endif
 }

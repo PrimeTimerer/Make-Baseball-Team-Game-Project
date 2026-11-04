@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <ps2_log.h>
 
@@ -42,6 +43,9 @@ namespace
         uint64_t generation = ~0ull;
         uint64_t imageHash = 0;
         std::unordered_map<uint64_t, uint64_t> entryCalls;
+        // Images already on disk: YKTK3 uploads new microcode (MPG) for most draws, and a file check at each change made
+        // a capture run about 10x slower.
+        std::unordered_set<uint64_t> written;
         uint64_t calls = 0;
     };
 
@@ -382,16 +386,19 @@ namespace
             capture->memory = memory;
             capture->generation = generation;
             capture->imageHash = fnv1a64(vuCode, codeSize);
-            char name[64];
-            std::snprintf(name, sizeof(name), "vu1_%016llx.bin", static_cast<unsigned long long>(capture->imageHash));
-            const std::filesystem::path path = capture->directory / name;
-            std::error_code error;
-            if (!std::filesystem::exists(path, error))
+            if (capture->written.insert(capture->imageHash).second)
             {
-                if (FILE *file = std::fopen(path.string().c_str(), "wb"))
+                char name[64];
+                std::snprintf(name, sizeof(name), "vu1_%016llx.bin", static_cast<unsigned long long>(capture->imageHash));
+                const std::filesystem::path path = capture->directory / name;
+                std::error_code error;
+                if (!std::filesystem::exists(path, error))
                 {
-                    std::fwrite(vuCode, 1, codeSize, file);
-                    std::fclose(file);
+                    if (FILE *file = std::fopen(path.string().c_str(), "wb"))
+                    {
+                        std::fwrite(vuCode, 1, codeSize, file);
+                        std::fclose(file);
+                    }
                 }
             }
         }
@@ -1467,6 +1474,17 @@ bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, 
         xa.issueCycle != xb.issueCycle || xa.currentTagEop != xb.currentTagEop ||
         std::memcmp(xa.packet.data(), xb.packet.data(), std::min<size_t>(xa.copiedBytes, xa.packet.size())) != 0)
         note("xgkick");
+    // The first differing qword (compiled / interpreted), to tell float rounding from a wrong value.
+    const auto qwords = [](const uint8_t *x, const uint8_t *y, size_t offset)
+    {
+        uint32_t wx[4], wy[4];
+        std::memcpy(wx, x + offset, 16u);
+        std::memcpy(wy, y + offset, 16u);
+        char text[128];
+        std::snprintf(text, sizeof(text), "%08x,%08x,%08x,%08x/%08x,%08x,%08x,%08x", wx[0], wx[1], wx[2], wx[3], wy[0], wy[1], wy[2],
+                      wy[3]);
+        return std::string(text);
+    };
     if (std::memcmp(vuData, shadowData.data(), dataSize) != 0)
     {
         uint32_t first = 0;
@@ -1474,10 +1492,25 @@ bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, 
             ++first;
         char text[64];
         std::snprintf(text, sizeof(text), "mem@%04x", first);
-        note(text);
+        note(text + std::string("=") + qwords(vuData, shadowData.data(), std::min<uint32_t>(first & ~15u, dataSize - 16u)));
     }
     if (realSink.packets != shadowSink.packets)
-        note("packets " + std::to_string(realSink.packets.size()) + "/" + std::to_string(shadowSink.packets.size()));
+    {
+        std::string where;
+        for (size_t p = 0; p < std::min(realSink.packets.size(), shadowSink.packets.size()) && where.empty(); ++p)
+        {
+            const auto &x = realSink.packets[p];
+            const auto &y = shadowSink.packets[p];
+            if (x == y || x.size() != y.size())
+                continue;
+            size_t first = 0;
+            while (first < x.size() && x[first] == y[first])
+                ++first;
+            where = " #" + std::to_string(p) + "@" + std::to_string(first & ~size_t{15}) + "=" +
+                    qwords(x.data(), y.data(), std::min(first & ~size_t{15}, x.size() - 16u));
+        }
+        note("packets " + std::to_string(realSink.packets.size()) + "/" + std::to_string(shadowSink.packets.size()) + where);
+    }
 
     ++stats.runs;
     if (observableOnly && memory)

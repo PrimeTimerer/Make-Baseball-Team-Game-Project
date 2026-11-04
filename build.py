@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Urban Reign PC: build and run.
+"""YKTK3 PC: build and run.
 
     python build.py              numbered menu
-    python build.py build        configure (first time) and compile urban.exe (urban on Linux)
-    python build.py play [args]  run urban.exe (extra arguments go to it)
+    python build.py build        configure (first time) and compile yktk3.exe (urban on Linux)
+    python build.py play [args]  run yktk3.exe (extra arguments go to it)
     python build.py generate     recompile the game code from your disc image in game/
     python build.py configure    run CMake again
     python build.py bench        measure frames/s on a savestate from bench/states
     python build.py release      the release folder and ZIP in build/release (no disc data); on Linux the .tar.gz and
                                  the .deb, built in the Steam Runtime container (docs/LINUX.md)
 
-Needs Python 3.10+ and your own Urban Reign (USA) disc image in game/. Windows: Visual Studio 2022 with C++ (cl, CMake
+Needs Python 3.10+ and your own YKTK3 (SLPM-65853) disc image in game/. Windows: Visual Studio 2022 with C++ (cl, CMake
 and Ninja come with it; set VSROOT if it is not in the default folder). Linux: Clang, CMake, Ninja and the libraries of
 tools/linux/install_deps.sh (docs/LINUX.md).
 """
@@ -25,7 +25,7 @@ WINDOWS = os.name == "nt"
 # Windows: build/port with MSVC; Linux: build/linux with Clang (docs/LINUX.md).
 BUILD = ROOT / "build" / ("port" if WINDOWS else "linux")
 BIN = BUILD / "bin"
-EXE = "urban.exe" if WINDOWS else "urban"
+EXE = "yktk3.exe" if WINDOWS else "yktk3"
 VSENV = ROOT / "tools" / "win" / "vsenv.cmd"
 JOBS = os.environ.get("URBAN_JOBS", "8" if WINDOWS else str(os.cpu_count() or 8))
 
@@ -45,8 +45,8 @@ def in_vs(*cmd):
 def game_running():
     if not WINDOWS:
         return subprocess.run(["pgrep", "-x", EXE], capture_output=True).returncode == 0
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq urban.exe", "/NH"], capture_output=True, text=True).stdout
-    return "urban.exe" in out.lower()
+    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq yktk3.exe", "/NH"], capture_output=True, text=True).stdout
+    return "yktk3.exe" in out.lower()
 
 
 def has_generated_code():
@@ -195,9 +195,9 @@ elif (ROOT / "launcher" / "urban_launcher.py").exists():
 def menu():
     actions = [action for _, action, _ in STEPS] + [action for _, action in UTILITIES]
     while True:
-        print("\n=== Urban Reign PC: build ===")
+        print("\n=== YKTK3 PC: build ===")
         if not has_disc_image():
-            print("  (no disc image in game/ yet: copy your Urban Reign (USA) .iso there)")
+            print("  (no disc image in game/ yet: copy your YKTK3 (SLPM-65853) .iso there)")
         for i, (text, _, done) in enumerate(STEPS, 1):
             mark = "  [done]" if done and done() else ""
             print(f"  Step {i}) {text}{mark}")

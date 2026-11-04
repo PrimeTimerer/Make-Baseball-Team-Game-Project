@@ -16,6 +16,7 @@
 #include "urban/game_disc.h"
 #include "urban/hang_dump.h"
 #include "urban/native_profile.h"
+#include "urban/opening.h"
 #include "urban/thread_policy.h"
 #include "urban/hle_bindings.h"
 #include "urban/log.h"
@@ -100,7 +101,7 @@ namespace
         std::swprintf(text, 256,
                       L"This processor does not support %hs, which this build of Urban Reign needs.\n"
                       L"Este processador não tem %hs, que esta versão de Urban Reign precisa.", missing, missing);
-        MessageBoxW(nullptr, text, L"Urban Reign", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, text, L"YKTK3", MB_OK | MB_ICONERROR);
         return false;
     }
 #else
@@ -385,11 +386,11 @@ namespace
                   << " (old file: " << backup.filename().string() << ")" << std::endl;
     }
 
-    constexpr const char *kDefaultConfig = R"(# Urban Reign settings (read when urban.exe starts; a launcher edits this file).
+    constexpr const char *kDefaultConfig = R"(# YKTK3 settings (read when yktk3.exe starts; a launcher edits this file).
 # An environment variable with the same effect (e.g. PS2X_GS_SCALE) wins over this file.
 
 [Game]
-# The disc image (.iso) of Urban Reign (SLUS-21209). Empty = look for one in the "game" folder.
+# The disc image (.iso) of Pro Yakyuu Team wo Tsukurou! 3 (SLPM-65853). Empty = look for one in the "game" folder.
 Iso=
 
 [Mods]
@@ -431,15 +432,15 @@ Gamma=50
 TVShader=0
 # Screen filter (the image scaled to the window): 0 = none (sharp pixels), 1 = smooth (default), 2 = sharp.
 ScreenFilter=1
-# Dithering: 0 = off, 1 = scaled, 2 = unscaled (default), 3 = force 32 bit.
-Dithering=2
+# Dithering: 0 = off (default: YKTK3's players get black dots on white uniforms with it), 1 = scaled, 2 = unscaled,
+# 3 = force 32 bit.
+Dithering=0
 # Blending accuracy: 0 = minimum ... 1 = basic (default) ... 5 = maximum (heavier).
 BlendingAccuracy=1
 # Stretch the image to the window: 1 = yes, 0 = keep the aspect ratio below with black bars.
 Stretch=0
-# Aspect ratio: 16:9 = real widescreen (the game's own 16:9 mode: the camera shows more of the scene), 4:3 = the
-# original picture, auto = as the game's option (Options > 4:3 / 16:9).
-AspectRatio=16:9
+# Aspect ratio: 4:3 = the original picture (the only one for now: the game has no 16:9 mode of its own).
+AspectRatio=4:3
 # HD textures (PCSX2 texture packs, PNG/DDS): 1 = use them, 0 = no.
 HDTextures=1
 # Pack folder (the one with the "replacements" subfolder); empty = textures\SLUS-21209 next to urban.exe or in the repository.
@@ -450,10 +451,6 @@ PreloadHDTextures=0
 [Runtime]
 # FPS counter (F3 toggles it in game). 1 = on at start.
 PS2X_SHOW_FPS=0
-
-# Progressive scan (480p, up to 60 FPS), Michael's "Force Progressive Scan" patch. On by default.
-# 0 = back to the interlaced mode (30 FPS).
-URBAN_PROGRESSIVE=1
 
 # IOP on its own thread (on by default). Remove the # below to go back to the old mode and compare.
 #PS2X_IOP_THREAD=0
@@ -1386,7 +1383,7 @@ int main(int argc, char *argv[])
             const char *fullscreen = std::getenv("URBAN_START_FULLSCREEN"); // config.ini [Video] StartFullscreen
             ps2_host_display::setStartFullscreen(fullscreen && *fullscreen == '1');
         }
-        if (!runtime.initialize("Urban Reign"))
+        if (!runtime.initialize("YKTK3"))
         {
             URBAN_ERROR(Boot, "runtime initialization failed");
             return 1;
@@ -1417,7 +1414,7 @@ int main(int argc, char *argv[])
                 modDirs.push_back(exeDir / "mods");
             urban::modloader::loadAll(modDirs, dlls ? dlls : "", portuguese ? "pt" : "en", runtime.memory().getRDRAM());
         }
-        urban::aspect::install(runtime.memory().getRDRAM());
+        // urban::aspect::install patches Urban Reign's screen option; YKTK3 has no 16:9 mode of its own (4:3 only for now).
         PS2Runtime::setIoPaths(paths);
 
         const char *missingPolicy = std::getenv("URBAN_MISSING_FUNCTION");
@@ -1433,19 +1430,11 @@ int main(int argc, char *argv[])
 #if URBAN_HAS_VU1_PROGRAMS
         registerGeneratedVu1Programs(); // VU1 microcode compiled ahead of time (generated/vu1)
 #endif
-        installProgressivePatch(runtime);
-        installGsHandlerGuard(runtime);
-        installMultitapPort1(runtime);
-        installEightControllers(runtime);
-        installExtraFighterMoves(runtime);
-        urban::animdecoder::install(runtime);
-        // FPS overlay (F3): 0x128dc0 runs once per iteration of the game's main loop (one game frame).
-        urban::FunctionHooks::instance().observeEntry(0x128dc0u, "game_frame", [](uint8_t *, R5900Context *, PS2Runtime *runtime) {
-            ps2_host_display::noteGameFrame();
-            urban::nativeprofile::noteGameFrame();
-            ps2x::asyncvif::traceEvent('F', static_cast<uint32_t>(runtime->eeScheduler().currentCycle() >> 10)); // EE cycle / 1024
-        });
+        // Urban Reign's game hooks (progressive scan, GS handler guard, multitap, 8 controllers, extra moves, animation
+        // decoder, the game-frame counter on its main loop) patch Urban Reign addresses and are not installed for YKTK3.
+        urban::opening::install();
         urban::hangdump::setRuntime(&runtime);
+        urban::hangdump::installCrashReport();
         urban::calltrace::installFromEnvironment(runtime);
         urban::FunctionHooks::instance().logBindings();
         urban::callprofile::installFromEnvironment(runtime); // last: wraps whatever the slots hold now

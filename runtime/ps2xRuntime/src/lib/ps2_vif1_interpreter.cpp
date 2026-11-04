@@ -1,6 +1,8 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <cstdlib>
@@ -33,6 +35,17 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    // The GS front end continues a GIF tag across packets (PS2X_GIF_CONTINUATION, on by default; gs_frontend.cpp) and
+    // PCSX2's GS keeps its own GIF path state, so the rest of an IMAGE tag cut by the end of a DIRECT goes on as it is.
+    // Re-tagged (an IMAGE tag of its own, below) it was read twice: its tag became image data and the image's last qword
+    // a GIF tag, whose random register writes included SIGNAL and stalled the GS for good (YKTK3's texture uploads:
+    // DIRECTHL 5 = the TRX registers and the IMAGE tag, then DIRECTHL 16384 = the image).
+    bool gifTagContinues()
+    {
+        static const bool enabled = [] { const char *v = std::getenv("PS2X_GIF_CONTINUATION"); return !v || *v != '0'; }();
+        return enabled;
+    }
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -475,6 +488,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    // PS2X_VIF1_LOG=<n>: the first n VIF1 transfers (size and first words).
+    static std::atomic<long> vif1LogLeft{[] { const char *v = std::getenv("PS2X_VIF1_LOG"); return v ? std::atol(v) : 0L; }()};
+    if (vif1LogLeft.load(std::memory_order_relaxed) > 0 && vif1LogLeft.fetch_sub(1, std::memory_order_relaxed) > 0)
+    {
+        uint32_t w[4]{};
+        std::memcpy(w, data, std::min<uint32_t>(sizeBytes, 16u));
+        std::fprintf(stderr, "[vif1] %u bytes: %08x %08x %08x %08x\n", sizeBytes, w[0], w[1], w[2], w[3]);
+    }
+
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
@@ -669,7 +691,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     const uint32_t packetBytes = (qwCount - imageQw) * 16u;
                     submitGifPacket(GifPathId::Path2, packets, packetBytes, true, directHl);
 
-                    const uint32_t pendingImageQw = pendingGifImageQwc(packets, packetBytes);
+                    const uint32_t pendingImageQw = gifTagContinues() ? 0u : pendingGifImageQwc(packets, packetBytes);
                     if (pendingImageQw != 0u)
                     {
                         m_vif1PendingPath2ImageQwc = pendingImageQw;

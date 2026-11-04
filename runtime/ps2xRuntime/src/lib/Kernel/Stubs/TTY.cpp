@@ -42,18 +42,42 @@ namespace ps2_stubs
         TODO_NAMED("sceTtyHandler", rdram, ctx, runtime);
     }
 
+    // The DECI2 "ttyp" channel of a development kit, which newlib's write()/read() use for stdout/stderr/stdin
+    // (YKTK3's printf). A retail console has no host on it: init succeeds, writes go to the log, reads get nothing.
     void sceTtyInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyInit", rdram, ctx, runtime);
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 1);
     }
 
     void sceTtyRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyRead", rdram, ctx, runtime);
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 0);
     }
 
     void sceTtyWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceTtyWrite", rdram, ctx, runtime);
+        // sceTtyWrite(buf, len)
+        const uint32_t buffer = getRegU32(ctx, 4);
+        const int32_t length = static_cast<int32_t>(getRegU32(ctx, 5));
+        if (length > 0)
+        {
+            std::string text = readPs2CStringBounded(rdram, runtime, buffer, std::min<size_t>(static_cast<size_t>(length), 1024u));
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                text.pop_back();
+            uint32_t count = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_printfLogMutex);
+                count = ++g_printfLogCount;
+            }
+            if (count <= kMaxPrintfLogs && !text.empty())
+                std::cerr << "[EE tty] " << sanitizeForLog(text) << std::endl;
+            else if (count == kMaxPrintfLogs + 1)
+                std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
+        }
+        setReturnS32(ctx, length);
     }
 }

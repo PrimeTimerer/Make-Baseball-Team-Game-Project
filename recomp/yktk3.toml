@@ -1,0 +1,20 @@
+[general]
+input = "../build/SLPM_658.53"
+output = "../generated"
+single_file_output = false
+output_worker_threads = 16
+# Function map from Ghidra (tools/ghidra_functions.py): the real functions of the Ghidra export plus the SDK entry
+# points the runtime replaces by address. Kept in the repository, so generating the code needs no Ghidra.
+ghidra_output = "yktk3_functions.csv"
+# Merge: keep the recompiler's own discoveries (functions Ghidra misses, reached only through pointers).
+ghidra_map_merge = true
+patch_syscalls = false
+patch_cop0 = false
+patch_cache = false
+# The ELF has no symbols; SDK functions are identified by address and bound to runtime handlers at start-up
+# (src/urban/hle_bindings.cpp with src/urban/sdk_functions.inc), so nothing is stubbed by name here.
+auto_stub_by_name = false
+# Tail jumps must go through the dispatch table, or replacing a function at run time would miss those callers.
+direct_tail_calls = false
+skip = []
+stubs = []

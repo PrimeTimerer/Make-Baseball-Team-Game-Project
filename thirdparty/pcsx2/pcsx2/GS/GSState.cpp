@@ -3399,6 +3399,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 						} while (path.StepReg() && size > 0 && path.reg != 0);
 					}
 
+					// YKTK3 port: the loop above can end the packet or use up the data (the runtime sends GIF data in
+					// pieces that may end inside a loop). Going on would run a handler past the end with size 0 and wrap
+					// size around; the rest comes with the next tag or the next transfer.
+					if (path.nloop == 0 || size == 0)
+						break;
+
 					// all data available? usually is
 
 					total = path.nloop * path.nreg;
