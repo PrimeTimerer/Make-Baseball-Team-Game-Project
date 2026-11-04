@@ -1,149 +1,50 @@
-<div align="center">
+# Make Baseball Team Game Project
 
-# Urban Reign — PC Port
+**プロ野球チームをつくろう！3** (PlayStation 2, SEGA 2005, SLPM-65853)의 PC 네이티브 포트입니다.
+게임의 EE 코드를 C++로 정적 재컴파일(static recompilation)하고, 그래픽은 PCSX2의 GS를 써서 고해상도로 그립니다.
 
-**English** · [Português (Brasil)](README.pt-BR.md)
+> **게임은 포함되어 있지 않습니다.** 직접 가지고 있는 디스크로 만든 이미지(`.iso`, SLPM-65853)가 있어야 하며,
+> 실행할 때 디스크의 실행 파일(`SLPM_658.53`)을 SHA-256으로 대조해 정품 디스크에서만 동작합니다.
+> 게임과 그 안의 모든 데이터·코드의 권리는 **SEGA**에 있습니다. 이 저장소는 SEGA와 관계없는 비영리 팬 프로젝트이며,
+> 게임의 코드나 데이터를 담고 있지 않습니다(변환된 게임 코드와 VU1 캡처는 각자의 ISO에서 로컬로 만들어집니다).
 
-**Urban Reign (PS2) running natively on Windows and Linux: 60 FPS, high resolution, HD textures, up to 8 players.**
+## 현재 상태
 
-![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-FCC624?logo=linux&logoColor=black)
-![Version](https://img.shields.io/badge/version-1.4.0-d9261c)
-![Status](https://img.shields.io/badge/status-beta-yellowgreen)
-![Based on](https://img.shields.io/badge/based%20on-PS2Recomp-8A2BE2)
-![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+- 부팅 → 시스템 데이터(메모리카드) → SEGA 로고 → 타이틀 → 메뉴 → 운영(2D) 화면
+- 3D 경기: VU1 마이크로코드를 미리 컴파일해 실시간 속도(60 fields/s)
+- 메모리카드: 게임 자체의 MCMAN/MCSERV + `Mcd001.ps2`(PCSX2 형식). 폴더형 세이브 가져오기 지원
+- 오프닝 무비(OPMV)는 아직 건너뜀
 
-### [⬇ Download the latest release](../../releases/latest)
+## 빌드 (Windows)
 
-</div>
+필요한 것: Visual Studio 2022(C++), CMake, Ninja, Python 3, 그리고 본인의 디스크 이미지.
+
+```bat
+copy <디스크 이미지>.iso game\
+py -3 build.py configure -DURBAN_BUILD_RECOMP=ON -DURBAN_BUILD_TOOLS=ON
+py -3 build.py generate --iso game\<디스크 이미지>.iso
+py -3 build.py build
+build\port\bin\yktk3.exe
+```
+
+- 첫 전체 빌드는 약 35~50분 걸립니다(생성 코드 2.5만 파일). 이후에는 바뀐 파일만 다시 빌드합니다.
+- 3D 속도용 VU1 코드: `PS2X_VU1_CAPTURE=build\vu1_capture`로 경기를 돌린 뒤 `py -3 tools\vu1_generate.py`, 다시 빌드.
+- 설정: `build\port\bin\config.ini` (내부 해상도 1~8배, 화면비, 필터 등).
+- 경기 배속(게임 기능): 경기 중 R2 올림, L2 내림.
+
+## 크레딧
+
+- [Urban Reign PC port](https://github.com/thiagordsfx/urban-reign-recomp) (thiagordsfx): 이 포트의 기반(런타임, PCSX2 GS
+  연동, 빌드). 원래 README는 `docs/upstream/`에 있습니다.
+- [PS2Recomp](https://github.com/ran-j/PS2Recomp)와 그 포크들, [PCSX2](https://github.com/PCSX2/pcsx2)의 GS,
+  raylib, SDL3 외 `thirdparty/README.md`의 라이브러리들.
+
+## 라이선스
+
+GPL-3.0 (`LICENSE`). 게임 자체는 SEGA의 저작물이며 이 라이선스의 대상이 아닙니다.
 
 ---
 
-> [!IMPORTANT]
-> The game is **not included**. You need **your own copy** of Urban Reign for the PS2 (USA, `SLUS-21209`) as a disc
-> image (`.iso`).
-
-## What is this?
-
-A PC port of *Urban Reign* made by **static recompilation**: the game's PS2 code was translated into C++ and compiled
-as a Windows and Linux program, instead of being emulated. The graphics use PCSX2's renderer (DirectX 11 on Windows,
-Vulkan on Linux), so you get high internal resolutions, texture filters and HD texture packs.
-
-- 60 FPS (progressive scan), including 8-fighter brawls
-- Real widescreen (16:9, the camera shows more of the scene) or the original 4:3
-- 1x to 8x internal resolution, FXAA, sharpening, TV shaders
-- HD texture packs (PCSX2 format)
-- Xbox, PlayStation and other controllers, with vibration; multitap for up to 8 players
-- Memory card and save states (F5 / F9)
-
-## Status
-
-<a href="docs/status/details.en.md"><img src="docs/status/map.en.svg" alt="Port status map: Sony SDK library functions and PS2 hardware components, colored by status" width="100%"></a>
-
-Every Sony SDK library the game links and every PS2 hardware component it uses, by status. Click the map for the
-details.
-
-## Download and play
-
-### Windows
-
-1. Download the ZIP from the [**latest release**](../../releases/latest) and extract it anywhere.
-2. Open **`Urban Reign.exe`**.
-3. In the **Game** tab, pick your Urban Reign disc image (`.iso`).
-4. Press **PLAY**.
-
-**HD textures (optional):** download the
-[Urban Reign Enhanced HD Textures Pack](https://gbatemp.net/threads/urban-reign-enhanced-hd-textures-pack-updated.665094/)
-and extract it into the `game\textures` folder (it should end up as `game\textures\SLUS-21209\replacements`).
-
-**Mods:** put mods (a folder with a `.dll`) or PCSX2 `.pnach` patches in `game\mods` and turn them on in the
-**Mods** tab; their options are in the in-game menu (**F2**). To make your own: the [mod kit](modsdk/README.md).
-The **CoopTool** mod comes with the game (`mods/CoopTool`): Multiplayer with up to 8 fighters (up to 8 humans, the
-rest bots, every one for himself or custom teams, Free Mode stages) and Free Mode missions with up to 4 players (number
-of enemies, objective, each fighter's character / AI / strength / health, optional partner, enhanced camera with
-L3 / R3). Its **How to use** tab explains each part.
-
-### Linux
-
-From the [**latest release**](../../releases/latest), pick one:
-
-- **`.deb`** (Debian, Ubuntu, Mint...): `sudo apt install ./urban-reign_1.4.0_amd64.deb` and open **Urban Reign** from
-  the applications menu. Settings, saves and your own mods are in `~/.local/share/urban-reign` (HD textures go in
-  `~/.local/share/urban-reign/textures/SLUS-21209`).
-- **`.tar.gz`** (any distribution): extract it and run **`urban-reign`**; everything stays in that folder, as with the
-  Windows ZIP (`./install-shortcut.sh` adds it to the menu).
-
-Both open the same launcher as on Windows (pick the `.iso` in the **Game** tab and press **PLAY**). The launcher uses
-the system's GTK with WebKit; when it is missing it says what to install (`sudo apt install python3-gi
-gir1.2-webkit2-4.1`), and `urban-reign --game` starts the game directly. Details in the [Linux guide](docs/LINUX.md).
-
-### Requirements
-
-- **Windows:** Windows 10 or 11, 64-bit, and a DirectX 11 graphics card
-- **Linux:** 64-bit with glibc 2.30 or newer (Ubuntu 20.04+, Debian 11+, Fedora, Arch...) and a Vulkan graphics driver;
-  the window is X11 (XWayland on Wayland desktops)
-- A processor with SSE4.1 (any PC from the last ~12 years)
-
-## Controls
-
-| PS2 | Keyboard |
-|---|---|
-| ✕ / ○ / □ / △ | ↓ / → / ← / ↑ (arrow keys) |
-| Left stick | W A S D |
-| L1 / R1 / L2 / R2 | Q / E / 1 / 3 |
-| L3 / R3 | F / G |
-| START / SELECT | Enter / Tab |
-
-Controllers work out of the box. Buttons, controllers per player and the multitap are set in the **Controls** tab.
-
-| Key | In game |
-|---|---|
-| F11 | Fullscreen |
-| F3 | FPS counter |
-| F5 / F9 | Quick save / load state |
-| F2 | In-game menu: MODS / PATCHES |
-| F4 | Reload the mods (.pnach) |
-
-**Recording with OBS:** use *Window Capture* with **Capture Method: Windows 10 (1903 and up)** (the default
-"Automatic"/BitBlt shows a blank window), or *Display Capture*.
-
-## Build from source
-
-For those who want to change the code. You need Windows, Visual Studio 2022 (C++ with CMake), Python 3.10+ and your
-disc image.
-
-```bat
-git clone <this repository>
-cd <repository folder>
-:: copy your Urban Reign (USA) .iso into the game\ folder
-python build.py
-```
-
-The menu walks you through it: **Step 1** generates the game code from your disc, **Step 2** builds (the first time
-takes over an hour), **Step 3** plays.
-
-**On Linux** (Clang; the game code compiles in a few minutes):
-
-```sh
-sh tools/linux/install_deps.sh   # apt, dnf or pacman (uses sudo)
-./build.py
-```
-
-`./build.py release` makes the `.tar.gz` and `.deb` packages (needs podman or docker). Everything about Linux:
-[`docs/LINUX.md`](docs/LINUX.md).
-
-➡ **Everything else** (repository layout, settings files, how it works, debugging tools, full credits) is in the
-[**advanced guide**](docs/ADVANCED.md).
-
-## Credits
-
-- Made by **thiagordsfx** — [GitHub](https://github.com/thiagordsfx) · [YouTube](https://www.youtube.com/@thiagordsfx)
-- [PS2Recomp](https://github.com/ran-j/PS2Recomp) (recompiler and runtime), [PCSX2](https://pcsx2.net/) (GS renderer),
-  [Shadow of the Colossus PC port](https://github.com/LightVelox/sotc-vibe-pc),
-  [God of War PS2 recomp](https://github.com/KIexster/god-of-war-recomp),
-  [Ace Combat 5 static recompilation](https://github.com/sal063/Ace-Combat-5-Static-recompilation) and Michael's
-  "Force Progressive Scan" patch. Full list in the [advanced guide](docs/ADVANCED.md#credits-and-license).
-- *Urban Reign* © Namco / Paradigm Entertainment. This is a fan project, not affiliated with or endorsed by Bandai
-  Namco. No game content is distributed.
-
-The code in this repository is released under the **GPL-3.0** license. See [`LICENSE`](LICENSE).
+*English:* a native PC port of *Pro Yakyuu Team wo Tsukurou! 3* (PS2, SLPM-65853) by static recompilation, based on the
+Urban Reign PC port. **No game code or data is included**: you need your own disc image, checked by hash at start. The
+game belongs to SEGA; this is a non-commercial fan project not affiliated with SEGA.
