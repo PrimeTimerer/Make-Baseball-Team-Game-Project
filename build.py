@@ -4,7 +4,7 @@
     python build.py              numbered menu
     python build.py build        configure (first time) and compile yktk3.exe (urban on Linux)
     python build.py play [args]  run yktk3.exe (extra arguments go to it)
-    python build.py generate     recompile the game code from your disc image in game/
+    python build.py generate     recompile the game code and the VU1 microcode from your disc image in game/
     python build.py configure    run CMake again
     python build.py bench        measure frames/s on a savestate from bench/states
     python build.py release      the release folder and ZIP in build/release (no disc data); on Linux the .tar.gz and
@@ -98,7 +98,18 @@ def generate(args=()):
         print("Building the recompiler (ps2_recomp) first.")
         if configure(["-DURBAN_BUILD_RECOMP=ON"]) or in_vs("cmake", "--build", BUILD, "--target", "ps2_recomp", "--", "-j", JOBS):
             return 1
-    return run([sys.executable, ROOT / "tools" / "generate.py", *args])
+    return run([sys.executable, ROOT / "tools" / "generate.py", *args]) or generate_vu1()
+
+
+def generate_vu1():
+    """The VU1 microcode compiled ahead of time (3D at full speed): tools/vu1_generate.py rebuilds the images from your ELF
+    with recomp/vu1_images.txt."""
+    tool = BUILD / "runtime" / "ps2xTest" / ("vu1_recomp.exe" if WINDOWS else "vu1_recomp")
+    if not tool.exists():
+        print("Building the VU1 recompiler (vu1_recomp) first.")
+        if configure(["-DURBAN_BUILD_TOOLS=ON"]) or in_vs("cmake", "--build", BUILD, "--target", "vu1_recomp", "--", "-j", JOBS):
+            return 1
+    return run([sys.executable, ROOT / "tools" / "vu1_generate.py"])
 
 
 def pick(title, options):
