@@ -24,9 +24,11 @@ class PS2Runtime;
 // simgame match [0x5E783C], position 0.
 // The same decision runs for 結果表示 / 簡易試合 and for the CPU clubs' games when the schedule moves on, so the hooks
 // cover those too. A forced HR / hit / walk is capped per half-inning (an all-HR team would never make an out).
-// Stacking multiplies the batter's at-bat values (rg+0xAC..0xC4) and the pitcher's pitch object values past 99.
+// Stacking sets the batter's at-bat values (rg+0xAC..0xC4) and the pitcher's pitch object values to base x multiplier
+// + added value, past 99. 타구 비거리 moves hits from the shallow outfield (no HR roll) to the deep zones behind them
+// (sub_32C690 hook). limit=0 (the default) puts no cap on forced HR / hit / walk per half-inning.
 // Settings: match_script.ini in the user folder (enabled=, steal=, limit=, rule=<target>,<bat|pit>,<hr|hit|k|bb>,
-// boost=<target>,<stat>,<percent>), read again when it changes. Targets: own (the own club's players), opp (the
+// boost=<target>,<stat>,<percent>,<add>), read again when it changes. Targets: own (the own club's players), opp (the
 // opponents in the own club's games), all (everyone, every game), or a player's global ID.
 namespace urban::matchscript
 {

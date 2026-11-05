@@ -92,21 +92,25 @@ namespace urban::matchscript
             // Swing-and-miss and hits are rolled from the batter's 選球眼 and 巧打 (sub_329F78), not from the pitcher's
             // speed or stuff: this one divides the facing batter's 巧打 and 選球眼 while the pitcher pitches.
             {"dominance", "탈삼진력 (상대 타자 교타·선구안 ÷)", true, 0u},
+            // Hits mostly land in the shallow outfield, where no HR is rolled: this one moves them deeper.
+            {"distance", "타구 비거리 (얕은 외야 안타 → 깊은 외야)", false, 1u},
         };
+        constexpr uint32_t kDominance = 0u, kDistance = 1u; // the offsets of the two items above
         constexpr int kStatCount = static_cast<int>(sizeof(kStats) / sizeof(kStats[0]));
 
         struct Boost
         {
             int target = 0; // as Rule::target
             int stat = 0;   // index into kStats
-            int percent = 100;
+            int percent = 100; // the multiplier, in percent
+            int add = 0;       // added after the multiplier (any value; the result is kept within 0..9999)
         };
 
         struct Settings
         {
             bool enabled = false;
             bool steal = false; // the own team's steals are always safe
-            int limit = 10;     // forced HR / hit / walk per half-inning (an all-HR team would never make an out)
+            int limit = 0;      // forced HR / hit / walk per half-inning, 0 = no limit (an all-HR team never makes an out)
             std::vector<Rule> rules;
             std::vector<Boost> boosts;
         };
@@ -218,6 +222,7 @@ namespace urban::matchscript
                         if (parts[1] == kStats[s].key)
                             boost.stat = s;
                     boost.percent = std::atoi(parts[2].c_str());
+                    boost.add = parts.size() >= 4 ? std::atoi(parts[3].c_str()) : 0;
                     if (boost.stat >= 0 && boost.target >= -3 && boost.percent > 0)
                         settings.boosts.push_back(boost);
                 }
@@ -232,7 +237,7 @@ namespace urban::matchscript
                 std::ofstream file(temp, std::ios::binary | std::ios::trunc);
                 file << "# 경기 스크립트 (게임 메뉴 F2 > 경기 스크립트 탭이 씀)\r\n";
                 file << "# rule=<own|opp|all|선수 ID>,<bat|pit>,<hr|hit|k|bb>  steal=1: 내 구단 도루 무조건 성공\r\n";
-                file << "# limit=한 이닝에 강제하는 홈런·안타·볼넷 수  boost=<own|opp|all|선수 ID>,<능력치>,<배율 %>\r\n";
+                file << "# limit=한 이닝에 강제하는 홈런·안타·볼넷 수  boost=<own|opp|all|선수 ID>,<능력치>,<배율 %>,<더하는 값>\r\n";
                 file << "enabled=" << (settings.enabled ? 1 : 0) << "\r\n";
                 file << "steal=" << (settings.steal ? 1 : 0) << "\r\n";
                 file << "limit=" << settings.limit << "\r\n";
@@ -243,7 +248,8 @@ namespace urban::matchscript
                     file << "rule=" << targetKey(rule.target) << ',' << (rule.pitcher ? "pit" : "bat") << ','
                          << kActionKeys[static_cast<int>(rule.action)] << "\r\n";
                 for (const Boost &boost : settings.boosts)
-                    file << "boost=" << targetKey(boost.target) << ',' << kStats[boost.stat].key << ',' << boost.percent << "\r\n";
+                    file << "boost=" << targetKey(boost.target) << ',' << kStats[boost.stat].key << ',' << boost.percent << ','
+                         << boost.add << "\r\n";
             }
             std::error_code error;
             std::filesystem::rename(temp, g_path, error); // whole file at once: the game thread reads it when it changes
@@ -374,22 +380,35 @@ namespace urban::matchscript
                          kActionKeys[static_cast<int>(action)], what, from, to);
         }
 
-        // The multiplier (percent) of a stat for the batter or the pitcher: a picked player's boost first, then groups.
-        int boostFor(uint16_t id, int stat, bool pitcherSide)
+        // A stat's factor for the batter or the pitcher: a picked player's boost first, then the groups.
+        struct Factor
+        {
+            int percent = 100;
+            int add = 0;
+            bool identity() const { return percent == 100 && add == 0; }
+        };
+
+        Factor boostFor(uint16_t id, int stat, bool pitcherSide)
         {
             for (const Boost &boost : g_settings.boosts)
                 if (boost.stat == stat && boost.target == id)
-                    return boost.percent;
+                    return Factor{boost.percent, boost.add};
             const bool self = pitcherSide ? g_pitcherOwn : g_batterOwn, other = pitcherSide ? g_batterOwn : g_pitcherOwn;
             for (const Boost &boost : g_settings.boosts)
                 if (boost.stat == stat && boost.target < 0 && groupMatches(boost.target, self, other))
-                    return boost.percent;
-            return 100;
+                    return Factor{boost.percent, boost.add};
+            return Factor{};
         }
 
-        // Writes base x percent over the fields (address, percent); a field back at 100% gets its base again. key is
-        // the player (and object): a new one starts from the values the game set.
-        void applyStack(Stacked &stack, uint32_t key, const std::vector<std::pair<uint32_t, int>> &fields)
+        struct Field
+        {
+            uint32_t address;
+            Factor factor;
+        };
+
+        // Writes base x percent + add over the fields; a field back at x1 +0 gets its base again. key is the player (and
+        // object): a new one starts from the values the game set.
+        void applyStack(Stacked &stack, uint32_t key, const std::vector<Field> &fields)
         {
             static const bool debug = std::getenv("URBAN_SCRIPT_DEBUG") != nullptr;
             const bool fresh = stack.object != key;
@@ -400,29 +419,29 @@ namespace urban::matchscript
                 stack.written.clear();
             }
             std::vector<std::pair<uint32_t, uint32_t>> base, written;
-            for (const auto &[address, percent] : fields)
+            for (const Field &field : fields)
             {
-                uint32_t value = r32(address);
+                uint32_t value = r32(field.address);
                 for (size_t i = 0; i < stack.written.size(); ++i)
-                    if (stack.written[i].first == address && stack.written[i].second == value)
+                    if (stack.written[i].first == field.address && stack.written[i].second == value)
                         value = stack.base[i].second; // still ours: the game's value is the base kept
-                if (percent == 100)
+                if (field.factor.identity())
                 {
-                    w32(address, value);
+                    w32(field.address, value);
                     continue;
                 }
-                const int64_t boosted = static_cast<int64_t>(static_cast<int32_t>(value)) * percent / 100;
-                const uint32_t result = static_cast<uint32_t>(std::min<int64_t>(boosted, 9999));
-                w32(address, result);
-                base.emplace_back(address, value);
-                written.emplace_back(address, result);
+                const int64_t boosted = static_cast<int64_t>(static_cast<int32_t>(value)) * field.factor.percent / 100 + field.factor.add;
+                const uint32_t result = static_cast<uint32_t>(std::clamp<int64_t>(boosted, 0, 9999));
+                w32(field.address, result);
+                base.emplace_back(field.address, value);
+                written.emplace_back(field.address, result);
             }
             // Fields boosted before and not listed now: their base goes back if nothing changed them since.
             for (size_t i = 0; i < stack.written.size(); ++i)
             {
                 bool listed = false;
-                for (const auto &field : fields)
-                    listed = listed || field.first == stack.written[i].first;
+                for (const Field &field : fields)
+                    listed = listed || field.address == stack.written[i].first;
                 if (!listed && r32(stack.written[i].first) == stack.written[i].second)
                     w32(stack.written[i].first, stack.base[i].second);
             }
@@ -437,25 +456,46 @@ namespace urban::matchscript
             stack.written = std::move(written);
         }
 
+        // 타구 비거리: the chance (0-100) that a hit to the shallow outfield (zones 18, 21, 24, in front of the
+        // fielders, where sub_32BB30 rolls no HR) goes to the deep outfield of the same side instead. x N gives
+        // 1 - 1/N, + C adds C points.
+        int g_deepChance = 0;
+
+        int deepChance(const Factor &factor)
+        {
+            const int fromFactor = factor.percent > 100 ? 100 - 10000 / factor.percent : 0;
+            return std::clamp(fromFactor + factor.add, 0, 100);
+        }
+
         void applyBoosts(R5900Context *ctx, uint32_t rg)
         {
+            g_deepChance = 0;
             if (g_batterStack.written.empty() && g_pitcherStack.written.empty() && (!g_settings.enabled || g_settings.boosts.empty()))
                 return;
             const bool on = g_settings.enabled && !g_settings.boosts.empty();
             // Batter: the at-bat fields of rg; the batter's match copy pointer tells at-bats apart.
-            std::vector<std::pair<uint32_t, int>> fields;
-            int dominance = 100;
+            std::vector<Field> fields;
+            Factor dominance;
             for (int s = 0; s < kStatCount; ++s)
-                if (kStats[s].pitcher && kStats[s].offset == 0u && on && g_pitcher)
+                if (kStats[s].pitcher && kStats[s].offset == kDominance && on && g_pitcher)
                     dominance = boostFor(g_pitcher, s, true);
             for (int s = 0; s < kStatCount; ++s)
             {
                 if (kStats[s].pitcher)
                     continue;
-                int percent = on && g_batter ? boostFor(g_batter, s, false) : 100;
-                if (dominance != 100 && (kStats[s].offset == 0xACu || kStats[s].offset == 0xB8u))
-                    percent = std::max(1, percent * 100 / dominance);
-                fields.emplace_back(rg + kStats[s].offset, percent);
+                Factor factor = on && g_batter ? boostFor(g_batter, s, false) : Factor{};
+                if (kStats[s].offset == kDistance)
+                {
+                    g_deepChance = deepChance(factor);
+                    continue;
+                }
+                if (!dominance.identity() && (kStats[s].offset == 0xACu || kStats[s].offset == 0xB8u))
+                {
+                    // The pitcher's 탈삼진력: the facing batter's 巧打 and 選球眼 divided by its multiplier, less its value.
+                    factor.percent = std::max(1, factor.percent * 100 / std::max(1, dominance.percent));
+                    factor.add -= dominance.add;
+                }
+                fields.push_back(Field{rg + kStats[s].offset, factor});
             }
             applyStack(g_batterStack, r32(rg + 0xD4u), fields); // the batter's match copy: a new at-bat, new values
             // Pitcher: the pitch object [gp-0x7FF0] (sub_2B02D0), read by the next pitch's choice.
@@ -465,21 +505,43 @@ namespace urban::matchscript
             fields.clear();
             for (int s = 0; s < kStatCount; ++s)
             {
-                if (!kStats[s].pitcher)
+                if (!kStats[s].pitcher || kStats[s].offset == kDominance)
                     continue;
-                if (kStats[s].offset == 0u)
-                    continue; // dominance: applied to the batter above
-                const int percent = on && g_pitcher ? boostFor(g_pitcher, s, true) : 100;
+                const Factor factor = on && g_pitcher ? boostFor(g_pitcher, s, true) : Factor{};
                 if (kStats[s].offset == 0x14u)
                 {
                     for (uint32_t k = 0; k < 10; ++k)
-                        if (r32(pitch + 0x10u + 8u * k) != 0u || percent == 100) // a breaking ball's level (type at +0x10)
-                            fields.emplace_back(pitch + 0x14u + 8u * k, percent);
+                        if (r32(pitch + 0x10u + 8u * k) != 0u || factor.identity()) // a breaking ball's level (type at +0x10)
+                            fields.push_back(Field{pitch + 0x14u + 8u * k, factor});
                 }
                 else
-                    fields.emplace_back(pitch + kStats[s].offset, percent);
+                    fields.push_back(Field{pitch + kStats[s].offset, factor});
             }
             applyStack(g_pitcherStack, pitch ^ (static_cast<uint32_t>(g_pitcher) << 24), fields);
+        }
+
+        // sub_32C690(rg, zone type, zone): called by sub_32BB30 for a hit once its zone is rolled, before the detail and
+        // the HR roll read the zone from $s7. A shallow outfield zone becomes the deep one of the same side.
+        GuestFunction g_hitKind = nullptr;
+
+        void hitKindHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t zone = getRegU32(ctx, 6);
+            if (g_deepChance > 0 && (zone == 18u || zone == 21u || zone == 24u) && getRegU32(ctx, 23) == zone)
+            {
+                static uint32_t seed = 0x9E3779B9u;
+                seed = seed * 1664525u + 1013904223u;
+                if (static_cast<int>((seed >> 16) % 100u) < g_deepChance)
+                {
+                    const uint32_t deeper = zone + 1u + ((seed >> 8) & 1u); // the middle or the deep zone behind
+                    setReg(ctx, 6, deeper);
+                    setReg(ctx, 23, deeper);
+                    static const bool debug = std::getenv("URBAN_SCRIPT_DEBUG") != nullptr;
+                    if (debug)
+                        std::fprintf(stderr, "[script] batter %u: hit zone %u -> %u\n", g_batter, zone, deeper);
+                }
+            }
+            g_hitKind(rdram, ctx, runtime);
         }
 
         // Before the swing decision: a sign that makes the batter swing and hit (HR, hit), swing and miss (strikeout)
@@ -518,8 +580,7 @@ namespace urban::matchscript
                 applyBoosts(ctx, rg);
                 if (g_settings.enabled && !g_settings.rules.empty())
                     g_action = pick(g_batter, g_pitcher);
-                const int limit = g_settings.limit > 0 ? g_settings.limit : 10;
-                if (g_action != Action::None && g_action != Action::Strikeout && g_forcedInHalf >= limit)
+                if (g_settings.limit > 0 && g_action != Action::None && g_action != Action::Strikeout && g_forcedInHalf >= g_settings.limit)
                     g_action = Action::None; // the half-inning has had its forced HR / hit / walk results
             }
             if (g_action != Action::None)
@@ -619,7 +680,7 @@ namespace urban::matchscript
         std::mutex g_menuMutex;
         Settings g_menu; // the menu's copy (GS thread)
         int g_pickTeam = 0, g_pickPlayer = 0, g_groupTarget = 0, g_groupRole = 0, g_groupAction = 0;
-        int g_boostTarget = 0, g_boostStat = 0, g_boostFactor = 1;
+        int g_boostTarget = 0, g_boostStat = 0;
 
         struct Player
         {
@@ -804,19 +865,26 @@ namespace urban::matchscript
                     settings.rules.push_back(rule);
                 changed = true;
             }
-            ui->text(("한 이닝에 강제하는 홈런·안타·볼넷: " + std::to_string(settings.limit) + "번까지").c_str());
+            ui->text(settings.limit > 0 ? ("한 이닝에 강제하는 홈런·안타·볼넷: " + std::to_string(settings.limit) + "번까지").c_str()
+                                        : "한 이닝에 강제하는 홈런·안타·볼넷: 제한 없음");
+            ui->same_line();
+            if (ui->small_button("제한 없음##limit"))
+            {
+                settings.limit = 0;
+                changed = true;
+            }
             for (int step : {-5, -1, 1, 5})
             {
                 ui->same_line();
                 const std::string label = (step > 0 ? "+" : "") + std::to_string(step) + "##limit";
                 if (ui->small_button(label.c_str()))
                 {
-                    settings.limit = std::clamp(settings.limit + step, 1, 99);
+                    settings.limit = std::clamp(settings.limit + step, 0, 99);
                     changed = true;
                 }
             }
-            ui->text_disabled("팀 전체에 홈런·안타·볼넷을 걸면 아웃이 나오지 않아 이닝이 끝나지 않습니다(게임이 멈춤).");
-            ui->text_disabled("그래서 한 이닝에 이 횟수까지만 강제하고 나머지는 원래대로 진행합니다. 삼진은 세지 않습니다.");
+            ui->text_disabled("제한 없음일 때 팀 전체에 홈런·안타·볼넷을 걸면 아웃이 나오지 않아 이닝이 끝나지 않습니다(게임이 멈춤).");
+            ui->text_disabled("횟수를 정하면 그 이닝에 그만큼만 강제하고 나머지는 원래대로 진행합니다. 삼진은 세지 않습니다.");
 
             ui->separator_text("도루");
             int steal = settings.steal ? 1 : 0;
@@ -827,20 +895,54 @@ namespace urban::matchscript
             }
 
             // Stacking
-            ui->separator_text("능력치 중첩 (배율, 99를 넘어서)");
-            ui->text_disabled("경기 계산에 쓰는 값에 배율을 곱합니다. 경기용 복사본은 99에서 잘리지만 이 값은 그 뒤에 곱해 99를 넘습니다.");
-            ui->text_disabled("타자는 그 투구부터, 투수는 다음 투구부터 반영됩니다. 교타를 아주 크게 올리면 안타는 늘지만 게임 공식상 홈런 확률은 줄어듭니다.");
+            ui->separator_text("능력치 중첩 (배율 x 더하는 값, 99를 넘어서)");
+            ui->text_disabled("경기 계산에 쓰는 값 = 원래 값 x 배율 + 더하는 값. 경기용 복사본은 99에서 잘리지만 이 값은 그 뒤라 99를 넘습니다.");
+            ui->text_disabled("3D 경기, 결과 표시, 다른 구단 경기(일정 진행) 모두 같습니다. 타자는 그 투구부터, 투수는 다음 투구부터 반영됩니다.");
+            ui->text_disabled("교타를 아주 크게 올리면 안타는 늘지만 게임 공식상 홈런 확률은 줄어듭니다. 홈런은 장타 + 타구 비거리를 같이 올리세요.");
             int removeBoost = -1;
             for (size_t i = 0; i < settings.boosts.size(); ++i)
             {
-                const Boost &boost = settings.boosts[i];
+                Boost &boost = settings.boosts[i];
                 ui->push_id(1000 + static_cast<int>(i));
                 if (ui->small_button("빼기"))
                     removeBoost = static_cast<int>(i);
                 ui->same_line();
-                char factor[32];
-                std::snprintf(factor, sizeof(factor), " x%d.%d", boost.percent / 100, (boost.percent % 100) / 10);
+                char factor[96];
+                const uint32_t offset = kStats[boost.stat].offset;
+                if (offset == kDistance && !kStats[boost.stat].pitcher)
+                    std::snprintf(factor, sizeof(factor), " x%d.%d %+d (깊은 외야로 갈 확률 %d%%)", boost.percent / 100, (boost.percent % 100) / 10,
+                                  boost.add, deepChance(Factor{boost.percent, boost.add}));
+                else if (offset == kDominance && kStats[boost.stat].pitcher)
+                    std::snprintf(factor, sizeof(factor), " 상대 교타·선구안 ÷%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, -boost.add);
+                else
+                    std::snprintf(factor, sizeof(factor), " x%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, boost.add);
                 ui->text((nameOfTarget(boost.target) + " · " + kStats[boost.stat].label + factor).c_str());
+                // The multiplier in steps of 0.1 and 1 (0.1 .. 100), the added value in steps of 1, 10 and 100.
+                ui->text_disabled("    배율");
+                for (const int step : {-100, -10, 10, 100})
+                {
+                    ui->same_line();
+                    char label[32];
+                    std::snprintf(label, sizeof(label), "%s%d.%d##m%d", step > 0 ? "+" : "-", std::abs(step) / 100, (std::abs(step) % 100) / 10, step);
+                    if (ui->small_button(label))
+                    {
+                        boost.percent = std::clamp(boost.percent + step, 10, 10000);
+                        changed = true;
+                    }
+                }
+                ui->same_line();
+                ui->text_disabled("  더하기");
+                for (const int step : {-100, -10, -1, 1, 10, 100})
+                {
+                    ui->same_line();
+                    char label[32];
+                    std::snprintf(label, sizeof(label), "%+d##a%d", step, step);
+                    if (ui->small_button(label))
+                    {
+                        boost.add = std::clamp(boost.add + step, -9999, 9999);
+                        changed = true;
+                    }
+                }
                 ui->pop_id();
             }
             if (removeBoost >= 0)
@@ -851,30 +953,23 @@ namespace urban::matchscript
             std::vector<const char *> statItems;
             for (const Stat &stat : kStats)
                 statItems.push_back(stat.label);
-            const char *factors[] = {"x1.5", "x2", "x3", "x5", "x10", "x20"};
-            constexpr int kFactorPercents[] = {150, 200, 300, 500, 1000, 2000};
             ui->set_next_width(200.0f);
             ui->combo("##boosttarget", &g_boostTarget, targets, havePlayer ? 4 : 3);
             ui->same_line();
-            ui->set_next_width(130.0f);
+            ui->set_next_width(180.0f);
             ui->combo("##booststat", &g_boostStat, statItems.data(), kStatCount);
             ui->same_line();
-            ui->set_next_width(70.0f);
-            ui->combo("##boostfactor", &g_boostFactor, factors, 6);
-            ui->same_line();
-            if (ui->button("더하기##boost") && (g_boostTarget < 3 || havePlayer))
+            if (ui->button("더하기 (x2.0 +0, 위에서 조절)##boost") && (g_boostTarget < 3 || havePlayer))
             {
-                const Boost boost{targetOf(g_boostTarget), g_boostStat, kFactorPercents[g_boostFactor]};
-                bool replaced = false;
-                for (Boost &existing : settings.boosts)
-                    if (existing.target == boost.target && existing.stat == boost.stat)
-                    {
-                        existing.percent = boost.percent;
-                        replaced = true;
-                    }
-                if (!replaced)
+                const Boost boost{targetOf(g_boostTarget), g_boostStat, 200, 0};
+                bool exists = false;
+                for (const Boost &existing : settings.boosts)
+                    exists = exists || (existing.target == boost.target && existing.stat == boost.stat);
+                if (!exists)
+                {
                     settings.boosts.push_back(boost);
-                changed = true;
+                    changed = true;
+                }
             }
             if (changed)
                 save(settings);
@@ -898,11 +993,16 @@ namespace urban::matchscript
         hooks.replace(kNoContact, "match_script_no_contact", &noContactHook, ReplacementStatus::Native, "match scripts");
         hooks.replace(kPlaySetup, "match_script_play_setup", &playSetupHook, ReplacementStatus::Native, "match scripts");
         hooks.replace(kStealResult, "match_script_steal", &stealHook, ReplacementStatus::Native, "match scripts: steals");
+        if (runtime.hasFunction(0x32C690u))
+        {
+            hooks.replace(0x32C690u, "match_script_hit_zone", &hitKindHook, ReplacementStatus::Native, "match scripts: 타구 비거리");
+            g_hitKind = hooks.original(0x32C690u);
+        }
         g_swing = hooks.original(kSwing);
         g_noContact = hooks.original(kNoContact);
         g_playSetup = hooks.original(kPlaySetup);
         g_stealResult = hooks.original(kStealResult);
-        if (!g_swing || !g_noContact || !g_playSetup || !g_stealResult)
+        if (!g_swing || !g_noContact || !g_playSetup || !g_stealResult || !g_hitKind)
         {
             std::fprintf(stderr, "[script] hooks not installed\n");
             return;
