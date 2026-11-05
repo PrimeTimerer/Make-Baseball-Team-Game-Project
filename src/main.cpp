@@ -25,6 +25,7 @@
 #include "runtime/ps2_hotkeys.h"
 #include "urban/perf_log.h"
 #include "urban/player_cheats.h"
+#include "urban/cheat_menu.h"
 #include "runtime/ps2_game_menu.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -1431,6 +1432,8 @@ int main(int argc, char *argv[])
                                                 : "No mod is on. Switch mods on in the launcher's Mods tab (config.ini [Mods] Dlls).");
             // YKTK3's player cheats: the first tab (player_cheat_items.txt, player_cheats.ini).
             urban::players::install(runtime.memory().getRDRAM(), userDir, exeDir);
+            // The cheats one by one (mods/기능별 from tools/cheat_groups.py): the second tab, it writes config.ini [Mods].
+            urban::cheatmenu::install(userDir / "config.ini");
             // The performance log: logs/perf-<time>.txt, a line a second (PS2X_PERF_LOG=0: off).
             urban::perflog::install(runtime.memory().getRDRAM(), userDir);
             // F1: the key list, in Korean (PCSX2's GS draws it with the Korean and Japanese fonts).

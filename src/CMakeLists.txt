@@ -51,6 +51,7 @@ set(URBAN_HOST_SOURCES
     urban/opening.cpp
     urban/perf_log.cpp
     urban/player_cheats.cpp
+    urban/cheat_menu.cpp
     urban/sha256.cpp
     urban/thread_policy.cpp
 )

@@ -134,6 +134,10 @@ def build(elf_path, mods, functions_csv, out_path, manifest_path=None):
     """Writes out_path; returns the resume entry points (jump targets inside game functions)."""
     elf = Elf(elf_path)
     files = sorted(f for f in os.listdir(mods) if f.lower().endswith(".pnach")) if mods and os.path.isdir(mods) else []
+    # mods/기능별: the cheats one by one (tools/cheat_groups.py), as "기능별/<file>" like config.ini lists them
+    groups = os.path.join(mods, "기능별") if mods else ""
+    if groups and os.path.isdir(groups):
+        files += sorted("기능별/" + f for f in os.listdir(groups) if f.lower().endswith(".pnach"))
     starts, bounds = set(), []
     for line in open(functions_csv, encoding="utf-8"):
         parts = line.strip().split(",")

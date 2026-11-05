@@ -21,6 +21,11 @@ namespace Yktk3Launcher
         public bool Compiled; // in cheats_native.txt with this content: compiled into yktk3.exe
     }
 
+    public class CheatFunction : CheatFile
+    {
+        public string Category, Title, Japanese, Note;
+    }
+
     public static class Cheats
     {
         public static List<string> EnabledNames(Launcher launcher)
@@ -128,6 +133,40 @@ namespace Yktk3Launcher
             return list;
         }
 
+        // The cheats one by one: mods/기능별 (tools/cheat_groups.py splits the cheat files by function), listed with their
+        // category and Korean name in mods/기능별/목록.tsv. Name is the path [Mods] Enabled lists ("기능별/<file>", or a
+        // whole file of the mods folder such as a team S+ file).
+        public static List<CheatFunction> Functions(Launcher launcher)
+        {
+            var list = new List<CheatFunction>();
+            string index = System.IO.Path.Combine(launcher.ModsDir, "기능별", "목록.tsv");
+            if (!File.Exists(index))
+                return list;
+            Dictionary<string, string> compiled = CompiledFiles(launcher);
+            foreach (string line in File.ReadAllLines(index, Encoding.UTF8))
+            {
+                if (line.StartsWith("#") || line.Trim().Length == 0)
+                    continue;
+                string[] f = line.Split('\t');
+                if (f.Length < 3)
+                    continue;
+                string path = System.IO.Path.Combine(launcher.ModsDir, f[0].Replace('/', System.IO.Path.DirectorySeparatorChar));
+                var c = new CheatFunction { Name = f[0], Path = path, Category = f[1], Title = f[2],
+                                            Japanese = f.Length > 3 ? f[3] : "", Note = f.Length > 5 ? f[5] : "", Description = "" };
+                try
+                {
+                    c.Code = File.Exists(path) && ChangesCode(path);
+                    string digest;
+                    c.Compiled = c.Code && compiled.TryGetValue(c.Name, out digest) && digest == Sha256(path);
+                }
+                catch (Exception)
+                {
+                }
+                list.Add(c);
+            }
+            return list;
+        }
+
         // .pnach files, or .zip files with .pnach inside (copied flat into the mods folder). Returns the names added.
         public static List<string> Import(Launcher launcher, IEnumerable<string> files)
         {
@@ -166,18 +205,51 @@ namespace Yktk3Launcher
 
         protected override FrameworkElement Build()
         {
-            List<CheatFile> cheats = Cheats.List(Launcher);
+            List<CheatFunction> functions = Cheats.Functions(Launcher);
+            var wholeFunctionFiles = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+            List<CheatFile> cheats = Cheats.List(Launcher).Where(c => !wholeFunctionFiles.Contains(c.Name)).ToList();
             var enabled = new HashSet<string>(Cheats.EnabledNames(Launcher), StringComparer.OrdinalIgnoreCase);
+            var functionList = new StackPanel();
             var list = new StackPanel();
+            Func<CheatFile, string, string, bool, Border> makeRow = null;
             Action fill = null;
             fill = delegate
             {
+                functionList.Children.Clear();
+                string shownCategory = null;
+                StackPanel categoryRows = null;
+                foreach (CheatFunction function in functions.Where(f => filter.Length == 0 ||
+                         (f.Title + " " + f.Japanese + " " + f.Note + " " + f.Category).IndexOf(filter, StringComparison.CurrentCultureIgnoreCase) >= 0))
+                {
+                    if (function.Category != shownCategory)
+                    {
+                        shownCategory = function.Category;
+                        categoryRows = new StackPanel();
+                        string category = function.Category;
+                        int count = functions.Count(f => f.Category == category);
+                        int on = functions.Count(f => f.Category == category && enabled.Contains(f.Name));
+                        var header = Ui.Text(category + "  ·  " + on + " / " + count + " 켜짐", "H2");
+                        header.Margin = new Thickness(0, functionList.Children.Count == 0 ? 0 : 12, 0, 6);
+                        functionList.Children.Add(header);
+                        functionList.Children.Add(categoryRows);
+                    }
+                    string caption = string.Join(" · ", new[] { function.Japanese, function.Note }.Where(s => !string.IsNullOrEmpty(s)));
+                    categoryRows.Children.Add(makeRow(function, function.Title, caption, false));
+                }
+                if (functions.Count == 0)
+                    functionList.Children.Add(Ui.Text("기능별 목록이 없습니다 (mods/기능별/목록.tsv). 다시 빌드하면 tools/cheat_groups.py가 만듭니다.", "Caption"));
+
                 list.Children.Clear();
                 IEnumerable<CheatFile> shown = cheats.Where(c => filter.Length == 0 || c.Name.IndexOf(filter, StringComparison.CurrentCultureIgnoreCase) >= 0
                                                                  || c.Description.IndexOf(filter, StringComparison.CurrentCultureIgnoreCase) >= 0);
                 if (cheats.Count == 0)
                     list.Children.Add(Ui.Text("치트가 없습니다. \"치트 추가\"로 .pnach 파일이나 그것이 든 .zip을 넣으세요.", "Caption"));
                 foreach (CheatFile cheat in shown)
+                    list.Children.Add(makeRow(cheat, Path.GetFileNameWithoutExtension(cheat.Name),
+                                              (cheat.Description.Length > 0 ? cheat.Description + " · " : "") + "patch " + cheat.Patches + "줄", true));
+            };
+            makeRow = delegate(CheatFile cheat, string title, string caption, bool removable)
+            {
                 {
                     CheatFile c = cheat;
                     var row = new Grid();
@@ -195,12 +267,12 @@ namespace Yktk3Launcher
                             enabled.Add(c.Name);
                         else
                             enabled.Remove(c.Name);
-                        Window.Toast((on ? "켬: " : "끔: ") + Path.GetFileNameWithoutExtension(c.Name) + (Game.IsRunning ? " (게임에 바로 적용)" : ""));
+                        Window.Toast((on ? "켬: " : "끔: ") + title + (Game.IsRunning ? " (게임에 바로 적용)" : ""));
                     });
                     toggle.Margin = new Thickness(0, 0, 14, 0);
                     row.Children.Add(toggle);
                     var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-                    var name = Ui.Text(Path.GetFileNameWithoutExtension(c.Name), "Body");
+                    var name = Ui.Text(title, "Body");
                     name.FontWeight = FontWeights.SemiBold;
                     Border kind = !c.Code ? Ui.Chip("", "데이터", Ui.Brush("SubText"))
                                   : c.Compiled ? Ui.Chip("", "코드 · 네이티브", Ui.Brush("Good"))
@@ -208,7 +280,8 @@ namespace Yktk3Launcher
                     kind.Margin = new Thickness(10, 0, 0, 0);
                     kind.Padding = new Thickness(8, 1, 8, 1);
                     text.Children.Add(Ui.Row(name, kind));
-                    text.Children.Add(Ui.Text((c.Description.Length > 0 ? c.Description + " · " : "") + "patch " + c.Patches + "줄", "Caption"));
+                    if (caption.Length > 0)
+                        text.Children.Add(Ui.Text(caption, "Caption"));
                     Grid.SetColumn(text, 1);
                     row.Children.Add(text);
                     var remove = Ui.Button("휴지통으로", delegate
@@ -233,8 +306,9 @@ namespace Yktk3Launcher
                     remove.Padding = new Thickness(10, 5, 10, 5);
                     remove.Opacity = 0.8;
                     Grid.SetColumn(remove, 2);
-                    row.Children.Add(remove);
-                    list.Children.Add(new Border { Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x14, 0x1C, 0x2E)), CornerRadius = new CornerRadius(10), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 6), Child = row });
+                    if (removable)
+                        row.Children.Add(remove);
+                    return new Border { Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x14, 0x1C, 0x2E)), CornerRadius = new CornerRadius(10), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 6), Child = row };
                 }
             };
             fill();
@@ -274,7 +348,7 @@ namespace Yktk3Launcher
             toolbar.Margin = new Thickness(0, 0, 0, 14);
 
             var page = new List<UIElement> { toolbar };
-            int pending = cheats.Count(c => c.Code && !c.Compiled);
+            int pending = cheats.Count(c => c.Code && !c.Compiled) + functions.Count(c => c.Code && !c.Compiled);
             if (pending > 0)
             {
                 string root = Updater.RepoRoot(Launcher.Dir);
@@ -300,8 +374,9 @@ namespace Yktk3Launcher
                 banner.BorderBrush = Ui.Brush("Warn");
                 page.Add(banner);
             }
-            page.Add(Ui.Card(cheats.Count + "개 · 켜짐 " + cheats.Count(c => enabled.Contains(c.Name)) + "개", list));
-            return Ui.Page("치트", "PCSX2 .pnach 파일 (mods 폴더). 켜고 끄면 게임 실행 중에도 바로 적용됩니다. 데이터 치트는 그대로, 게임 코드를 바꾸는 치트는 게임과 함께 번역되어 네이티브로 돕니다.",
+            page.Add(Ui.Card("기능별 치트 " + functions.Count + "개 · 켜짐 " + functions.Count(c => enabled.Contains(c.Name)) + "개", functionList));
+            page.Add(Ui.Card("원본 파일 (파일째 켜기) " + cheats.Count + "개 · 켜짐 " + cheats.Count(c => enabled.Contains(c.Name)) + "개", list));
+            return Ui.Page("치트", "치트 파일을 기능별로 나눠(mods/기능별) 하나씩 켜고 끕니다. 게임 실행 중에도 바로 적용되고, 게임 안 F2 > 치트 탭에서도 같습니다. 원본 파일을 통째로 켜면 같은 기능이 두 번 돌 수 있으니 한쪽만 쓰세요.",
                 page.ToArray());
         }
     }

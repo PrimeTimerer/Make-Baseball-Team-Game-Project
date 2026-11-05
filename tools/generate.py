@@ -132,6 +132,10 @@ def main():
     # compiled with the game (URBAN_CHEATS_DIR: another folder).
     bin_dir = os.path.join(build, "port" if os.name == "nt" else "linux", "bin")
     mods = os.environ.get("URBAN_CHEATS_DIR") or os.path.join(bin_dir, "mods")
+    # The cheats one by one (tools/cheat_groups.py): mods/기능별, one .pnach per cheat function, compiled with the rest.
+    if os.path.isdir(mods):
+        import cheat_groups
+        cheat_groups.split(mods, os.path.join(build, BOOT_ELF), os.path.join(ROOT, "recomp", "yktk3_functions.csv"))
     cheat_path = os.path.join(build, "cheat_code.txt")
     cheat_entries = cheat_code.build(os.path.join(build, BOOT_ELF), mods, os.path.join(ROOT, "recomp", "yktk3_functions.csv"),
                                      cheat_path, os.path.join(bin_dir, "cheats_native.txt") if os.path.isdir(bin_dir) else None)
