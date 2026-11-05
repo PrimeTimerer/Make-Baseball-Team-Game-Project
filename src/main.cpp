@@ -26,6 +26,8 @@
 #include "urban/perf_log.h"
 #include "urban/player_cheats.h"
 #include "urban/cheat_menu.h"
+#include "urban/staff_cheats.h"
+#include "urban/ichinen_cheats.h"
 #include "runtime/ps2_game_menu.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -1433,7 +1435,11 @@ int main(int argc, char *argv[])
             // YKTK3's player cheats: the first tab (player_cheat_items.txt, player_cheats.ini).
             urban::players::install(runtime.memory().getRDRAM(), userDir, exeDir);
             // The cheats one by one (mods/기능별 from tools/cheat_groups.py): the second tab, it writes config.ini [Mods].
-            urban::cheatmenu::install(userDir / "config.ini");
+            urban::cheatmenu::install(userDir / "config.ini", runtime.memory().getRDRAM());
+            // The staff (manager, coaches, scouts): abilities, personality and skills by role, written once or held.
+            urban::staff::install(runtime.memory().getRDRAM(), userDir);
+            // イチネンモード: the shop slots by name (change, hold, buy again) and the points.
+            urban::ichinen::install(runtime.memory().getRDRAM(), userDir);
             // The performance log: logs/perf-<time>.txt, a line a second (PS2X_PERF_LOG=0: off).
             urban::perflog::install(runtime.memory().getRDRAM(), userDir);
             // F1: the key list, in Korean (PCSX2's GS draws it with the Korean and Japanese fonts).

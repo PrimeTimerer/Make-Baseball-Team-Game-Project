@@ -1,4 +1,5 @@
 #include "urban/player_cheats.h"
+#include "urban/skill_table.h"
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
@@ -63,17 +64,6 @@ namespace urban::players
         constexpr const char *kTeamNames[kTeams] = {"라이온즈", "호크스",   "파이터즈", "마린즈",   "버팔로즈", "골든이글스",
                                                     "드래곤즈", "스왈로즈", "자이언츠", "타이거즈", "카프",     "요코하마"};
 
-        struct Skill
-        {
-            uint16_t id;
-            int group;
-            const char *ko, *jp;
-        };
-        constexpr Skill kSkillTable[] = {
-#include "urban/player_skills.inc"
-        };
-        constexpr const char *kSkillGroups[] = {"선수 스킬", "WS 결정구", "감독 스킬", "코치 스킬"};
-
         struct Run
         {
             uint32_t offset = 0u;
@@ -89,6 +79,8 @@ namespace urban::players
             bool on = true;
             uint32_t mask = 0u;
             std::vector<uint16_t> skills;
+            // Slot by slot (the 8 skill slots): -1 as it is, 0 empty, else that skill; written after the added skills.
+            std::array<int, kSkillSlots> slots{-1, -1, -1, -1, -1, -1, -1, -1};
             std::string name;
         };
         enum Scope
@@ -100,6 +92,7 @@ namespace urban::players
         struct Settings
         {
             bool enabled = false;
+            bool restore = true; // an item taken off gets the player's own bytes back (kept from this run's first write)
             bool all = true; // the default items for the players of the scope without a pin (off: only the picked players)
             int scope = kScopeOwn;
             uint32_t teams = kOwnBit; // kScopeTeams: bit t = team t, kOwnBit = the own team
@@ -114,6 +107,7 @@ namespace urban::players
             int number = 0, age = 0;
             bool pitcher = false;
             std::string name;
+            std::array<uint16_t, kSkillSlots> skills{}; // the slots as the record has them now
         };
         using Slots = std::array<uint16_t, kSkillSlots>;
         // A player whose skills the cheat changed in this run: what the slots held before and what it wrote last.
@@ -131,6 +125,14 @@ namespace urban::players
         int g_team = -1;
         std::array<std::vector<Row>, kTeams> g_rows;
         std::map<uint16_t, SkillBackup> g_skillBackups; // EE thread only, by player ID
+        // A player whose items the cheat wrote in this run: where, and per item the bytes there before the first write.
+        struct StatBackup
+        {
+            uint32_t record = 0u, block = 0u;
+            std::map<size_t, std::vector<std::pair<uint32_t, uint8_t>>> items;
+        };
+        std::map<uint16_t, StatBackup> g_statBackups; // EE thread only, by player ID
+        std::filesystem::file_time_type g_settingsTime{}; // player_cheats.ini as last read or written (under g_mutex)
 
         std::string trim(std::string text)
         {
@@ -170,14 +172,6 @@ namespace urban::players
         uint32_t allItems()
         {
             return g_items.size() >= 32u ? 0xFFFFFFFFu : (1u << g_items.size()) - 1u;
-        }
-
-        const Skill *findSkill(uint16_t id)
-        {
-            for (const Skill &skill : kSkillTable)
-                if (skill.id == id)
-                    return &skill;
-            return nullptr;
         }
 
         // player_cheat_items.txt: "== section ==", "[key] label", then "> note" and "offset: byte byte ..." lines (hex,
@@ -275,7 +269,7 @@ namespace urban::players
                 id = trim(id);
                 char *end = nullptr;
                 const unsigned long value = std::strtoul(id.c_str(), &end, 16);
-                if (id.empty() || *end != '\0' || value > 0xFFFFu || !findSkill(static_cast<uint16_t>(value)))
+                if (id.empty() || *end != '\0' || value > 0xFFFFu || !urban::skills::find(static_cast<uint16_t>(value), false))
                     continue;
                 const uint16_t skill = static_cast<uint16_t>(value);
                 if (std::find(skills.begin(), skills.end(), skill) == skills.end() && skills.size() < kSkillSlots)
@@ -313,6 +307,7 @@ namespace urban::players
             Settings settings;
             settings.mask = allItems();
             std::map<uint16_t, std::vector<uint16_t>> pinSkills;
+            std::map<uint16_t, std::array<int, kSkillSlots>> pinSlots;
             std::ifstream file(path, std::ios::binary);
             std::string line;
             while (std::getline(file, line))
@@ -326,6 +321,8 @@ namespace urban::players
                     settings.enabled = value == "1";
                 else if (key == "all")
                     settings.all = value == "1";
+                else if (key == "restore")
+                    settings.restore = value != "0";
                 else if (key == "scope")
                     settings.scope = value == "all" ? kScopeAll : value == "teams" ? kScopeTeams : kScopeOwn;
                 else if (key == "teams")
@@ -348,7 +345,7 @@ namespace urban::players
                     settings.mask = maskOf(value);
                 else if (key == "skills")
                     settings.skills = skillsOf(value);
-                else if (key == "pin" || key == "pinskills")
+                else if (key == "pin" || key == "pinskills" || key == "pinslots")
                 {
                     std::istringstream fields(value);
                     std::string id, on, items, name;
@@ -361,6 +358,18 @@ namespace urban::players
                     {
                         std::getline(fields, items);
                         pinSkills[static_cast<uint16_t>(number)] = skillsOf(items);
+                        continue;
+                    }
+                    if (key == "pinslots")
+                    {
+                        std::array<int, kSkillSlots> slots{-1, -1, -1, -1, -1, -1, -1, -1};
+                        std::string slot;
+                        for (int k = 0; k < kSkillSlots && std::getline(fields, slot, ','); ++k)
+                        {
+                            const int skill = std::atoi(trim(slot).c_str());
+                            slots[static_cast<size_t>(k)] = skill <= 0 || urban::skills::find(static_cast<uint16_t>(skill), false) ? std::max(skill, -1) : -1;
+                        }
+                        pinSlots[static_cast<uint16_t>(number)] = slots;
                         continue;
                     }
                     if (!std::getline(fields, on, ',') || !std::getline(fields, items, ','))
@@ -376,6 +385,9 @@ namespace urban::players
             for (auto &[id, skills] : pinSkills)
                 if (auto pin = settings.pins.find(id); pin != settings.pins.end())
                     pin->second.skills = std::move(skills);
+            for (const auto &[id, slots] : pinSlots)
+                if (auto pin = settings.pins.find(id); pin != settings.pins.end())
+                    pin->second.slots = slots;
             return settings;
         }
 
@@ -388,12 +400,20 @@ namespace urban::players
                  << "scope=" << (settings.scope == kScopeAll ? "all" : settings.scope == kScopeTeams ? "teams" : "own") << "\n"
                  << "teams=" << teamsText(settings.teams) << "\n"
                  << "items=" << keysOf(settings.mask) << "\n"
-                 << "skills=" << skillText(settings.skills) << "\n";
+                 << "skills=" << skillText(settings.skills) << "\n"
+                 << "restore=" << (settings.restore ? 1 : 0) << "\n";
             for (const auto &[id, pin] : settings.pins)
             {
                 file << "pin=" << id << "," << (pin.on ? 1 : 0) << "," << keysOf(pin.mask) << "," << pin.name << "\n";
                 if (!pin.skills.empty())
                     file << "pinskills=" << id << "," << skillText(pin.skills) << "\n";
+                if (std::any_of(pin.slots.begin(), pin.slots.end(), [](int s) { return s >= 0; }))
+                {
+                    file << "pinslots=" << id;
+                    for (int s : pin.slots)
+                        file << "," << s;
+                    file << "\n";
+                }
             }
         }
 
@@ -445,25 +465,75 @@ namespace urban::players
             return t == own;
         }
 
-        // The chosen items into a record. `block` is its ability block (own team: record + 0x6C).
-        void writeItems(uint32_t record, uint32_t block, bool own, uint32_t mask)
+        // Where an item's run goes in a record whose ability block is `block` (own team: record + 0x6C); 0 when a CPU
+        // record has nothing there (past the block).
+        uint32_t runAddress(uint32_t record, uint32_t block, bool own, const Run &run)
         {
+            const uint32_t end = run.offset + static_cast<uint32_t>(run.bytes.size());
+            if (end <= kBlock)
+                return record + run.offset;
+            if (run.offset >= kBlock && end <= kBlock + kBlockSize)
+                return block + (run.offset - kBlock);
+            return own ? record + run.offset : 0u;
+        }
+
+        void restoreBytes(const std::vector<std::pair<uint32_t, uint8_t>> &bytes)
+        {
+            for (const auto &[address, value] : bytes)
+                g_rdram[address] = value;
+        }
+
+        // The chosen items into a player's record. The bytes each item overwrites are kept the first time (this run), and
+        // an item no longer chosen (unticked, the player out of the target, the cheat off) gets them back when
+        // Settings::restore is on (else they stay, as before 2026-11-05). A player found at another record (a trade,
+        // another save) starts over: the old bytes belong to that other place.
+        void applyItems(uint32_t record, uint32_t block, bool own, uint16_t id, uint32_t mask)
+        {
+            auto backup = g_statBackups.find(id);
+            if (backup != g_statBackups.end() && (backup->second.record != record || backup->second.block != block))
+            {
+                g_statBackups.erase(backup);
+                backup = g_statBackups.end();
+            }
+            if (backup != g_statBackups.end())
+                for (auto it = backup->second.items.begin(); it != backup->second.items.end();)
+                {
+                    if (mask & (1u << it->first))
+                    {
+                        ++it;
+                        continue;
+                    }
+                    if (g_settings.restore)
+                        restoreBytes(it->second);
+                    it = backup->second.items.erase(it);
+                }
+            if (mask == 0u)
+            {
+                if (backup != g_statBackups.end())
+                    g_statBackups.erase(backup);
+                return;
+            }
+            if (backup == g_statBackups.end())
+            {
+                StatBackup fresh;
+                fresh.record = record;
+                fresh.block = block;
+                backup = g_statBackups.emplace(id, std::move(fresh)).first;
+            }
             for (size_t i = 0; i < g_items.size(); ++i)
             {
                 if (!(mask & (1u << i)))
                     continue;
+                const bool first = backup->second.items.find(i) == backup->second.items.end();
+                std::vector<std::pair<uint32_t, uint8_t>> &kept = backup->second.items[i];
                 for (const Run &run : g_items[i].runs)
                 {
-                    const uint32_t end = run.offset + static_cast<uint32_t>(run.bytes.size());
-                    uint32_t at;
-                    if (end <= kBlock)
-                        at = record + run.offset;
-                    else if (run.offset >= kBlock && end <= kBlock + kBlockSize)
-                        at = block + (run.offset - kBlock);
-                    else if (own)
-                        at = record + run.offset;
-                    else
-                        continue; // past the block: CPU records have nothing there
+                    const uint32_t at = runAddress(record, block, own, run);
+                    if (at == 0u)
+                        continue;
+                    if (first)
+                        for (uint32_t b = 0; b < run.bytes.size(); ++b)
+                            kept.emplace_back(at + b, g_rdram[at + b]);
                     std::memcpy(g_rdram + at, run.bytes.data(), run.bytes.size());
                 }
             }
@@ -484,10 +554,12 @@ namespace urban::players
         // The chosen skills, added to the player's own: one they lack goes into an empty slot or, all 8 full, over the last
         // skill not chosen. Not chosen any more (or the cheat off), the slots go back to what they held before, unless the
         // game changed them meanwhile. The backup lives for this run only.
-        void applySkills(uint32_t record, uint16_t id, const std::vector<uint16_t> *chosen)
+        void applySkills(uint32_t record, uint16_t id, const std::vector<uint16_t> *chosen,
+                         const std::array<int, kSkillSlots> *slots = nullptr)
         {
             auto backup = g_skillBackups.find(id);
-            if (!chosen || chosen->empty())
+            const bool bySlot = slots && std::any_of(slots->begin(), slots->end(), [](int s) { return s >= 0; });
+            if ((!chosen || chosen->empty()) && !bySlot)
             {
                 if (backup != g_skillBackups.end())
                 {
@@ -503,7 +575,7 @@ namespace urban::players
             else if (now != backup->second.written)
                 backup->second.before = now; // the game (or a loaded save) wrote them: those are the player's own now
             Slots want = backup->second.before;
-            for (uint16_t skill : *chosen)
+            for (uint16_t skill : chosen ? *chosen : std::vector<uint16_t>{})
             {
                 if (std::find(want.begin(), want.end(), skill) != want.end())
                     continue;
@@ -514,6 +586,10 @@ namespace urban::players
                 if (slot != want.end())
                     *slot = skill;
             }
+            if (bySlot)
+                for (size_t k = 0; k < want.size(); ++k)
+                    if ((*slots)[k] >= 0)
+                        want[k] = static_cast<uint16_t>((*slots)[k]); // the slot as picked (0: empty)
             if (want != now)
                 writeSkills(record, want);
             backup->second.written = want;
@@ -526,6 +602,18 @@ namespace urban::players
             static unsigned tick = 0u;
             const bool refresh = (++tick % 30u) == 0u;
             std::lock_guard<std::mutex> lock(g_mutex);
+            // player_cheats.ini changed outside the tab (an editor, a test, a launcher): read it again (about once a second).
+            if (tick % 60u == 0u)
+            {
+                std::error_code error;
+                const auto time = std::filesystem::last_write_time(g_settingsPath, error);
+                if (!error && time != g_settingsTime)
+                {
+                    g_settingsTime = time;
+                    g_settings = loadSettings(g_settingsPath);
+                    std::fprintf(stderr, "[players] settings reloaded: player cheats %s\n", g_settings.enabled ? "on" : "off");
+                }
+            }
             uint32_t rosters[kTeams] = {};
             int team = -1;
             for (int t = 0; t < kTeams; ++t)
@@ -551,7 +639,7 @@ namespace urban::players
                 for (std::vector<Row> &rows : g_rows)
                     rows.clear();
             const bool apply = team >= 0 && g_settings.enabled;
-            if (!rebuild && !apply && g_skillBackups.empty())
+            if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty())
                 return;
             for (int t = 0; t < kTeams; ++t)
             {
@@ -579,10 +667,12 @@ namespace urban::players
                         row.age = g_rdram[record + kAge];
                         row.pitcher = g_rdram[record + kPitcher] != 0u;
                         row.name = nameOf(record);
+                        row.skills = readSkills(record);
                         g_rows[static_cast<size_t>(t)].push_back(std::move(row));
                     }
                     uint32_t mask = 0u;
                     const std::vector<uint16_t> *skills = nullptr;
+                    const std::array<int, kSkillSlots> *slots = nullptr;
                     if (apply)
                     {
                         const auto pin = g_settings.pins.find(id);
@@ -592,6 +682,7 @@ namespace urban::players
                             {
                                 mask = pin->second.mask;
                                 skills = &pin->second.skills;
+                                slots = &pin->second.slots;
                             }
                         }
                         else if (scoped)
@@ -600,10 +691,10 @@ namespace urban::players
                             skills = &g_settings.skills;
                         }
                     }
-                    if (mask != 0u)
-                        writeItems(record, block, own, mask);
-                    if (skills || !g_skillBackups.empty())
-                        applySkills(record, id, skills);
+                    if (mask != 0u || !g_statBackups.empty())
+                        applyItems(record, block, own, id, mask);
+                    if (skills || slots || !g_skillBackups.empty())
+                        applySkills(record, id, skills, slots);
                 }
             }
         }
@@ -628,7 +719,7 @@ namespace urban::players
             }
             for (size_t i = 0; i < skills.size(); ++i)
             {
-                const Skill *skill = findSkill(skills[i]);
+                const urban::skills::Skill *skill = urban::skills::find(skills[i], false);
                 ui->push_id(400000 + skills[i]);
                 if (i % 4u != 0u)
                     ui->same_line();
@@ -645,14 +736,15 @@ namespace urban::players
             ui->text_disabled("빼거나 끄면 이번 실행에서 바꾼 칸을 원래 스킬로 돌립니다.");
             if (!ui->begin_tab_bar("skillgroups"))
                 return;
-            for (int group = 0; group < 4; ++group)
+            for (int group = urban::skills::kPlayer; group <= urban::skills::kCoach; ++group)
             {
-                if (!ui->begin_tab(kSkillGroups[group]))
+                if (!ui->begin_tab(urban::skills::groupName(group)))
                     continue;
                 ui->begin_child("skilllist", 0.0f, 170.0f);
                 int column = 0;
-                for (const Skill &skill : kSkillTable)
+                for (const urban::skills::Skill *entry = urban::skills::begin(); entry != urban::skills::end(); ++entry)
                 {
+                    const urban::skills::Skill &skill = *entry;
                     if (skill.group != group)
                         continue;
                     const auto at = std::find(skills.begin(), skills.end(), skill.id);
@@ -661,7 +753,7 @@ namespace urban::players
                     if (column++ % 2 != 0)
                         ui->same_line();
                     ui->begin_disabled(!on && skills.size() >= static_cast<size_t>(kSkillSlots) ? 1 : 0);
-                    if (ui->checkbox((std::string(skill.ko) + "  " + skill.jp).c_str(), &on))
+                    if (ui->checkbox(urban::skills::label(g_rdram, skill).c_str(), &on))
                     {
                         if (on)
                             skills.push_back(skill.id);
@@ -676,6 +768,59 @@ namespace urban::players
                 ui->end_tab();
             }
             ui->end_tab_bar();
+        }
+
+        // A picked player's 8 skill slots one by one: as it is, empty, or any skill (written after the added skills; taken
+        // off, the slots go back to the player's own). `row`: the player as the roster has them now (null when away).
+        void drawSlotEditor(const Pcsx2GsUi *ui, Pin &pin, const Row *row, bool &changed)
+        {
+            ui->separator_text("스킬 슬롯별 편집 (이 선수의 8칸)");
+            // The choices: as it is, empty, then every player / WS / manager / coach skill by group.
+            static std::vector<std::string> labels;
+            static std::vector<int> ids;
+            if (labels.empty() || labels.size() < 3u)
+            {
+                labels = {"그대로", "비우기"};
+                ids = {-1, 0};
+                for (int group = urban::skills::kPlayer; group <= urban::skills::kCoach; ++group)
+                    for (const urban::skills::Skill *skill = urban::skills::begin(); skill != urban::skills::end(); ++skill)
+                        if (skill->group == group)
+                        {
+                            labels.push_back(std::string("[") + urban::skills::groupName(group) + "] " + urban::skills::label(g_rdram, *skill));
+                            ids.push_back(skill->id);
+                        }
+            }
+            std::vector<const char *> pointers;
+            for (const std::string &label : labels)
+                pointers.push_back(label.c_str());
+            if (ui->small_button("8칸 모두 그대로"))
+            {
+                pin.slots.fill(-1);
+                changed = true;
+            }
+            for (int k = 0; k < kSkillSlots; ++k)
+            {
+                ui->push_id(800000 + k);
+                const uint16_t now = row ? row->skills[static_cast<size_t>(k)] : 0u;
+                const urban::skills::Skill *skill = now ? urban::skills::find(now, false) : nullptr;
+                char head[160];
+                std::snprintf(head, sizeof(head), "칸 %d: 지금 %s", k + 1, now == 0u ? "비어 있음" : skill ? skill->ko : "?");
+                ui->text(head);
+                ui->same_line();
+                const int picked = pin.slots[static_cast<size_t>(k)];
+                int current = 0;
+                for (size_t i = 0; i < ids.size(); ++i)
+                    if (ids[i] == picked)
+                        current = static_cast<int>(i);
+                ui->set_next_width(380.0f);
+                if (ui->combo("##slot", &current, pointers.data(), static_cast<int>(pointers.size())))
+                {
+                    pin.slots[static_cast<size_t>(k)] = ids[static_cast<size_t>(current)];
+                    changed = true;
+                }
+                ui->pop_id();
+            }
+            ui->text_disabled("'그대로'인 칸은 원래 스킬(또는 위 '스킬' 탭에서 더한 스킬)이 남습니다. 칸을 정하면 매 프레임 그 스킬로 유지됩니다.");
         }
 
         // The items of `mask`, a tab per section of player_cheat_items.txt, three to a row; then the skills tab.
@@ -797,6 +942,9 @@ namespace urban::players
             };
 
             int enabled = settings.enabled ? 1 : 0;
+            // イチネンモード (one-year mode) runs: its state object [0x62B45C] exists only then. Its new club borrows one
+            // team's place, which holds that team's own players until the expansion draft is over.
+            const bool ichinen = valid(read32(0x62B45Cu), 0x10u);
             if (ui->checkbox("선수 치트 켜기", &enabled))
             {
                 settings.enabled = enabled != 0;
@@ -806,8 +954,20 @@ namespace urban::players
             if (team < 0)
                 ui->text_disabled("내 구단을 찾는 중: 세이브를 불러오거나 새 게임을 시작하면 자동으로 찾습니다");
             else
-                ui->text_disabled((std::string("내 구단 ") + kTeamNames[team] + " (자동 감지) · 12개 구단 선수 " + std::to_string(players) + "명")
+                ui->text_disabled((std::string(ichinen ? "이치넨 구단 (" : "내 구단 ") + kTeamNames[team] + (ichinen ? " 자리)" : " (자동 감지)") +
+                                   " · 12개 구단 선수 " + std::to_string(players) + "명")
                                       .c_str());
+            int restore = settings.restore ? 1 : 0;
+            if (ui->checkbox("끄거나 대상에서 빼면 원래 능력치로 (이번 실행에서 처음 쓰기 전 값)", &restore))
+            {
+                settings.restore = restore != 0;
+                changed = true;
+            }
+            if (ichinen)
+            {
+                ui->text_colored(0xFF5050FFu, "이치넨 모드: 드래프트가 끝나기 전에는 '내 구단' 자리에 원래 구단 선수들이 있습니다.");
+                ui->text_colored(0xFF5050FFu, "대상을 '고른 선수만'으로 두고, 드래프트 뒤 아래 '선수 고르기'에서 내 선수를 고르세요.");
+            }
 
             // 1. Who gets the default items.
             ui->separator_text("대상 고르기: 기본 항목을 쓸 선수");
@@ -905,6 +1065,8 @@ namespace urban::players
             std::vector<uint16_t> &skills = selected == settings.pins.end() ? settings.skills : selected->second.skills;
             ui->begin_disabled(apply ? 0 : 1);
             drawItems(ui, mask, skills, changed);
+            if (selected != settings.pins.end())
+                drawSlotEditor(ui, selected->second, rowOf(selected->first), changed);
             ui->end_disabled();
 
             // 3. The players: any team's, picked ones get items of their own.
@@ -1056,8 +1218,9 @@ namespace urban::players
         g_items = loadItems(g_itemsPath);
         g_settingsPath = userDir / "player_cheats.ini";
         g_settings = loadSettings(g_settingsPath);
-        std::fprintf(stderr, "[players] %zu items (%s), %zu skills; player cheats %s, %zu picked, scope %d%s\n", g_items.size(),
-                     utf8(g_itemsPath).c_str(), std::size(kSkillTable), g_settings.enabled ? "on" : "off", g_settings.pins.size(),
+        g_settingsTime = std::filesystem::last_write_time(g_settingsPath, error);
+        std::fprintf(stderr, "[players] %zu items (%s), %td skills; player cheats %s, %zu picked, scope %d%s\n", g_items.size(),
+                     utf8(g_itemsPath).c_str(), urban::skills::end() - urban::skills::begin(), g_settings.enabled ? "on" : "off", g_settings.pins.size(),
                      g_settings.all ? g_settings.scope : 3, g_safeMode ? "; safe start: off" : "");
 #if defined(URBAN_PLAYER_MENU)
         ps2x::menu::addPanel("선수 치트", [](const Pcsx2GsUi *ui) { draw(ui); });

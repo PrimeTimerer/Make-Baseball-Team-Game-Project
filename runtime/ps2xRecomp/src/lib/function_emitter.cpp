@@ -6,6 +6,8 @@
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <cctype>
 #include <set>
@@ -26,6 +28,39 @@ namespace ps2recomp
             inst.opcode = OPCODE_SPECIAL;
             inst.function = SPECIAL_SLL;
             return inst;
+        }
+
+        // A cheat word that puts a number in a register (addiu, ori, lui) takes the number from the word in memory: a
+        // value picked in config.ini [CheatValues] (ticket price, memo number, ...) then works without being compiled in.
+        // `code` is the translation of the instruction (or of a branch and this delay slot); `word` the C++ expression
+        // of the word in memory. False, and the code unchanged, when the immediate is not found exactly once.
+        bool takeImmediateFromMemory(std::string &code, const Instruction &inst, const std::string &word)
+        {
+            if (inst.rt == 0)
+                return false;
+            std::string from, to;
+            switch (inst.opcode)
+            {
+            case OPCODE_ADDIU:
+                from = fmt::format(", {}));", inst.simmediate);
+                to = fmt::format(", (int32_t)(int16_t)({} & 0xFFFFu)));", word);
+                break;
+            case OPCODE_ORI:
+                from = fmt::format("(uint16_t){});", inst.immediate);
+                to = fmt::format("(uint16_t)({} & 0xFFFFu));", word);
+                break;
+            case OPCODE_LUI:
+                from = fmt::format("(uint32_t){} << 16", inst.immediate);
+                to = fmt::format("(uint32_t)({} & 0xFFFFu) << 16", word);
+                break;
+            default:
+                return false;
+            }
+            const size_t at = code.find(from);
+            if (at == std::string::npos || code.find(from, at + 1u) != std::string::npos)
+                return false;
+            code.replace(at, from.size(), to);
+            return true;
         }
     }
 
@@ -99,6 +134,8 @@ namespace ps2recomp
             }
         }
         size_t nextCheatRegion = 0;
+        // A cheat routine (code a cheat writes into free memory, tools/cheat_code.py "C"): its numbers come from memory.
+        const bool cheatRoutine = function.name.rfind("cheat_", 0) == 0;
 
         // A cheat region: the code each version the cheats can leave there compiles to, chosen by the words in memory
         // (as PCSX2 runs what is in memory); the original code below runs when none matches.
@@ -112,9 +149,17 @@ namespace ps2recomp
                 out << "        const uint32_t cheat_" << std::hex << region.start << "_" << std::dec << k
                     << " = FAST_READ32(0x" << std::hex << (region.start + 4u * static_cast<uint32_t>(k)) << "u);\n";
             bool first = true;
+            const auto wordName = [&](size_t k)
+            {
+                std::ostringstream name;
+                name << "cheat_" << std::hex << region.start << "_" << std::dec << k;
+                return name.str();
+            };
             for (size_t v = 0; v < region.versions.size(); ++v)
             {
                 std::ostringstream body;
+                // The words whose number comes from memory: the version matches them by everything but the low half.
+                std::vector<bool> fromMemory(count, false);
                 try
                 {
                     const std::vector<Instruction> &version = region.versions[v];
@@ -123,13 +168,19 @@ namespace ps2recomp
                         const Instruction &alt = version[k];
                         if (alt.hasDelaySlot && k + 1 < version.size())
                         {
-                            body << cg.handleBranchDelaySlots(alt, version[k + 1], function, analysisResult);
+                            std::string code = cg.handleBranchDelaySlots(alt, version[k + 1], function, analysisResult);
+                            if (k + 1 < count && takeImmediateFromMemory(code, version[k + 1], wordName(k + 1)))
+                                fromMemory[k + 1] = true;
+                            body << code;
                             ++k;
                         }
                         else
                         {
+                            std::string code = cg.translateInstruction(alt, MemoryAccessHint{});
+                            if (k < count && takeImmediateFromMemory(code, alt, wordName(k)))
+                                fromMemory[k] = true;
                             body << "    ctx->pc = 0x" << std::hex << alt.address << "u;\n";
-                            body << "    " << cg.translateInstruction(alt, MemoryAccessHint{}) << "\n";
+                            body << "    " << code << "\n";
                         }
                     }
                 }
@@ -142,8 +193,13 @@ namespace ps2recomp
                 out << "        " << (first ? "if (" : "else if (");
                 first = false;
                 for (size_t k = 0; k < count; ++k)
-                    out << (k ? " && " : "") << "cheat_" << std::hex << region.start << "_" << std::dec << k << " == 0x" << std::hex
-                        << region.words[v][k] << "u";
+                {
+                    out << (k ? " && " : "");
+                    if (fromMemory[k])
+                        out << "(" << wordName(k) << " & 0xFFFF0000u) == 0x" << std::hex << (region.words[v][k] & 0xFFFF0000u) << "u";
+                    else
+                        out << wordName(k) << " == 0x" << std::hex << region.words[v][k] << "u";
+                }
                 out << ")\n        {\n" << body.str();
                 if (region.end < function.end)
                     out << "    ctx->pc = 0x" << std::hex << region.end << "u;\n    goto label_" << region.end << ";\n";
@@ -266,7 +322,10 @@ namespace ps2recomp
                     }
                     else
                     {
-                        ss << cg.handleBranchDelaySlots(inst, *delaySlot, function, analysisResult);
+                        std::string code = cg.handleBranchDelaySlots(inst, *delaySlot, function, analysisResult);
+                        if (cheatRoutine && hasDecodedDelaySlot)
+                            (void)takeImmediateFromMemory(code, *delaySlot, fmt::format("FAST_READ32(0x{:x}u)", delaySlot->address));
+                        ss << code;
                     }
 
                     if (hasDecodedDelaySlot)
@@ -302,7 +361,10 @@ namespace ps2recomp
                     ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
                        << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
+                    std::string code = cg.translateInstruction(inst, memoryHint);
+                    if (cheatRoutine)
+                        (void)takeImmediateFromMemory(code, inst, fmt::format("FAST_READ32(0x{:x}u)", inst.address));
+                    ss << "    " << code;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;

@@ -26,8 +26,42 @@ namespace Yktk3Launcher
         public string Category, Title, Japanese, Note;
     }
 
+    // A number a cheat lets the user pick (mods/기능별/값.tsv from tools/cheat_groups.py), kept in config.ini [CheatValues]
+    // as "<file>|<address>=<value>"; the game applies it within a second, also while running.
+    public class CheatParam
+    {
+        public string File, Address, Label, Kind, DefaultText;
+        public long Min, Max, Default;
+        public bool Lockable;
+        public string[] Options = new string[0];
+    }
+
     public static class Cheats
     {
+        public static List<CheatParam> Params(Launcher launcher)
+        {
+            var list = new List<CheatParam>();
+            string path = System.IO.Path.Combine(launcher.ModsDir, "기능별", "값.tsv");
+            if (!File.Exists(path))
+                return list;
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                if (line.StartsWith("#") || line.Trim().Length == 0)
+                    continue;
+                string[] f = line.Split('\t');
+                long min, max, fallback;
+                if (f.Length < 7 || !long.TryParse(f[3], out min) || !long.TryParse(f[4], out max))
+                    continue;
+                if (!long.TryParse(f[5], out fallback))
+                    fallback = 0; // a list (planlist): DefaultText
+                list.Add(new CheatParam { File = f[0], Address = f[1], Label = f[2], Min = min, Max = max, Default = fallback, Kind = f[6],
+                                          DefaultText = f[5],
+                                          Lockable = f.Length > 7 && f[7] == "1",
+                                          Options = f.Length > 8 && f[8].Length > 0 ? f[8].Split('|') : new string[0] });
+            }
+            return list;
+        }
+
         public static List<string> EnabledNames(Launcher launcher)
         {
             return launcher.Config("Mods", "Enabled", "").Split(';').Select(n => n.Trim()).Where(n => n.Length > 0).ToList();
@@ -206,6 +240,22 @@ namespace Yktk3Launcher
         protected override FrameworkElement Build()
         {
             List<CheatFunction> functions = Cheats.Functions(Launcher);
+            List<CheatParam> parameters = Cheats.Params(Launcher);
+            // The game writes the management plans' names here when it has them (it reads them from its own memory).
+            string planFile = System.IO.Path.Combine(Launcher.ModsDir, "기능별", "경영기획 이름.txt");
+            string[] planNames = File.Exists(planFile) ? File.ReadAllLines(planFile, Encoding.UTF8).Where(l => l.Length > 0).ToArray() : new string[0];
+            // Korean names and effects (tools/cheat_names_ko.tsv, copied there at build time), by the game's plan numbers.
+            var planKorean = new Dictionary<int, string[]>();
+            string koreanFile = System.IO.Path.Combine(Launcher.ModsDir, "기능별", "한국어 이름.tsv");
+            if (File.Exists(koreanFile))
+                foreach (string line in File.ReadAllLines(koreanFile, Encoding.UTF8))
+                {
+                    string[] f = line.Split('	');
+                    int number;
+                    if (f.Length >= 3 && f[0] == "plan" && int.TryParse(f[1], out number))
+                        planKorean[number] = new[] { f[2], f.Length > 3 ? f[3] : "" };
+                }
+            int planCount = Math.Max(planNames.Length, planKorean.Count);
             var wholeFunctionFiles = new HashSet<string>(functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
             List<CheatFile> cheats = Cheats.List(Launcher).Where(c => !wholeFunctionFiles.Contains(c.Name)).ToList();
             var enabled = new HashSet<string>(Cheats.EnabledNames(Launcher), StringComparer.OrdinalIgnoreCase);
@@ -282,6 +332,152 @@ namespace Yktk3Launcher
                     text.Children.Add(Ui.Row(name, kind));
                     if (caption.Length > 0)
                         text.Children.Add(Ui.Text(caption, "Caption"));
+                    // The numbers of this cheat: a box (or the game's names) and 적용; 고정 for a data write.
+                    foreach (CheatParam p in parameters.Where(p => string.Equals(p.File, c.Name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        CheatParam param = p;
+                        string key = c.Name + "|" + param.Address;
+                        Func<int, string> planName = delegate(int n)
+                        {
+                            string japanese = n >= 0 && n < planNames.Length ? planNames[n] : "";
+                            string[] korean;
+                            if (planKorean.TryGetValue(n, out korean))
+                                return n + "  " + korean[0] + (japanese.Length > 0 ? " (" + japanese + ")" : "") + (korean[1].Length > 0 ? " · " + korean[1] : "");
+                            return n + "  " + (japanese.Length > 0 ? japanese : "기획 " + n);
+                        };
+                        if (param.Kind == "planlist")
+                        {
+                            // The loop's plans, top to bottom; stored as u16 IDs (0x0B00 + plan number), at least one.
+                            var panel = new StackPanel { Margin = new Thickness(0, 6, 0, 0) };
+                            Action draw = null;
+                            Func<List<int>> readPlans = delegate
+                            {
+                                string stored = Launcher.Config("CheatValues", key, "");
+                                if (stored.Length == 0)
+                                    return param.DefaultText.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).Select(int.Parse).ToList();
+                                return stored.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).Select(s => int.Parse(s) - 0x0B00).ToList();
+                            };
+                            Action<List<int>> save = delegate(List<int> plans)
+                            {
+                                if (plans.Count == 0)
+                                    return;
+                                Launcher.SetConfig("CheatValues", key, string.Join(",", plans.Select(n => (0x0B00 + n).ToString())));
+                                Window.Toast(title + " · 기획 " + plans.Count + "개" + (Game.IsRunning ? " (게임에 바로 적용)" : ""));
+                                draw();
+                            };
+                            draw = delegate
+                            {
+                                panel.Children.Clear();
+                                List<int> plans = readPlans();
+                                panel.Children.Add(Ui.Text(param.Label + " · " + plans.Count + "개", "Caption"));
+                                for (int k = 0; k < plans.Count; k++)
+                                {
+                                    int index = k;
+                                    var up = Ui.Button("위로", delegate
+                                    {
+                                        List<int> edited = readPlans();
+                                        int t = edited[index]; edited[index] = edited[index - 1]; edited[index - 1] = t;
+                                        save(edited);
+                                    }, null, "");
+                                    up.Padding = new Thickness(8, 1, 8, 1);
+                                    up.IsEnabled = index > 0;
+                                    var drop = Ui.Button("빼기", delegate
+                                    {
+                                        List<int> edited = readPlans();
+                                        edited.RemoveAt(index);
+                                        save(edited);
+                                    }, null, "");
+                                    drop.Padding = new Thickness(8, 1, 8, 1);
+                                    drop.IsEnabled = plans.Count > 1; // an empty list would keep the game's loop from ending
+                                    var item = Ui.Text(planName(plans[k]), "Body");
+                                    item.VerticalAlignment = VerticalAlignment.Center;
+                                    item.Margin = new Thickness(8, 0, 0, 0);
+                                    var planRow = Ui.Row(up, drop, item);
+                                    planRow.Margin = new Thickness(0, 2, 0, 0);
+                                    panel.Children.Add(planRow);
+                                }
+                                var pick = new ComboBox { Width = 300 };
+                                pick.Items.Add("+ 추가할 기획 고르기");
+                                int count = planCount > 0 ? planCount : 157;
+                                for (int i = 0; i < count; i++)
+                                    pick.Items.Add(planName(i));
+                                pick.SelectedIndex = 0;
+                                pick.SelectionChanged += delegate
+                                {
+                                    if (pick.SelectedIndex <= 0)
+                                        return;
+                                    List<int> edited = readPlans();
+                                    if (edited.Count < 30)
+                                    {
+                                        edited.Add(pick.SelectedIndex - 1);
+                                        save(edited);
+                                    }
+                                };
+                                var reset = Ui.Button("기본 목록", delegate { save(param.DefaultText.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0).Select(int.Parse).ToList()); }, null, "");
+                                reset.Padding = new Thickness(10, 3, 10, 3);
+                                reset.Margin = new Thickness(8, 0, 0, 0);
+                                var tools = Ui.Row(pick, reset);
+                                tools.Margin = new Thickness(0, 6, 0, 0);
+                                panel.Children.Add(tools);
+                                if (planCount == 0)
+                                    panel.Children.Add(Ui.Text("기획 이름은 게임을 한 번 실행해 운영 화면에 들어가면 나옵니다 (그 전에는 번호만).", "Caption"));
+                            };
+                            draw();
+                            text.Children.Add(panel);
+                            continue;
+                        }
+                        long current;
+                        if (!long.TryParse(Launcher.Config("CheatValues", key, param.Default.ToString()), out current))
+                            current = param.Default;
+                        var label = Ui.Text(param.Label + "  (" + param.Min.ToString("N0") + "~" + param.Max.ToString("N0") + ", 기본 " +
+                                            param.Default.ToString("N0") + ")", "Caption");
+                        label.VerticalAlignment = VerticalAlignment.Center;
+                        label.Margin = new Thickness(0, 0, 10, 0);
+                        FrameworkElement input;
+                        Func<string> read;
+                        string[] choices = param.Kind == "memo" ? param.Options
+                                         : param.Kind == "plan" ? Enumerable.Range(0, planCount).Select(i => planName(i).Substring(planName(i).IndexOf("  ") + 2)).ToArray()
+                                         : new string[0];
+                        if (choices.Length > 0)
+                        {
+                            var box = new ComboBox { Width = 260 };
+                            for (int i = 0; i < choices.Length; i++)
+                                box.Items.Add(i + "  " + choices[i]);
+                            box.SelectedIndex = (int)Math.Max(0, Math.Min(current, choices.Length - 1));
+                            input = box;
+                            read = () => box.SelectedIndex.ToString();
+                        }
+                        else
+                        {
+                            var box = new TextBox { Width = 120, Text = current.ToString() };
+                            input = box;
+                            read = () => box.Text.Replace(",", "").Trim();
+                        }
+                        var apply = Ui.Button("적용", delegate
+                        {
+                            long value;
+                            if (!long.TryParse(read(), out value) || value < param.Min || value > param.Max)
+                            {
+                                Window.Toast(param.Label + ": " + param.Min.ToString("N0") + "~" + param.Max.ToString("N0") + " 사이의 숫자를 넣으세요");
+                                return;
+                            }
+                            Launcher.SetConfig("CheatValues", key, value.ToString());
+                            Window.Toast(title + " · " + param.Label + " = " + value.ToString("N0") + (Game.IsRunning ? " (게임에 바로 적용)" : ""));
+                        }, null, "");
+                        apply.Padding = new Thickness(10, 3, 10, 3);
+                        apply.Margin = new Thickness(8, 0, 0, 0);
+                        var line = Ui.Row(label, input, apply);
+                        line.Margin = new Thickness(0, 6, 0, 0);
+                        text.Children.Add(line);
+                    }
+                    if (parameters.Any(p => p.Lockable && string.Equals(p.File, c.Name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        string lockKey = c.Name + "|lock";
+                        var hold = new CheckBox { Content = "고정 (매 프레임 다시 씀; 끄면 켤 때·바꿀 때 한 번만)",
+                                                  IsChecked = Launcher.Config("CheatValues", lockKey, "1") != "0", Margin = new Thickness(0, 6, 0, 0) };
+                        hold.Click += delegate { Launcher.SetConfig("CheatValues", lockKey, hold.IsChecked == true ? "1" : "0"); };
+                        text.Children.Add(hold);
+                    }
                     Grid.SetColumn(text, 1);
                     row.Children.Add(text);
                     var remove = Ui.Button("휴지통으로", delegate

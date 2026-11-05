@@ -23,6 +23,7 @@ import argparse
 import glob
 import os
 import re
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -166,6 +167,80 @@ MONEY_FIX = [(0x104D68, 0x0803E080),  # j 0xF8200
              (0x0F8208, 0x10800003), (0x0F820C, 0x3C0105F5),  # if a0 == 0 return; at = 99999990
              (0x0F8210, 0x3421E0F6), (0x0F8214, 0xAC810124),  # [a0 + 0x124] = at
              (0x0F8218, 0x03E00008), (0x0F821C, 0x00000000)]  # jr ra
+
+
+# The numbers a cheat lets the user pick (config.ini [CheatValues] "<file>|<address>=<value>", the F2 치트 tab and the
+# launcher): the address as the .pnach line has it, a label, the range and the kind (number; memo = an idea memo by the
+# game's own name table). A word that loads a number (addiu/ori/lui) keeps its instruction and takes the new low half:
+# ps2_recomp compiles those numbers to come from memory, so any value works without compiling it in.
+PARAMS = {
+    "자금 최대 (포인터 코드)": [("6062F190", "자금 (만엔)", 0, 99999999, "number")],
+    "티켓 가격 설정": [("20172980", "티켓 가격 (엔)", 0, 65535, "number")],
+    "경영기획 효과 최대": [("20170EC8", "효과 값 1", 0, 32767, "number"), ("20170E48", "효과 값 2", 0, 32767, "number")],
+    "경영기획 지정 기획 실행 + 비용 0": [("2012B900", "실행할 기획", 0, 156, "plan"), ("2012B910", "비용", 0, 32767, "number")],
+    # The loop's list: u16 plan IDs (0x0B00 + the plan's number in plan.tbb) from 0xF0750, 0 ends it (then from the top).
+    "지정 경영기획 무한 루프": [("200F0750", "돌릴 기획 (위에서부터 차례로, 끝나면 처음부터)", 0, 156, "planlist")],
+    "출장에서 지정 아이디어 메모 획득": [("2012ABB8", "아이디어 메모", 0, 82, "memo")],
+    "성장 폭발 경험치 최대": [("20141A84", "경험치", 0, 32767, "number")],
+    "ichinen 99": [("203A10A4", "레벨형 아이템 레벨 (화면에는 +1)", 0, 98, "number")],
+    "스카우터 최대": [("2068FEB0", "스카우트 능력 값", 0, 127, "number"), ("2068FECC", "지역 값", 0, 32767, "number")],
+}
+# Data writes the user may hold at every frame (고정, the default) or write once: [CheatValues] "<file>|lock=0".
+LOCKABLE = {"자금 최대 (포인터 코드)"}
+
+
+def memo_names(elf_path):
+    """The game's idea memo names (ELF 0x5CD520: 83 pointers to Shift-JIS) for the launcher's list; [] when not found.
+    Read from the user's own ELF at build time into their mods folder, not kept in the repository."""
+    try:
+        data = open(elf_path, "rb").read()
+        phoff, phnum = struct.unpack_from("<I", data, 0x1C)[0], struct.unpack_from("<H", data, 0x2C)[0]
+        segments = [struct.unpack_from("<8I", data, phoff + i * 32) for i in range(phnum)]
+
+        def offset(address):
+            for kind, off, vaddr, _, filesz, _, _, _ in segments:
+                if kind == 1 and vaddr <= address < vaddr + filesz:
+                    return off + address - vaddr
+            return None
+        names = []
+        for i in range(83):
+            pointer = struct.unpack_from("<I", data, offset(0x5CD520 + 4 * i))[0]
+            start = offset(pointer)
+            names.append(data[start:data.index(b"\0", start)].decode("cp932").replace("|", " "))
+        return names
+    except Exception:
+        return []
+
+
+def plan_list_default(path, address):
+    """The plan numbers of a loop list (u16 IDs 0x0B00 + number from `address`, 0 ends it) as "7,4,135"."""
+    words = {}
+    for raw in open(path, encoding="utf-8-sig", errors="replace"):
+        fields = [f.strip() for f in raw.split("//")[0].split("=", 1)[-1].split(",")]
+        if len(fields) >= 5 and fields[3].lower() == "word":
+            words[int(fields[2], 16)] = int(fields[4], 16)
+    numbers, at = [], int(address, 16)
+    while at in words:
+        for half in (words[at] & 0xFFFF, words[at] >> 16):
+            if half == 0:
+                return ",".join(numbers)
+            numbers.append(str(half - 0x0B00))
+        at += 4
+    return ",".join(numbers) if numbers else None
+
+
+def param_default(path, address):
+    """The number a .pnach line at `address` (as written) has now: the low half of a word that loads a number, else the
+    whole value."""
+    for raw in open(path, encoding="utf-8-sig", errors="replace"):
+        fields = [f.strip() for f in raw.split("//")[0].split("=", 1)[-1].split(",")]
+        if len(fields) >= 5 and fields[2].upper() == address.upper():
+            value = int(fields[4], 16)
+            if fields[3].lower() == "word" and value >> 26 in (0x09, 0x0D, 0x0F):
+                low = value & 0xFFFF
+                return low - 0x10000 if value >> 26 == 0x09 and low >= 0x8000 else low
+            return value
+    return None
 
 
 def split(mods, elf_path, functions_path, excel=None):
@@ -371,6 +446,29 @@ def split(mods, elf_path, functions_path, excel=None):
         out.write("# 파일\t분류\t이름\t코드표 이름\t원본\t메모 (tools/cheat_groups.py)\n")
         for row in rows:
             out.write("\t".join(row) + "\n")
+    # Korean names of the plans and memos (tools/cheat_names_ko.tsv, by the game's numbers) for the F2 tab and the launcher
+    korean = os.path.join(ROOT, "tools", "cheat_names_ko.tsv")
+    memo_ko = {}
+    if os.path.exists(korean):
+        text = open(korean, encoding="utf-8").read()
+        open(os.path.join(out_dir, "한국어 이름.tsv"), "w", encoding="utf-8", newline="\n").write(text)
+        for line in text.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 3 and fields[0] == "memo":
+                memo_ko[int(fields[1])] = fields[2] + (" " + fields[3] if len(fields) > 3 and fields[3] else "")
+    memos = memo_names(elf_path)
+    memos = [memo_ko.get(i, name) + (f" ({name})" if i in memo_ko else "") for i, name in enumerate(memos)]
+    with open(os.path.join(out_dir, "값.tsv"), "w", encoding="utf-8", newline="\n") as out:
+        out.write("# 파일\t주소\t이름\t최소\t최대\t기본\t종류\t고정 가능\t이름 목록 (tools/cheat_groups.py PARAMS; config.ini [CheatValues])\n")
+        for row in rows:
+            for address, label, low, high, kind in PARAMS.get(row[2], []):
+                default = (plan_list_default if kind == "planlist" else param_default)(os.path.join(mods, row[0]), address)
+                if default is None:
+                    print(f"cheat groups: {row[2]}: no line at {address} for its value")
+                    continue
+                options = "|".join(memos) if kind == "memo" else ""
+                out.write("\t".join([row[0], address, label, str(low), str(high), str(default), kind,
+                                     "1" if row[2] in LOCKABLE else "0", options]) + "\n")
     print(f"cheat groups: {len(groups)} functions ({extra} only in the code table) + {len(whole)} files kept whole -> "
           f"{out_dir}" + (f"; code table: {len(entries)} entries" if workbook else ""))
     return rows
