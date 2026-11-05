@@ -157,15 +157,16 @@ def lines_of(path):
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 # 資金最大 routine of the "Club Status Cheats": a jump at a function's return (0x104D68) to code written over .rodata
-# text at 0x68FFC8 that stores 99999990 at a fixed address (PCSX2's 0x866390/0x8664D0). The club object is allocated,
-# so here that address is other data (it broke 4 bytes of a save). Same hook, the money of the club object
-# [0x62F190] + 0x124 (as tools/cheat_code.py's pointer code), in free memory below the ELF.
+# text at 0x68FFC8 that stores 99999990 at a fixed address (PCSX2's 0x866390/0x8664D0). That memory is allocated, so
+# here the address is other data (it broke 4 bytes of a save). Same hook, the game's money: [0x5CA114] + 0xE50 in
+# 1000 yen (sub_172BB0; the screen shows it / 10 as 万円, so 99999990 = 999億9999万円), in free memory below the ELF.
+# ([0x62F190] + 0x124, used until 2026-11-05, is only the office header's copy of it.)
 MONEY_HOOK = (0x104D68, 0x081A3FF2)
 MONEY_CAVE = (0x68FFC8, 0x68FFE0)
 MONEY_FIX = [(0x104D68, 0x0803E080),  # j 0xF8200
-             (0x0F8200, 0x3C040063), (0x0F8204, 0x8C84F190),  # a0 = [0x62F190]
+             (0x0F8200, 0x3C04005D), (0x0F8204, 0x8C84A114),  # a0 = [0x5CA114]
              (0x0F8208, 0x10800003), (0x0F820C, 0x3C0105F5),  # if a0 == 0 return; at = 99999990
-             (0x0F8210, 0x3421E0F6), (0x0F8214, 0xAC810124),  # [a0 + 0x124] = at
+             (0x0F8210, 0x3421E0F6), (0x0F8214, 0xAC810E50),  # [a0 + 0xE50] = at
              (0x0F8218, 0x03E00008), (0x0F821C, 0x00000000)]  # jr ra
 
 
@@ -174,8 +175,9 @@ MONEY_FIX = [(0x104D68, 0x0803E080),  # j 0xF8200
 # game's own name table). A word that loads a number (addiu/ori/lui) keeps its instruction and takes the new low half:
 # ps2_recomp compiles those numbers to come from memory, so any value works without compiling it in.
 PARAMS = {
-    "자금 최대 (포인터 코드)": [("6062F190", "자금 (만엔)", 0, 99999999, "number")],
+    "자금 최대 (포인터 코드)": [("605CA114", "자금 (천엔 단위 · 99,999,990 = 999억9999만엔)", 0, 99999990, "number")],
     "티켓 가격 설정": [("20172980", "티켓 가격 (엔)", 0, 65535, "number")],
+    "관중 수 설정 (구장 정원 무시)": [("2016EE78", "관중 수 (명)", 0, 65535, "number")],
     "경영기획 효과 최대": [("20170EC8", "효과 값 1", 0, 32767, "number"), ("20170E48", "효과 값 2", 0, 32767, "number")],
     "경영기획 지정 기획 실행 + 비용 0": [("2012B900", "실행할 기획", 0, 156, "plan"), ("2012B910", "비용", 0, 32767, "number")],
     # The loop's list: u16 plan IDs (0x0B00 + the plan's number in plan.tbb) from 0xF0750, 0 ends it (then from the top).
@@ -185,6 +187,7 @@ PARAMS = {
     "ichinen 99": [("203A10A4", "레벨형 아이템 레벨 (화면에는 +1)", 0, 98, "number")],
     "스카우터 최대": [("2068FEB0", "스카우트 능력 값", 0, 127, "number"), ("2068FECC", "지역 값", 0, 32767, "number")],
 }
+ATTENDANCE = "관중 수 설정 (구장 정원 무시)"
 # Data writes the user may hold at every frame (고정, the default) or write once: [CheatValues] "<file>|lock=0".
 LOCKABLE = {"자금 최대 (포인터 코드)"}
 
@@ -390,7 +393,7 @@ def split(mods, elf_path, functions_path, excel=None):
                         piece = [w for w in piece if not MONEY_CAVE[0] <= w[0] < MONEY_CAVE[1] and w != MONEY_HOOK]
                         piece = MONEY_FIX + piece
                         label = "자금 최대 (구단 상태 루틴)"
-                        note = "PCSX2 고정 주소 대신 구단 [0x62F190]+0x124 에 씀"
+                        note = "PCSX2 고정 주소 대신 게임 자금 [0x5CA114]+0xE50 (천엔 단위)에 씀"
                     elif len(pieces) == 1:
                         label = title
                     else:
@@ -408,6 +411,11 @@ def split(mods, elf_path, functions_path, excel=None):
         add_group(KOREAN.get(entry["jp"], entry["jp"]), entry["jp"], "", entry["on"], f"{os.path.basename(workbook)}",
                   note="코드표에만 있음")
         extra += 1
+    # Cheats of this port with no source file, added last so that the numbers of the others stay. 관중 수: sub_16ED20
+    # (a game day's attendance from fans, ticket price and weather, capped at the stadium) ends with `move s1, v0` in
+    # the delay slot at 0x16EE78; `ori s1, zero, N` makes it N (any 0-65535, past the cap, through PARAMS).
+    add_group(ATTENDANCE, "", "", [(0x16EE78, 0x3411FFFF)], "tools/cheat_groups.py",
+              note="경기 날 관중 수를 이 값으로 (구장 정원보다 커도 됨, 입장료 수입 = 관중 수 x 티켓 가격)")
     # One file per function, numbered by category
     rows, used = [], set()
     category_order = [c for c, _ in CATEGORIES] + ["기타"]
