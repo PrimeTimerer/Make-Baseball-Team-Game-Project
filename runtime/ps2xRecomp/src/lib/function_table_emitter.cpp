@@ -53,6 +53,7 @@ namespace ps2recomp
         };
 
         std::vector<std::pair<uint32_t, std::string>> normalFunctions;
+        std::vector<std::pair<uint32_t, std::string>> cheatRoutines; // outside the game code: not in the dense table
         std::vector<std::pair<uint32_t, std::string>> stubFunctions;
         std::vector<std::pair<uint32_t, std::string>> systemCallFunctions;
         std::vector<std::pair<uint32_t, std::string>> libraryFunctions;
@@ -64,6 +65,11 @@ namespace ps2recomp
 
             std::string generatedName = cg.getFunctionName(function.start);
 
+            if (function.name.rfind("cheat_", 0) == 0 && !function.isStub && !function.isSkipped)
+            {
+                cheatRoutines.emplace_back(function.start, generatedName);
+                continue;
+            }
             if (function.isSkipped)
             {
                 libraryFunctions.emplace_back(function.start, generatedName);
@@ -115,7 +121,12 @@ namespace ps2recomp
 
             for (uint32_t target : targets)
             {
-                addEntry(target, ownerName);
+                // A cheat routine's resume points are registered with it, outside the dense table (which stays the
+                // game code's range: the pnach engine restores code words in it).
+                if (ownerName.rfind("cheat_", 0) == 0)
+                    cheatRoutines.emplace_back(target, ownerName);
+                else
+                    addEntry(target, ownerName);
             }
         }
 
@@ -169,6 +180,23 @@ namespace ps2recomp
         ss << "    }\n";
         ss << "};\n";
         ss << "static const GeneratedFunctionTableInitializer g_generatedFunctionTableInitializer;\n";
+        ss << "}\n\n";
+
+        // Cheat routines (tools/cheat_code.py): code cheats write outside the game code, registered at startup
+        // (src/main.cpp) where calls that miss the dense table look. Declared here, not in ps2_recompiled_functions.h
+        // (the game code's precompiled header).
+        std::unordered_set<std::string> declared;
+        for (const auto &[address, name] : cheatRoutines)
+        {
+            if (declared.insert(name).second)
+                ss << "void " << name << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+        }
+        ss << "void ps2xRegisterGeneratedExtraFunctions(PS2Runtime &runtime) {\n";
+        for (const auto &[address, name] : cheatRoutines)
+        {
+            ss << "    runtime.registerFunction(0x" << std::hex << address << "u, " << name << ");\n" << std::dec;
+        }
+        ss << "    (void)runtime;\n";
         ss << "}\n";
 
         return ss.str();

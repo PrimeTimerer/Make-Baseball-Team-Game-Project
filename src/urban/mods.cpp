@@ -73,16 +73,56 @@ namespace urban::mods
         return enabled;
     }
 
+    std::filesystem::path pathFromConfig(const std::string &text)
+    {
+        // Valid UTF-8 with non-ASCII bytes is UTF-8 (Korean in CP949 never is: its lead bytes are UTF-8 continuation
+        // bytes); anything else is the ANSI code page. A character neither can map gives an empty path, not an
+        // exception (std::filesystem throws on one, and at startup that ended the game).
+        bool ascii = true, utf8 = true;
+        for (size_t i = 0; i < text.size() && utf8;)
+        {
+            const auto c = static_cast<unsigned char>(text[i]);
+            const size_t length = c < 0x80u ? 1u : (c >> 5) == 0x6u ? 2u : (c >> 4) == 0xEu ? 3u : (c >> 3) == 0x1Eu ? 4u : 0u;
+            if (length == 0u || i + length > text.size())
+                utf8 = false;
+            for (size_t k = 1; utf8 && k < length; ++k)
+                utf8 = (static_cast<unsigned char>(text[i + k]) & 0xC0u) == 0x80u;
+            ascii = ascii && length == 1u;
+            i += length ? length : 1u;
+        }
+        try
+        {
+            if (!ascii && utf8)
+                return std::filesystem::path(std::u8string(text.begin(), text.end()));
+            return std::filesystem::path(text);
+        }
+        catch (const std::exception &)
+        {
+            return {};
+        }
+    }
+
     std::vector<std::string> pnachFiles(const std::filesystem::path &configPath, const std::string &enabled, bool log)
     {
         std::vector<std::string> files;
         for (const std::string &name : split(enabled))
         {
-            const std::filesystem::path file = configPath.parent_path() / "mods" / name;
-            if (std::filesystem::exists(file))
-                files.push_back(file.string());
+            const std::filesystem::path relative = pathFromConfig(name);
+            std::error_code error;
+            const std::filesystem::path file = configPath.parent_path() / "mods" / relative;
+            std::string narrow;
+            try
+            {
+                narrow = file.string(); // the pnach loader opens narrow (ANSI) paths
+            }
+            catch (const std::exception &)
+            {
+            }
+            if (!relative.empty() && !narrow.empty() && std::filesystem::exists(file, error))
+                files.push_back(narrow);
             else if (log)
-                std::cerr << "[mods] " << name << " is not in the mods folder" << std::endl;
+                std::cerr << "[mods] " << name << (relative.empty() || narrow.empty() ? ": the name cannot be read (config.ini encoding)"
+                                                                                          : " is not in the mods folder") << std::endl;
         }
         return files;
     }

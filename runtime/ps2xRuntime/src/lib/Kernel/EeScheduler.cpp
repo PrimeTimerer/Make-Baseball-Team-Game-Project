@@ -237,6 +237,18 @@ namespace
     uint32_t g_pendingMaskedIntc = 0u;
     uint32_t g_pendingMaskedDmac = 0u;
     std::atomic<bool> s_hostPacingDefault{false};
+    // Emulation speed (F7/F10 in ps2_runtime.cpp, PS2X_SPEED at start): 100 = normal, 200 = fields twice as often in real
+    // time, 0 = turbo (fields as soon as the EE reaches them). Only the real-time side is scaled; the emulated cycles per
+    // field stay the same, so the game runs as it always does, just faster.
+    std::atomic<int> g_speedPercent{100};
+
+    // A real-time interval at the current speed (turbo: none).
+    template <typename Duration>
+    Duration atSpeed(Duration interval) noexcept
+    {
+        const int speed = g_speedPercent.load(std::memory_order_relaxed);
+        return speed == 100 ? interval : speed <= 0 ? Duration::zero() : interval * 100 / speed;
+    }
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -332,11 +344,26 @@ void EeScheduler::setHostPacingDefault(bool enabled) noexcept
     s_hostPacingDefault.store(enabled, std::memory_order_relaxed);
 }
 
+void ps2xSetSpeedPercent(int percent) noexcept
+{
+    g_speedPercent.store(percent, std::memory_order_relaxed);
+}
+
+int ps2xSpeedPercent() noexcept
+{
+    return g_speedPercent.load(std::memory_order_relaxed);
+}
+
 void EeScheduler::hostCatchUp() noexcept
 {
     m_pacingCheckCycle = m_eeCycle + kHostPacingCheckCycles;
     if (m_pacingRefTime == std::chrono::steady_clock::time_point{} || !ps2x::asyncvif::active(m_runtime.memory()))
         return;
+    // Faster than 100% (F7/F10) the vblank deadlines alone pace the game: the EE neither waits for the VU/GIF workers
+    // when ahead (that kept 200% at ~77 fields/s in a match whose ceiling is ~127) nor skips cycles when behind.
+    if (g_speedPercent.load(std::memory_order_relaxed) != 100)
+        return;
+    const double cyclesPerSecond = static_cast<double>(kEeClockHz);
     if (ps2x::asyncvif::vblankWaitEnabled())
     {
         // MTVU timing model: no catch-up (the game slows down instead of skipping emulated time), but emulated time may
@@ -347,7 +374,7 @@ void EeScheduler::hostCatchUp() noexcept
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_pacingRefTime).count();
         if (elapsed <= 0.0)
             return;
-        const uint64_t expected = m_pacingRefCycle + static_cast<uint64_t>(elapsed * static_cast<double>(kEeClockHz));
+        const uint64_t expected = m_pacingRefCycle + static_cast<uint64_t>(elapsed * cyclesPerSecond);
         constexpr uint64_t kSlackCycles = kEeClockHz / 2000u; // 0.5 ms
         if (m_eeCycle <= expected + kSlackCycles || !ps2x::asyncvif::pipelineBusy(m_runtime.memory()))
             return;
@@ -358,7 +385,7 @@ void EeScheduler::hostCatchUp() noexcept
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_pacingRefTime).count();
     if (elapsed <= 0.0)
         return;
-    const uint64_t expected = m_pacingRefCycle + static_cast<uint64_t>(elapsed * static_cast<double>(kEeClockHz));
+    const uint64_t expected = m_pacingRefCycle + static_cast<uint64_t>(elapsed * cyclesPerSecond);
     const uint64_t field = vblankPeriodCycles();
     if (expected <= m_eeCycle + field / 2u)
         return;
@@ -381,6 +408,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     {
         const char *pacing = std::getenv("PS2X_EE_HOST_PACING");
         m_hostPacing = pacing && *pacing ? *pacing != '0' : s_hostPacingDefault.load(std::memory_order_relaxed);
+        // PS2X_SPEED=200 (or 0 = turbo, config.ini [Runtime]): the speed at start; F7/F10 change it in game.
+        if (const char *speed = std::getenv("PS2X_SPEED"); speed && *speed)
+            g_speedPercent.store(std::clamp(std::atoi(speed), 0, 1000), std::memory_order_relaxed);
     }
     m_pacingCheckCycle = 0;
     m_pacingRefTime = {};
@@ -1650,7 +1680,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
+                  std::chrono::steady_clock::now() + atSpeed(std::chrono::microseconds(tickCount * kAlarmTickMicroseconds)),
                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
     return id;
 }
@@ -2656,16 +2686,20 @@ void EeScheduler::processDueDeadlines()
                 // While the IPU decodes an FMV its commands run inside the EE's register writes (a full-picture CSC
                 // takes ~3 ms) and push vblanks past the 2 ms: the movie ran at ~82% speed. Then late vblanks catch up
                 // as in the synchronous mode (ps2_memory.cpp ps2xIpuActiveRecently, PS2X_IPU_CATCHUP=0 turns it off).
-                const auto catchUp = ps2x::asyncvif::vblankWaitEnabled() && ps2x::asyncvif::active(m_runtime.memory()) &&
+                // Faster than 100% (F7/F10) the next field comes sooner in real time and is not locked to the
+                // monitor's refresh (the screen shows the newest image at each refresh); a late field catches up (up to
+                // 2 fields), so heavy frames do not pull the speed down.
+                const bool normalSpeed = g_speedPercent.load(std::memory_order_relaxed) == 100;
+                const auto catchUp = normalSpeed && ps2x::asyncvif::vblankWaitEnabled() && ps2x::asyncvif::active(m_runtime.memory()) &&
                                              !ps2xIpuActiveRecently()
                                          ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(2))
-                                         : std::chrono::duration_cast<std::chrono::steady_clock::duration>(kMaxVBlankCatchUpFields * vblankPeriod());
+                                         : std::chrono::duration_cast<std::chrono::steady_clock::duration>(kMaxVBlankCatchUpFields * atSpeed(vblankPeriod()));
                 const auto hostStart = std::max(scheduled.hostDeadline, std::chrono::steady_clock::now() - catchUp);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              hostStart + kVBlankDuration,
+                              hostStart + atSpeed(kVBlankDuration),
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
-                              lockToHostVsync(hostStart + vblankPeriod()),
+                              normalSpeed ? lockToHostVsync(hostStart + vblankPeriod()) : hostStart + atSpeed(vblankPeriod()),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
                 m_pacingRefCycle = scheduled.deadlineCycle;
                 m_pacingRefTime = hostStart;
@@ -2850,7 +2884,7 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        const auto timerHostDeadline = std::chrono::steady_clock::now() + atSpeed(eeCyclesToHostDuration(timerCycles));
         if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;

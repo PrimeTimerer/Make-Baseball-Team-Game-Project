@@ -41,7 +41,7 @@ namespace urban::nativeprofile
             uint64_t samples = 0;
             std::unordered_map<DWORD64, uint64_t> self;      // leaf pc -> count
             std::vector<std::vector<DWORD64>> stacks;        // walked stacks (GameThread only)
-            std::vector<uint32_t> stackSecond;               // capture second of each walked stack (F6 captures)
+            std::vector<uint32_t> stackSecond;               // capture second of each walked stack (Ctrl+F6 captures)
             std::vector<double> stackTime;                   // log time of each walked stack (timeline output)
         };
 
@@ -391,7 +391,7 @@ namespace urban::nativeprofile
             closeThreads(session);
         }
 
-        // F6 capture: one press starts sampling (1 ms), the next stops it and writes perfil_<n>.txt (summary, the FPS
+        // Ctrl+F6 capture: one press starts sampling (1 ms), the next stops it and writes perfil_<n>.txt (summary, the FPS
         // line of every second, per-thread hot spots, subsystem split) and perfil_<n>_pilhas.txt (folded stacks) next
         // to urban.exe. Made for comparing scenes, e.g. the character select with 2, 3 and 4 fighters on screen.
         void captureLoop(std::filesystem::path directory)
@@ -404,7 +404,7 @@ namespace urban::nativeprofile
                 ++captureIndex;
             for (;;)
             {
-                const bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+                const bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0 && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                 DWORD foregroundPid = 0;
                 GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPid);
                 const bool pressed = down && !wasDown && foregroundPid == GetCurrentProcessId();
@@ -417,7 +417,7 @@ namespace urban::nativeprofile
 
                 ++captureIndex;
                 const std::string name = "perfil_" + std::to_string(captureIndex);
-                const std::string note = "CAPTURING PROFILE " + std::to_string(captureIndex) + " (F6 to stop)";
+                const std::string note = "CAPTURING PROFILE " + std::to_string(captureIndex) + " (Ctrl+F6 to stop)";
                 ps2_host_display::setOverlayNote(note.c_str());
                 HANDLE process = symbolProcess();
                 Session session;
@@ -425,7 +425,7 @@ namespace urban::nativeprofile
                 std::map<uint32_t, std::string> fpsBySecond;
                 std::map<uint32_t, std::vector<std::string>> marks;
                 uint32_t markCount = 0u;
-                bool markWasDown = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+                bool markWasDown = (GetAsyncKeyState(VK_F7) & 0x8000) != 0 && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                 unsigned lastSerial = 0u;
                 (void)ps2_host_display::fpsLine(lastSerial);
                 const auto start = std::chrono::steady_clock::now();
@@ -442,17 +442,17 @@ namespace urban::nativeprofile
                         lastSerial = serial;
                         fpsBySecond[second] = line;
                     }
-                    // F7: a marker in the table (e.g. right after adding a fighter).
-                    const bool markDown = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+                    // Ctrl+F7 (F7 alone is the 200% speed): a marker in the table (e.g. right after adding a fighter).
+                    const bool markDown = (GetAsyncKeyState(VK_F7) & 0x8000) != 0 && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                     if (markDown && !markWasDown)
                     {
                         ++markCount;
-                        marks[second].push_back("marca " + std::to_string(markCount) + " (F7)");
+                        marks[second].push_back("marca " + std::to_string(markCount) + " (Ctrl+F7)");
                         const std::string markNote = note + "  - mark " + std::to_string(markCount);
                         ps2_host_display::setOverlayNote(markNote.c_str());
                     }
                     markWasDown = markDown;
-                    const bool stopDown = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+                    const bool stopDown = (GetAsyncKeyState(VK_F6) & 0x8000) != 0 && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                     if (stopDown && !wasDown)
                     {
                         wasDown = true;
@@ -521,7 +521,7 @@ namespace urban::nativeprofile
                 const std::filesystem::path stacksPath = directory / (name + "_pilhas.txt");
                 if (std::FILE *out = _wfopen(textPath.wstring().c_str(), L"w"))
                 {
-                    std::fprintf(out, "Captura %u: %.1f segundos, %u marca(s) com F7\n\n", captureIndex, duration, markCount);
+                    std::fprintf(out, "Captura %u: %.1f segundos, %u marca(s) com Ctrl+F7\n\n", captureIndex, duration, markCount);
                     for (const auto &[id, t] : session.threads)
                         if (t.name == "GameThread")
                             secondTable(process, t, fpsBySecond, marks, out);

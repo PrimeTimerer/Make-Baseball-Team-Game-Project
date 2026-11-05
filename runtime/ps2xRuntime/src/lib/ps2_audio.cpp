@@ -431,8 +431,13 @@ void PS2AudioBackend::resetPcm()
     m_impl->statsStart = std::chrono::steady_clock::now();
 }
 
+int ps2xSpeedPercent() noexcept; // Kernel/EeScheduler.cpp
+
 void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
 {
+    // Faster than 100% (F7/F10) the SPU2 makes sound faster than it plays: it is left out (muted) until back at 100%.
+    if (ps2xSpeedPercent() != 100)
+        return;
     std::lock_guard<std::mutex> lock(m_impl->pcmMutex);
     if (m_impl->dump && samples.size_bytes() <= 0xFFFFFF00u - m_impl->dumpBytes)
     {

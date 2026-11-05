@@ -6,17 +6,22 @@
 #define VU1_FORCE_INLINE inline
 #include "ps2_vu1_impl.inl"
 
+#include "runtime/ps2_perf_stats.h"
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,16 +70,29 @@ namespace
         return capture;
     }
 
+    // A micro memory state VU1 has run: its compiled program and, when it runs as pieces, which unit each pc uses. A match
+    // switches between more states than a frame has fields (several code uploads a field, players, stadium, crowd), so
+    // each state is hashed and matched once, then found again by a quick hash and an exact compare (2026-11-05: hashing
+    // 16 KB and matching the pieces again at every upload took ~40% of VU1's time in a match).
     struct Vu1ImageCacheEntry
     {
+        uint64_t quick = 0u;   // quickHash64 of image
+        uint64_t key = 0u;     // fnv1a64 of image: the image key of the compiled code
+        uint64_t lastUse = 0u; // 0 = free
         std::vector<uint8_t> image;
         VU1InterpreterAccess::CompiledProgram program = nullptr;
+        // runVu1Pieces' state for this image: per unit -1 not checked yet, 0 / 1; per pc / 8 -2 not looked up yet, -1 no
+        // unit, else the unit. Empty until the image first runs as pieces.
+        std::vector<int8_t> valid;
+        std::vector<int32_t> atSlot;
+        bool missNoted = false;
     };
 
     struct Vu1CompiledRegistry
     {
         std::unordered_map<uint64_t, VU1InterpreterAccess::CompiledProgram> programs;
-        std::vector<Vu1ImageCacheEntry> recent;
+        std::vector<Vu1ImageCacheEntry> recent; // reserved once: the piece registry points into it
+        uint64_t useClock = 0u;
         const PS2Memory *memory = nullptr;
         const uint8_t *code = nullptr;
         uint64_t generation = ~0ull;
@@ -82,29 +100,93 @@ namespace
         bool enabled = true;
     };
 
-    VU1InterpreterAccess::CompiledProgram findCompiledVu1Image(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
+    // Finds a cached state, not an image key (that is fnv1a64, as tools/vu1_generate.py computes it): four independent
+    // lanes, ~1 us for 16 KB where the byte-serial FNV takes ~15 us. A collision only costs the exact compare.
+    inline uint64_t rotl64(uint64_t value, int bits)
     {
-        for (size_t index = 0; index < registry.recent.size(); ++index)
-        {
-            Vu1ImageCacheEntry &entry = registry.recent[index];
-            if (entry.image.size() == codeSize && std::memcmp(entry.image.data(), vuCode, codeSize) == 0)
+        return (value << bits) | (value >> (64 - bits));
+    }
+
+    uint64_t quickHash64(const uint8_t *data, size_t size)
+    {
+        constexpr uint64_t kPrime1 = 0x9E3779B185EBCA87ull;
+        constexpr uint64_t kPrime2 = 0xC2B2AE3D27D4EB4Full;
+        uint64_t lanes[4] = {kPrime1 + kPrime2, kPrime2, 0u, 0u - kPrime1};
+        size_t i = 0;
+        for (; i + 32u <= size; i += 32u)
+            for (int lane = 0; lane < 4; ++lane)
             {
-                if (index != 0u)
-                    std::swap(registry.recent[index], registry.recent[0]);
-                return registry.recent[0].program;
+                uint64_t word;
+                std::memcpy(&word, data + i + static_cast<size_t>(lane) * 8u, sizeof(word));
+                lanes[lane] = rotl64(lanes[lane] + word * kPrime2, 31) * kPrime1;
             }
+        uint64_t hash = rotl64(lanes[0], 1) + rotl64(lanes[1], 7) + rotl64(lanes[2], 12) + rotl64(lanes[3], 18) + size;
+        for (; i < size; ++i)
+            hash = (hash ^ data[i]) * kPrime1;
+        hash ^= hash >> 33;
+        hash *= kPrime2;
+        hash ^= hash >> 29;
+        return hash;
+    }
+
+    // ps2x::perf (runtime/ps2_perf_stats.h): VU1 time by kind and the images that run interpreted.
+    std::atomic<uint64_t> g_vu1InterpretedNs{0u};
+    std::atomic<uint64_t> g_vu1CompiledNs{0u};
+    std::mutex g_missingMutex;
+    std::filesystem::path g_missingDirectory;
+    std::unordered_set<uint64_t> g_missingSeen;
+    std::vector<uint64_t> g_missingNew;
+
+    void noteMissingVu1Image(const uint8_t *vuCode, uint32_t codeSize, uint64_t hash)
+    {
+        std::lock_guard<std::mutex> lock(g_missingMutex);
+        if (!g_missingSeen.insert(hash).second)
+            return;
+        g_missingNew.push_back(hash);
+        if (g_missingDirectory.empty())
+            return;
+        char name[64];
+        std::snprintf(name, sizeof(name), "vu1_%016llx.bin", static_cast<unsigned long long>(hash));
+        std::error_code error;
+        std::filesystem::create_directories(g_missingDirectory, error);
+        const std::filesystem::path path = g_missingDirectory / name;
+        if (!std::filesystem::exists(path, error))
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(vuCode), codeSize);
+    }
+
+    // The cached state of the micro memory in place: found by its quick hash and the exact bytes, else the least recently
+    // used entry is filled (whole-image program looked up by the image key; piece state cleared).
+    Vu1ImageCacheEntry &findVu1State(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
+    {
+        constexpr size_t kStates = 64u;
+        if (registry.recent.capacity() < kStates)
+            registry.recent.reserve(kStates); // once, before any entry exists: entries never move afterwards
+        const uint64_t quick = quickHash64(vuCode, codeSize);
+        Vu1ImageCacheEntry *oldest = nullptr;
+        for (Vu1ImageCacheEntry &entry : registry.recent)
+        {
+            if (entry.lastUse != 0u && entry.quick == quick && entry.image.size() == codeSize &&
+                std::memcmp(entry.image.data(), vuCode, codeSize) == 0)
+            {
+                entry.lastUse = ++registry.useClock;
+                return entry;
+            }
+            if (!oldest || entry.lastUse < oldest->lastUse)
+                oldest = &entry;
         }
-        const auto it = registry.programs.find(fnv1a64(vuCode, codeSize));
-        Vu1ImageCacheEntry entry;
+        if (registry.recent.size() < kStates)
+            oldest = &registry.recent.emplace_back();
+        Vu1ImageCacheEntry &entry = *oldest;
+        entry.quick = quick;
+        entry.key = fnv1a64(vuCode, codeSize);
+        entry.lastUse = ++registry.useClock;
         entry.image.assign(vuCode, vuCode + codeSize);
+        const auto it = registry.programs.find(entry.key);
         entry.program = it == registry.programs.end() ? nullptr : it->second;
-        constexpr size_t kRecentImages = 8u;
-        if (registry.recent.size() < kRecentImages)
-            registry.recent.push_back(std::move(entry));
-        else
-            registry.recent.back() = std::move(entry);
-        std::swap(registry.recent.back(), registry.recent[0]);
-        return registry.recent[0].program;
+        entry.valid.clear();
+        entry.atSlot.clear();
+        entry.missNoted = false;
+        return entry;
     }
 
     struct Vu1Trace
@@ -149,7 +231,7 @@ namespace
         return trace;
     }
 
-    // F8 in the game window (ps2_runtime.cpp) asks for a trace of the next few fields without PS2X_VU1_TRACE.
+    // Ctrl+F8 in the game window (ps2_runtime.cpp) asks for a trace of the next few fields without PS2X_VU1_TRACE.
     std::atomic<uint32_t> g_vu1TraceRequestFields{0u};
     Vu1Trace *g_vu1HotkeyTrace = nullptr;
 
@@ -269,10 +351,114 @@ namespace
         return registry;
     }
 
+    // Piece units (vu1_recomp --pieces): the code of one microcode piece at its fixed address, compiled once. The game
+    // loads its pieces into fixed places of micro memory and leaves the pieces of earlier scenes in the rest, so most
+    // micro memory images are new combinations of known pieces; a unit runs wherever its piece's bytes are in place.
+    struct Vu1PieceUnit
+    {
+        uint32_t start = 0u;
+        uint32_t end = 0u;
+        uint64_t bytesHash = 0u;
+        VU1InterpreterAccess::CompiledProgram run = nullptr;
+    };
+
+    struct Vu1PieceRegistry
+    {
+        std::vector<Vu1PieceUnit> units;
+        std::vector<std::vector<uint32_t>> bySlot; // pc / 8 -> the units covering it, longest first
+        // The micro memory being run (lookupCompiledVu1Program's image) and its cached state (Vu1ImageCacheEntry):
+        const uint8_t *code = nullptr;
+        uint32_t codeSize = 0u;
+        Vu1ImageCacheEntry *state = nullptr;
+    };
+
+    Vu1PieceRegistry &vu1PieceRegistry()
+    {
+        static Vu1PieceRegistry registry;
+        return registry;
+    }
+
+    void preparePieces(Vu1PieceRegistry &r, const uint8_t *code, uint32_t codeSize, Vu1ImageCacheEntry &state)
+    {
+        const size_t slots = VU1InterpreterAccess::kFastCodeSize / 8u;
+        if (r.bySlot.empty())
+        {
+            r.bySlot.assign(slots, {});
+            for (uint32_t index = 0; index < r.units.size(); ++index)
+                for (uint32_t slot = r.units[index].start / 8u; slot < r.units[index].end / 8u && slot < slots; ++slot)
+                    r.bySlot[slot].push_back(index);
+            for (auto &list : r.bySlot)
+                std::stable_sort(list.begin(), list.end(), [&](uint32_t a, uint32_t b)
+                                 { return r.units[a].end - r.units[a].start > r.units[b].end - r.units[b].start; });
+        }
+        r.code = code;
+        r.codeSize = codeSize;
+        r.state = &state;
+        if (state.atSlot.size() != slots || state.valid.size() != r.units.size())
+        {
+            state.valid.assign(r.units.size(), -1);
+            state.atSlot.assign(slots, -2);
+            state.missNoted = false;
+        }
+    }
+
+    const Vu1PieceUnit *pieceUnitAt(Vu1PieceRegistry &r, uint32_t pc)
+    {
+        const uint32_t slot = pc / 8u;
+        if ((pc & 7u) != 0u || !r.state || slot >= r.state->atSlot.size() || !r.code)
+            return nullptr;
+        int32_t &chosen = r.state->atSlot[slot];
+        if (chosen == -2)
+        {
+            chosen = -1;
+            for (const uint32_t index : r.bySlot[slot])
+            {
+                const Vu1PieceUnit &unit = r.units[index];
+                int8_t &ok = r.state->valid[index];
+                if (ok < 0)
+                    ok = unit.end <= r.codeSize && fnv1a64(r.code + unit.start, unit.end - unit.start) == unit.bytesHash ? 1 : 0;
+                if (ok)
+                {
+                    chosen = static_cast<int32_t>(index);
+                    break;
+                }
+            }
+        }
+        return chosen >= 0 ? &r.units[static_cast<size_t>(chosen)] : nullptr;
+    }
+
+    // The compiled program of an image no whole-image code exists for: the units of the pieces in place, one after the
+    // other; where none is, Fallback lets runLoopWith interpret one pair and come back.
+    VU1InterpreterAccess::StepResult runVu1Pieces(VU1Interpreter &vu, const Vu1RunArgs &args)
+    {
+        using StepResult = VU1InterpreterAccess::StepResult;
+        Vu1PieceRegistry &r = vu1PieceRegistry();
+        for (;;)
+        {
+            const uint32_t pc = vu.state().pc;
+            const Vu1PieceUnit *unit = pieceUnitAt(r, pc);
+            if (!unit)
+            {
+                if (r.state && !r.state->missNoted)
+                {
+                    r.state->missNoted = true; // the performance log keeps such an image (it holds a piece no unit has)
+                    noteMissingVu1Image(r.code, r.codeSize, r.state->key);
+                }
+                return StepResult::Fallback;
+            }
+            const StepResult result = unit->run(vu, args);
+            if (result != StepResult::Fallback)
+                return result;
+            const uint32_t next = vu.state().pc;
+            if (next >= unit->start && next < unit->end)
+                return StepResult::Fallback; // a pair the unit leaves to the interpreter
+        }
+    }
+
     VU1InterpreterAccess::CompiledProgram lookupCompiledVu1Program(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory)
     {
         Vu1CompiledRegistry &registry = vu1CompiledRegistry();
-        if (!registry.enabled || registry.programs.empty() || !memory)
+        if (!registry.enabled || (registry.programs.empty() && vu1PieceRegistry().units.empty()) || !memory)
             return nullptr;
         const uint64_t generation = memory->getVU1CodeGeneration();
         if (registry.memory != memory || registry.code != vuCode || registry.generation != generation)
@@ -280,7 +466,19 @@ namespace
             registry.memory = memory;
             registry.code = vuCode;
             registry.generation = generation;
-            registry.current = findCompiledVu1Image(registry, vuCode, codeSize);
+            Vu1ImageCacheEntry &state = findVu1State(registry, vuCode, codeSize);
+            registry.current = state.program;
+            Vu1PieceRegistry &pieces = vu1PieceRegistry();
+            if (!registry.current && !pieces.units.empty() && codeSize == VU1InterpreterAccess::kFastCodeSize)
+            {
+                preparePieces(pieces, vuCode, codeSize, state);
+                registry.current = &runVu1Pieces;
+            }
+            else if (!registry.current && !state.missNoted)
+            {
+                state.missNoted = true;
+                noteMissingVu1Image(vuCode, codeSize, state.key);
+            }
         }
         return registry.current;
     }
@@ -1145,6 +1343,28 @@ bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t
     return runLoopWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, compiled);
 }
 
+ps2x::perf::Vu1Times ps2x::perf::takeVu1Times() noexcept
+{
+    Vu1Times times;
+    times.interpretedNs = g_vu1InterpretedNs.exchange(0u, std::memory_order_relaxed);
+    times.compiledNs = g_vu1CompiledNs.exchange(0u, std::memory_order_relaxed);
+    return times;
+}
+
+void ps2x::perf::setMissingVu1Directory(const std::filesystem::path &directory)
+{
+    std::lock_guard<std::mutex> lock(g_missingMutex);
+    g_missingDirectory = directory;
+}
+
+std::vector<uint64_t> ps2x::perf::takeNewMissingVu1()
+{
+    std::lock_guard<std::mutex> lock(g_missingMutex);
+    std::vector<uint64_t> hashes;
+    hashes.swap(g_missingNew);
+    return hashes;
+}
+
 bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                        GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled)
 {
@@ -1161,11 +1381,19 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
     bool programEnded = false;
     const Vu1RunArgs compiledArgs{vuData, dataSize, &gs, memory, codeSize, budgetEnd};
     bool interpretNextPair = false;
+    // VU1 time by kind for the performance log (runtime/ps2_perf_stats.h): compiled calls and interpreted pairs.
+    using Clock = std::chrono::steady_clock;
+    const bool timed = vu.m_unit == VU1Interpreter::Unit::VU1;
+    const auto elapsedNs = [](Clock::time_point since)
+    { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - since).count()); };
     while (vu.m_cycle < budgetEnd && !vu.m_stopRequested)
     {
         if (compiled && !interpretNextPair)
         {
+            const Clock::time_point compiledStart = timed ? Clock::now() : Clock::time_point{};
             const StepResult result = compiled(vu, compiledArgs);
+            if (timed)
+                g_vu1CompiledNs.fetch_add(elapsedNs(compiledStart), std::memory_order_relaxed);
             if (result == StepResult::Budget)
                 break;
             if (result == StepResult::Ended)
@@ -1177,6 +1405,18 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
             continue;
         }
         interpretNextPair = false;
+        const Clock::time_point interpretStart = timed ? Clock::now() : Clock::time_point{};
+        struct AddTime
+        {
+            bool on;
+            Clock::time_point start;
+            uint64_t (*elapsed)(Clock::time_point);
+            ~AddTime()
+            {
+                if (on)
+                    g_vu1InterpretedNs.fetch_add(elapsed(start), std::memory_order_relaxed);
+            }
+        } addInterpreted{timed, interpretStart, +elapsedNs};
         if (vu.m_unit == VU1Interpreter::Unit::VU1)
             vu1NormShadow.valid = false;
         else
@@ -1324,6 +1564,14 @@ bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, 
     shadowData.assign(vuData, vuData + dataSize);
     const uint32_t startPc = vu.m_state.pc;
     const uint64_t startCycle = vu.m_cycle;
+    // PS2X_VU1_BISECT: the start state, for re-running a mismatching run (below).
+    static thread_local std::unique_ptr<VU1Interpreter> start;
+    static thread_local std::vector<uint8_t> startData;
+    if (const char *v = std::getenv("PS2X_VU1_BISECT"); v && *v == '1')
+    {
+        start = std::make_unique<VU1Interpreter>(vu);
+        startData.assign(vuData, vuData + dataSize);
+    }
 
     Vu1PacketSink realSink;
     realSink.forward = forward;
@@ -1562,6 +1810,93 @@ bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, 
                          static_cast<unsigned long long>(fnv1a64(vuCode, codeSize)), startPc, a.pc, b.pc, diff.c_str());
             std::fflush(stderr);
         }
+        // PS2X_VU1_BISECT=1: for the first mismatches, the first cycle budget at which the compiled and the interpreted
+        // runs differ (pc, VF/VI registers or VU memory), re-running both from the saved start on copies.
+        static const bool bisect = [] { const char *v = std::getenv("PS2X_VU1_BISECT"); return v && *v == '1'; }();
+        static thread_local unsigned bisected = 0u;
+        if (bisect && compiled && start && bisected < 4u)
+        {
+            ++bisected;
+            Vu1PacketSink drop;
+            drop.forward = false;
+            std::string qInfo; // Q, the pending DIV/SQRT/RSQRT and the cycle of each run, for timing differences
+            const auto stateAt = [&](uint32_t budget, bool useCompiled, VU1State &state, std::vector<uint8_t> &data)
+            {
+                auto unit = std::make_unique<VU1Interpreter>(*start);
+                data = startData;
+                packetSink = &drop;
+                runLoopWith(*unit, vuCode, codeSize, data.data(), dataSize, gs, memory, budget, useCompiled ? compiled : nullptr);
+                packetSink = nullptr;
+                state = effectiveState(*unit);
+                uint32_t q = 0u, pending = 0u, w15 = 0u, y22 = 0u;
+                std::memcpy(&q, &unit->m_state.q, 4u);
+                std::memcpy(&pending, &unit->m_fdiv.value, 4u);
+                std::memcpy(&w15, &state.vf[15][3], 4u);
+                std::memcpy(&y22, &state.vf[22][1], 4u);
+                char text[200];
+                std::snprintf(text, sizeof(text), " [%s @%u: cycle %llu pc %04x Q %08x fdiv %s ready %llu value %08x vf15.w %08x vf22.y %08x]",
+                              useCompiled ? "C" : "I", budget, static_cast<unsigned long long>(unit->m_cycle - startCycle), unit->m_state.pc,
+                              q, unit->m_fdiv.valid ? "on" : "off",
+                              static_cast<unsigned long long>(unit->m_fdiv.valid ? unit->m_fdiv.readyCycle - startCycle : 0u), pending, w15, y22);
+                qInfo = text;
+            };
+            const auto same = [](const VU1State &x, const VU1State &y, const std::vector<uint8_t> &dx, const std::vector<uint8_t> &dy)
+            {
+                if (x.pc != y.pc || dx != dy)
+                    return false;
+                for (uint32_t reg = 0; reg < 32u; ++reg)
+                    if (!sameBits(x.vf[reg], y.vf[reg]))
+                        return false;
+                for (uint32_t reg = 0; reg < 16u; ++reg)
+                    if (x.vi[reg] != y.vi[reg])
+                        return false;
+                return true;
+            };
+            uint32_t lo = 0u;
+            uint32_t hi = static_cast<uint32_t>(std::max(vu.m_cycle, shadow->m_cycle) - startCycle) + 1u;
+            VU1State x, y;
+            std::vector<uint8_t> dx, dy;
+            while (hi - lo > 1u)
+            {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                stateAt(mid, true, x, dx);
+                stateAt(mid, false, y, dy);
+                (same(x, y, dx, dy) ? lo : hi) = mid;
+            }
+            VU1State lx, ly;
+            std::vector<uint8_t> ldx, ldy;
+            std::string timing;
+            stateAt(lo, true, lx, ldx);
+            timing += qInfo;
+            stateAt(lo, false, ly, ldy);
+            timing += qInfo;
+            stateAt(hi, true, x, dx);
+            timing += qInfo;
+            stateAt(hi, false, y, dy);
+            timing += qInfo;
+            std::string where;
+            for (uint32_t reg = 0; reg < 32u; ++reg)
+                if (!sameBits(x.vf[reg], y.vf[reg]))
+                    where += " vf" + std::to_string(reg);
+            for (uint32_t reg = 0; reg < 16u; ++reg)
+                if (x.vi[reg] != y.vi[reg])
+                    where += " vi" + std::to_string(reg) + "=" + std::to_string(x.vi[reg]) + "/" + std::to_string(y.vi[reg]);
+            if (dx != dy)
+                for (size_t at = 0; at < dx.size(); at += 16u)
+                    if (std::memcmp(dx.data() + at, dy.data() + at, 16u) != 0)
+                    {
+                        char text[32];
+                        std::snprintf(text, sizeof(text), " mem@%04zx", at / 16u);
+                        where += text;
+                        break;
+                    }
+            std::fprintf(stderr,
+                         "[vu1-bisect] image %016llx entry %04x: same through %u cycles (pc %04x/%04x), first difference at %u "
+                         "cycles: pc %04x/%04x (compiled/interpreted)%s\n[vu1-bisect]   timing:%s\n",
+                         static_cast<unsigned long long>(fnv1a64(vuCode, codeSize)), startPc, lo, lx.pc, ly.pc, hi, x.pc, y.pc,
+                         where.c_str(), timing.c_str());
+            std::fflush(stderr);
+        }
     }
     if ((stats.runs & 0x3FFFu) == 0u && g_vu1WindowAccesses.load(std::memory_order_relaxed) != 0u)
         std::fprintf(stderr, "[vu1-verify] ERROR: %llu accesses to VU1's register window (see [vu1-window])\n",
@@ -1590,6 +1925,14 @@ void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::Compil
     vu1CompiledRegistry().programs[imageHash] = program;
 }
 
+// vu1_recomp --pieces (generated vu1_programs.cpp): a unit for the piece [start, end) whose bytes hash to bytesHash.
+void registerVu1PieceUnit(uint32_t start, uint32_t end, uint64_t bytesHash, VU1InterpreterAccess::CompiledProgram program)
+{
+    Vu1PieceRegistry &registry = vu1PieceRegistry();
+    registry.units.push_back({start, end, bytesHash, program});
+    registry.bySlot.clear(); // rebuilt at the first lookup
+}
+
 void saveVuState(VU1Interpreter &vu, ps2x::state::Writer &out)
 {
     VU1InterpreterAccess::serializeState(vu, out);
@@ -1600,7 +1943,7 @@ void loadVuState(VU1Interpreter &vu, ps2x::state::Reader &in)
     VU1InterpreterAccess::serializeState(vu, in);
 }
 
-// Called on F8 (ps2_runtime.cpp): trace every VU1 run of the next `fields` fields to vu1trace_<tick>.bin.
+// Called on Ctrl+F8 (ps2_runtime.cpp): trace every VU1 run of the next `fields` fields to vu1trace_<tick>.bin.
 void ps2xRequestVu1Trace(uint32_t fields)
 {
     g_vu1TraceRequestFields.store(fields, std::memory_order_release);

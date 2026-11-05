@@ -33,6 +33,7 @@
 #include <cmath>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -541,6 +542,24 @@ bool ImGuiManager::Initialize()
         g_osdFont = std::filesystem::exists(roboto, error) ? io.Fonts->AddFontFromFileTTF(roboto.c_str(), 20.0f) : nullptr;
         if (!g_osdFont)
             g_osdFont = io.Fonts->AddFontDefault();
+#if defined(_WIN32)
+        // Japanese and Korean (player names, the Korean menu tabs): Windows' own fonts merged into it; ImGui 1.92 loads
+        // a glyph when it is first drawn. The first Japanese font found, then the first Korean one (Hangul).
+        {
+            const char *windir = std::getenv("WINDIR");
+            const std::string fonts = std::string(windir && *windir ? windir : "C:\\Windows") + "\\Fonts\\";
+            ImFontConfig merge;
+            merge.MergeMode = true;
+            for (const auto &choices : {std::initializer_list<const char *>{"YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"},
+                                        std::initializer_list<const char *>{"malgun.ttf", "gulim.ttc"}})
+                for (const char *file : choices)
+                    if (std::filesystem::exists(fonts + file, error))
+                    {
+                        io.Fonts->AddFontFromFileTTF((fonts + file).c_str(), 20.0f, &merge);
+                        break;
+                    }
+        }
+#endif
     }
     WindowResized();
     NewFrame();

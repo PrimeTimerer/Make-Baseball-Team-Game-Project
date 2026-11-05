@@ -68,6 +68,7 @@ namespace ps2recomp
             config.autoStubByName = toml::find_or<bool>(general, "auto_stub_by_name", config.autoStubByName);
             config.directTailCalls = toml::find_or<bool>(general, "direct_tail_calls", config.directTailCalls);
             config.runtimeRelocationsPath = toml::find_or<std::string>(general, "runtime_relocations", "");
+            config.cheatCodePath = toml::find_or<std::string>(general, "cheat_code", "");
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {

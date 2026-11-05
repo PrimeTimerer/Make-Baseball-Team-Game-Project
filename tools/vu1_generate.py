@@ -31,6 +31,8 @@ ZERO = bytes(8)
 # Compiled code that differs from the interpreter (PS2X_VU1_VERIFY=obs): the w lane of stored vectors gets a VI value
 # where the interpreter keeps the memory's (2026-11-04, the opening of a COM vs COM match). Interpreted, the match still
 # runs at ~58 of 60 fields/s.
+# (8a486be5e9cce0a8, excluded on 2026-11-04 for a stale JALR target, compiles right since vu1_recomp reads JR/JALR
+# registers like the interpreter.)
 EXCLUDED = {"7a19a174a1858c8e", "821ecaddc3221d92", "aa9deea297816605"}
 HEADER = """\
 # VU1 microcode images for tools/vu1_generate.py, rebuilt from your own SLPM_658.53: no game bytes, only where the
@@ -56,6 +58,48 @@ def section(elf, name):
         if elf[names + h[0]:elf.index(b"\0", names + h[0])] == name:
             return h[4], h[4] + h[5]
     sys.exit(f"no {name.decode()} section in the ELF")
+
+
+# VIF codes a microcode packet can hold besides MPG, by command: none of them carries data, or the number of bytes they do
+VIF_NO_DATA = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x10, 0x11, 0x13, 0x14, 0x15, 0x17}
+VIF_FIXED_DATA = {0x20: 4, 0x30: 16, 0x31: 16}  # STMASK, STROW, STCOL
+
+
+def elf_uploads(elf):
+    """Every microcode upload in the ELF: .vutext holds DMA packets (a CNT, RET or END tag, then VIF codes) that the game
+    sends as they are, each MPG putting code at a fixed micro memory address. Scenes nobody captured yet use them too.
+    Returns {(address, code): ELF offset}."""
+    lo, hi = section(elf, b".vutext")
+    uploads = {}
+    for tag in range(lo, hi - 15, 16):
+        word, address_word = struct.unpack_from("<II", elf, tag)
+        kind, qwc = (word >> 28) & 7, word & 0xFFFF
+        end = tag + 16 + qwc * 16
+        # CNT/RET/END: no address, reserved bits clear (code words seldom look like that)
+        if kind not in (1, 6, 7) or (word >> 16) & 0xFFF or address_word or not qwc or end > hi:
+            continue
+        found, pos = [], tag + 8
+        while found is not None and pos < end:
+            code = struct.unpack_from("<I", elf, pos)[0]
+            command = (code >> 24) & 0x7F
+            pos += 4
+            if command == 0x4A:  # MPG: num pairs (0 = 256) to address imm * 8
+                length, address = (((code >> 16) & 0xFF) or 256) * 8, (code & 0xFFFF) * 8
+                if address + length > CODE_SIZE or pos + length > end:
+                    found = None
+                else:
+                    found.append((address, pos, length))
+                    pos += length
+            elif command in VIF_FIXED_DATA:
+                pos += VIF_FIXED_DATA[command]
+            elif command in (0x50, 0x51):  # DIRECT, DIRECTHL
+                pos += ((code & 0xFFFF) or 0x10000) * 16
+            elif command not in VIF_NO_DATA:
+                found = None
+        if found and pos == end:
+            for address, offset, length in found:
+                uploads.setdefault((address, elf[offset:offset + length]), offset)
+    return uploads
 
 
 def rebuild(elf, pieces):
@@ -133,6 +177,8 @@ def main():
         if not os.path.exists(args.elf):
             sys.exit(f"{args.elf} missing: python build.py generate extracts it from your disc image")
         elf = open(args.elf, "rb").read()
+    elif os.path.exists(args.elf):
+        elf = open(args.elf, "rb").read()
 
     images = {}
     for name, pieces in recipes.items():
@@ -164,15 +210,53 @@ def main():
 
     selected = os.path.join(ROOT, "build", "vu1_images")
     staging = os.path.join(ROOT, "build", "vu1_staging")
+    piece_dir = os.path.join(ROOT, "build", "vu1_pieces")
     out = os.path.join(ROOT, "generated", "vu1")
-    for path in (selected, staging):
+    for path in (selected, staging, piece_dir):
         shutil.rmtree(path, ignore_errors=True)
         os.makedirs(path)
     for name, image in images.items():
         if name not in EXCLUDED:
             with open(os.path.join(selected, f"vu1_{name}.bin"), "wb") as f:
                 f.write(image)
-    r = subprocess.run([RECOMP, selected, staging], capture_output=True, text=True)
+    # Piece units: every piece of the listed images, and every MPG upload of the ELF, at its place in micro memory,
+    # compiled on its own. The game keeps its pieces at fixed addresses and leaves earlier scenes' pieces in the rest of
+    # micro memory, so a scene's image is often new while its pieces are known; the runtime then runs the units of the
+    # pieces in place (ps2_vu1_core.cpp).
+    pieces, excluded_pieces = {}, []
+    for name, recipe in recipes.items():
+        address = 0
+        for piece in recipe:
+            where, length = piece.split("+")
+            length = int(length, 16)
+            if where != "z":
+                offset = int(where, 16)
+                data = elf[offset:offset + length]
+                if name in EXCLUDED:
+                    excluded_pieces.append((address, data))
+                else:
+                    pieces.setdefault((address, data), offset)
+            address += length
+    from_images = len(pieces)
+
+    def in_excluded(address, data):
+        """Does this code hold part of an excluded image's code at the same place? (It stays interpreted.)"""
+        for other, code in excluded_pieces:
+            lo, hi = max(address, other), min(address + len(data), other + len(code))
+            if lo < hi and data[lo - address:hi - address] == code[lo - other:hi - other]:
+                return True
+        return False
+
+    # ...and every upload in the ELF, so the scenes no capture has met run compiled too
+    for (address, data), offset in (elf_uploads(elf) if elf else {}).items():
+        if (address, data) not in pieces and not in_excluded(address, data):
+            pieces[(address, data)] = offset
+    for (address, data), offset in pieces.items():
+        image = bytearray(CODE_SIZE)
+        image[address:address + len(data)] = data
+        with open(os.path.join(piece_dir, f"vup_{address:04x}_{address + len(data):04x}_{offset:x}.bin"), "wb") as f:
+            f.write(image)
+    r = subprocess.run([RECOMP, selected, staging, "--pieces", piece_dir], capture_output=True, text=True)
     if r.returncode:
         sys.exit(f"vu1_recomp failed ({r.returncode}):\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
     os.makedirs(out, exist_ok=True)
@@ -189,7 +273,9 @@ def main():
             removed += 1
     excluded = len(EXCLUDED & set(images))
     print(f"{len(images)} images ({from_list} rebuilt from recomp/vu1_images.txt, {len(images) - from_list} more captured; "
-          f"{excluded} left out) -> {len(new)} files in generated/vu1: {written} written, {removed} removed")
+          f"{excluded} left out) + {len(pieces)} piece units ({from_images} from the images, "
+          f"{len(pieces) - from_images} more ELF uploads) -> {len(new)} files in generated/vu1: {written} written, "
+          f"{removed} removed")
 
 
 if __name__ == "__main__":

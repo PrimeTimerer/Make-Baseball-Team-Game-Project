@@ -13,6 +13,10 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
+
+extern const uint32_t g_ps2RecompiledFunctionTableBase; // generated/register_functions.cpp: the recompiled game code
+extern const uint32_t g_ps2RecompiledFunctionTableEnd;
 
 namespace ps2x::pnach
 {
@@ -28,6 +32,11 @@ namespace ps2x::pnach
         bool g_loaded = false;
         std::atomic<bool> g_onceAfterReload{false};
         std::atomic<bool> g_reloadRequested{false};
+        // Game code words the patches overwrote (address -> original), EE thread only. The recompiled code runs the
+        // version of a place that matches the words in memory (tools/cheat_code.py), so after a reload the originals
+        // are written back first: a code cheat switched off stops at once (PCSX2 kept it until a restart).
+        std::unordered_map<uint32_t, uint32_t> g_codeOriginals;
+        std::atomic<bool> g_restoreCode{false};
         std::atomic<uint64_t> g_writes{0u};
         std::vector<std::function<void()>> g_frameHooks; // set before the game starts, run on the EE thread
 
@@ -92,6 +101,7 @@ namespace ps2x::pnach
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             g_files = std::move(files);
             rebuild();
+            g_restoreCode.store(true, std::memory_order_release);
         }
 
         // EE RAM (32 MB, little endian like the host); addresses outside it are ignored, as PCSX2 ignores writes to
@@ -117,8 +127,29 @@ namespace ps2x::pnach
                 address &= 0x01FFFFFFu;
                 if (address + sizeof(T) > kRamSize)
                     return;
+                // Game code (the recompiled range): keep the original words to write back after a reload.
+                if (address + sizeof(T) > g_ps2RecompiledFunctionTableBase && address < g_ps2RecompiledFunctionTableEnd)
+                    for (uint32_t word = address & ~3u; word < address + sizeof(T); word += 4u)
+                    {
+                        uint32_t original;
+                        std::memcpy(&original, rdram + word, sizeof(original));
+                        g_codeOriginals.emplace(word, original);
+                    }
                 std::memcpy(rdram + address, &value, sizeof(T));
                 ++writes;
+            }
+
+            // PCSX2 1.6.0's EE memory map for the plain types (byte/short/word/double): main RAM and its mirrors
+            // (kuseg, uncached 0x2..., uncached accelerated 0x3..., kseg0 0x8..., kseg1 0xA...); any other address is
+            // unmapped there and the write is ignored, e.g. a CodeBreaker "E..." or "4..." line written with the word
+            // type (the masked address would land in low memory).
+            template <typename T>
+            void writeMapped(uint32_t address, T value)
+            {
+                const uint32_t segment = address & 0xFE000000u;
+                if (segment == 0x00000000u || segment == 0x20000000u || segment == 0x30000000u || segment == 0x80000000u ||
+                    segment == 0xA0000000u)
+                    write(address, value);
             }
         };
 
@@ -305,10 +336,10 @@ namespace ps2x::pnach
                 switch (patch.bytes)
                 {
                 case 0u: extended.run(ram, patch.address, static_cast<uint32_t>(patch.value)); break;
-                case 1u: ram.write<uint8_t>(patch.address, static_cast<uint8_t>(patch.value)); break;
-                case 2u: ram.write<uint16_t>(patch.address, static_cast<uint16_t>(patch.value)); break;
-                case 4u: ram.write<uint32_t>(patch.address, static_cast<uint32_t>(patch.value)); break;
-                case 8u: ram.write<uint64_t>(patch.address, patch.value); break;
+                case 1u: ram.writeMapped<uint8_t>(patch.address, static_cast<uint8_t>(patch.value)); break;
+                case 2u: ram.writeMapped<uint16_t>(patch.address, static_cast<uint16_t>(patch.value)); break;
+                case 4u: ram.writeMapped<uint32_t>(patch.address, static_cast<uint32_t>(patch.value)); break;
+                case 8u: ram.writeMapped<uint64_t>(patch.address, patch.value); break;
                 default: break;
                 }
             }
@@ -474,6 +505,14 @@ namespace ps2x::pnach
         if (!rdram)
             return;
         const std::shared_ptr<const List> list = current();
+        if (g_restoreCode.exchange(false, std::memory_order_acq_rel) && !g_codeOriginals.empty())
+        {
+            // A reload: the game code as the ELF has it, then the patches still on write their words again below.
+            for (const auto &[address, original] : g_codeOriginals)
+                std::memcpy(rdram + address, &original, sizeof(original));
+            std::fprintf(stderr, "[pnach] %zu game code words restored before the new patch list\n", g_codeOriginals.size());
+            g_codeOriginals.clear();
+        }
         if (g_onceAfterReload.exchange(false, std::memory_order_acq_rel))
             g_writes.fetch_add(applyList(rdram, *list, true), std::memory_order_relaxed);
         const uint64_t count = list->empty() ? 0u : applyList(rdram, *list, false);

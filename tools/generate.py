@@ -14,6 +14,8 @@ import struct
 import subprocess
 import sys
 
+import cheat_code
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BOOT_ELF = "SLPM_658.53"
 BOOT_SHA256 = "3697202792fa559312ae1e0f89dd91514d99034cd754f8a608ec50dbee3fd4e0"
@@ -122,11 +124,21 @@ def main():
         return f'ghidra_output = "{path.replace(os.sep, "/")}"' if os.path.exists(path) else '# ghidra map missing: ' + m.group(1)
     toml = re.sub(r'(?m)^ghidra_output\s*=\s*"([^"]+)"', absolute_ghidra, toml)
     # Jump-table cases as internal entry points (tools/ghidra_functions.py writes the list).
+    entries = []
     entries_path = os.path.join(ROOT, "recomp", "yktk3_entry_points.txt")
     if os.path.exists(entries_path):
         entries = [line.strip() for line in open(entries_path, encoding="utf-8") if line.strip() and not line.startswith("#")]
-        toml = re.sub(r'(?m)^\[general\]\s*$', lambda m: m.group(0) + "\nentry_points = [" + ", ".join(f'"{e}"' for e in entries) + "]",
-                      toml, count=1)
+    # Native code cheats (tools/cheat_code.py): the code the .pnach files of the game's mods folder rewrite or add,
+    # compiled with the game (URBAN_CHEATS_DIR: another folder).
+    bin_dir = os.path.join(build, "port" if os.name == "nt" else "linux", "bin")
+    mods = os.environ.get("URBAN_CHEATS_DIR") or os.path.join(bin_dir, "mods")
+    cheat_path = os.path.join(build, "cheat_code.txt")
+    cheat_entries = cheat_code.build(os.path.join(build, BOOT_ELF), mods, os.path.join(ROOT, "recomp", "yktk3_functions.csv"),
+                                     cheat_path, os.path.join(bin_dir, "cheats_native.txt") if os.path.isdir(bin_dir) else None)
+    entries += [f"0x{e:08X}" for e in cheat_entries]
+    general = "\nentry_points = [" + ", ".join(f'"{e}"' for e in entries) + "]" if entries else ""
+    general += f'\ncheat_code = "{cheat_path.replace(os.sep, "/")}"'
+    toml = re.sub(r'(?m)^\[general\]\s*$', lambda m: m.group(0) + general, toml, count=1)
     staged_toml = os.path.join(build, "yktk3.staging.toml")
     open(staged_toml, "w", encoding="utf-8").write(toml)
 

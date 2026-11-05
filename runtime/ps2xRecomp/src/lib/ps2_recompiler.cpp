@@ -20,6 +20,7 @@
 #include <optional>
 #include <limits>
 #include <functional>
+#include <iomanip>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -950,6 +951,10 @@ namespace ps2recomp
             }
 
             m_functions = m_elfParser->extractFunctions();
+            if (!loadCheatCode())
+            {
+                return false;
+            }
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
@@ -1035,6 +1040,7 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            m_codeGenerator->m_cheatRegions = m_cheatRegions;
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
@@ -1905,7 +1911,9 @@ namespace ps2recomp
 
             for (const auto &function : m_functions)
             {
-                if (!shouldGenerateCodeForFunction(function))
+                // Cheat routines (tools/cheat_code.py) are declared where they are registered: this header is in the
+                // game code's precompiled header, so a change of the cheats would rebuild every generated file.
+                if (!shouldGenerateCodeForFunction(function) || function.name.rfind("cheat_", 0) == 0)
                 {
                     continue;
                 }
@@ -2120,6 +2128,86 @@ namespace ps2recomp
         }
     }
 
+    // tools/cheat_code.py output (config cheat_code): "R <start> <end> <words>;<words>..." a region of game code and
+    // the versions cheats can leave in it, "C <start> <end> <words>" a cheat routine (code a cheat writes into free
+    // memory and jumps to), compiled as a function of its own and registered outside the dense table.
+    bool PS2Recompiler::loadCheatCode()
+    {
+        if (m_config.cheatCodePath.empty())
+            return true;
+        std::ifstream file(m_config.cheatCodePath);
+        if (!file)
+        {
+            m_reporter.error("cheat", "cannot open " + m_config.cheatCodePath);
+            return false;
+        }
+        std::unordered_set<uint32_t> starts;
+        for (const Function &function : m_functions)
+            starts.insert(function.start);
+        R5900Decoder decoder;
+        size_t regions = 0, routines = 0;
+        std::string line;
+        while (std::getline(file, line))
+        {
+            std::istringstream head(line);
+            std::string kind;
+            uint32_t start = 0, end = 0;
+            if (!(head >> kind) || (kind != "R" && kind != "C") || !(head >> std::hex >> start >> end) || end <= start || ((end - start) & 3u))
+                continue;
+            std::string rest;
+            std::getline(head, rest);
+            std::vector<std::vector<uint32_t>> lists;
+            std::istringstream versions(rest);
+            std::string version;
+            while (std::getline(versions, version, ';'))
+            {
+                std::istringstream words(version);
+                std::vector<uint32_t> list;
+                uint32_t word = 0;
+                while (words >> std::hex >> word)
+                    list.push_back(word);
+                if (list.size() == (end - start) / 4u)
+                    lists.push_back(std::move(list));
+            }
+            if (lists.empty())
+                continue;
+            if (kind == "C")
+            {
+                for (size_t k = 0; k < lists[0].size(); ++k)
+                    m_cheatWords[start + 4u * static_cast<uint32_t>(k)] = lists[0][k];
+                if (starts.insert(start).second)
+                {
+                    Function routine;
+                    std::ostringstream name;
+                    name << "cheat_" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << start;
+                    routine.name = name.str();
+                    routine.start = start;
+                    routine.end = end;
+                    m_functions.push_back(std::move(routine));
+                    ++routines;
+                }
+                continue;
+            }
+            CheatRegion region;
+            region.start = start;
+            region.end = end;
+            for (const auto &list : lists)
+            {
+                std::vector<Instruction> decoded;
+                for (size_t k = 0; k < list.size(); ++k)
+                    decoded.push_back(decoder.decodeInstruction(start + 4u * static_cast<uint32_t>(k), list[k]));
+                region.words.push_back(list);
+                region.versions.push_back(std::move(decoded));
+            }
+            m_cheatRegions[start] = std::move(region);
+            ++regions;
+        }
+        std::ostringstream msg;
+        msg << "cheat code: " << regions << " regions, " << routines << " routines (" << m_config.cheatCodePath << ")";
+        m_reporter.info("cheat", msg.str());
+        return true;
+    }
+
     bool PS2Recompiler::decodeFunction(Function &function)
     {
         std::vector<Instruction> instructions;
@@ -2132,7 +2220,9 @@ namespace ps2recomp
         {
             try
             {
-                if (!m_elfParser->isValidAddress(address))
+                // Cheat routines are code a cheat writes into memory: decoded from the cheat code, not the ELF.
+                const auto cheatWord = m_cheatWords.find(address);
+                if (cheatWord == m_cheatWords.end() && !m_elfParser->isValidAddress(address))
                 {
                     {
                         std::ostringstream msg;
@@ -2143,7 +2233,7 @@ namespace ps2recomp
                     break;
                 }
 
-                uint32_t rawInstruction = m_elfParser->readWord(address);
+                uint32_t rawInstruction = cheatWord != m_cheatWords.end() ? cheatWord->second : m_elfParser->readWord(address);
                 const uint32_t originalInstruction = rawInstruction;
 
                 auto patchIt = m_config.patches.find(address);

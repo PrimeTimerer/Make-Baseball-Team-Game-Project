@@ -20,6 +20,7 @@ PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[1] = {};
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -36,12 +37,14 @@ namespace
     // Stage (c) of the microVU-style work (docs/PROGRESS.md §45):
     // - gFastFmac: FMACs whose flags are folded in a dead-flag segment use fmacFastV (the plain SSE operation, no
     //   range checks; VU1_RECOMP_EXACT_FMAC=1 keeps fmacV);
-    // - gRawLoads: LQ/LQI/LQD keep the loaded bits as the normalized value, relying on DAZ for denormal operands
-    //   (VU1_RECOMP_NORM_LOADS=1 keeps vnorm). A loaded operand with exponent 255 reaches SSE as infinity/NaN; in
-    //   FMACs that saturates the product, which fmacFastV hands to the exact path. Verified (PS2X_VU1_VERIFY=obs)
-    //   with 0 mismatches over the 4-fighter select, a fight and the story mode.
+    // - gRawLoads (VU1_RECOMP_RAW_LOADS=1, off by default since 2026-11-05): LQ/LQI/LQD keep the loaded bits as the
+    //   normalized value, relying on DAZ for denormal operands. A loaded operand with exponent 255 (the PS2's +-max,
+    //   0x7FFFFFFF/0xFFFFFFFF) then reaches SSE as NaN, and the product saturates: right when the PS2 product overflows
+    //   too, wrong when the other factor is small. YKTK3's match vertex loop multiplies a loaded 0xFFFFFFFF by Q = 0.001
+    //   (MULq; PS2 and the interpreter give -3.4e35, the raw load gave -max: 1203 verify mismatches), so loads are
+    //   normalized like the interpreter's operands (vnorm). Raw loads were verified with 0 mismatches in Urban Reign.
     const bool gFastFmac = [] { const char *v = std::getenv("VU1_RECOMP_EXACT_FMAC"); return !(v && *v == '1'); }();
-    const bool gRawLoads = [] { const char *v = std::getenv("VU1_RECOMP_NORM_LOADS"); return !(v && *v == '1'); }();
+    const bool gRawLoads = [] { const char *v = std::getenv("VU1_RECOMP_RAW_LOADS"); return v && *v == '1'; }();
     // - gSticky: keep accumulating the sticky zero/sign status bits in fast FMACs (VU1_RECOMP_STICKY=1). By default an
     //   image without any status reader (FSEQ/FSSET/FSAND/FSOR) uses fmacFastN; the runtime logs any access to VU1's
     //   register window from VU0 (noteVu0DataAddress), the only way to read VU1's status from outside.
@@ -572,11 +575,17 @@ namespace
         case 0x21:
             viSet(it, num((pc + 16u) / 8u));
             return e;
+        // JR/JALR read the register as it is now, like the interpreter (ps2_vu1_impl.inl), unless
+        // PS2X_VU1_JR_DELAYED_VI=1 asks for the value before a write by the previous pair, as conditional branches do.
+        // Always the delayed value jumped to stale addresses: YKTK3's library sets IADDIU vi1, vi0, 1372 right before
+        // JALR vi15, vi1 (2026-11-05).
         case 0x24:
-            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(" + br(is) + ")) * 8u) & 0x3FFFu;";
+            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(vu1JrUsesDelayedVi() ? " + br(is) + " : " + vi(is) +
+                     ")) * 8u) & 0x3FFFu;";
             return e;
         case 0x25:
-            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(" + br(is) + ")) * 8u) & 0x3FFFu;";
+            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(vu1JrUsesDelayedVi() ? " + br(is) + " : " + vi(is) +
+                     ")) * 8u) & 0x3FFFu;";
             viSet(it, num((pc + 16u) / 8u));
             return e;
         case 0x28:
@@ -1475,34 +1484,50 @@ namespace
         return !p.reserved && !p.branch && !p.d.eBit && !p.d.dBit && !p.d.tBit;
     }
 
-    // hash: the name the image is emitted and registered under. exactVu0: an image that may be a VU0 program keeps the
-    // exact FMACs (the PS2X_VU0_FAST=0 variant). mayBeVu0Out: whether it fits in VU0's micro memory.
-    bool writeImage(const std::filesystem::path &outDir, uint64_t hash, const std::vector<uint8_t> &code, uint32_t maxBlockPairs,
-                    std::map<std::string, uint32_t> &stats, bool exactVu0, bool *mayBeVu0Out)
+    // A status flag reader (FSEQ/FSAND/FSOR/FSSET) in [start, end).
+    bool readsStatusIn(const std::vector<uint8_t> &code, uint32_t start, uint32_t end)
     {
-        VU1Interpreter vu(VU1Interpreter::Unit::VU1);
-        uint32_t used = 0u;
-        for (uint32_t pc = 0; pc + 8u <= code.size(); pc += 8u)
-            if (std::any_of(code.begin() + pc, code.begin() + pc + 8u, [](uint8_t b) { return b != 0u; }))
-                used = pc / 8u + 1u;
-        const uint32_t total = kCodeSize / 8u;
-        const uint32_t count = std::min(total, used + 2u);
-
-        Emitter emitter;
-        const bool mayBeVu0 = used * 8u <= 4096u;
-        if (mayBeVu0Out)
-            *mayBeVu0Out = mayBeVu0;
-        emitter.fastFmac = gFastFmac && (!mayBeVu0 || (gVu0Fast && !exactVu0));
-        bool readsStatus = false;
-        for (uint32_t pc = 0; pc + 8u <= code.size(); pc += 8u)
+        for (uint32_t pc = start; pc + 8u <= end && pc + 8u <= code.size(); pc += 8u)
         {
             uint32_t lower, upper;
             std::memcpy(&lower, code.data() + pc, 4u);
             std::memcpy(&upper, code.data() + pc + 4u, 4u);
             const uint32_t opHi = (lower >> 25) & 0x7Fu;
             if (!(upper & 0x80000000u) && opHi >= 0x14u && opHi <= 0x17u)
-                readsStatus = true;
+                return true;
         }
+        return false;
+    }
+
+    // hash: the name the image is emitted and registered under. exactVu0: an image that may be a VU0 program keeps the
+    // exact FMACs (the PS2X_VU0_FAST=0 variant). mayBeVu0Out: whether it fits in VU0's micro memory.
+    // Piece mode (rangeStart/rangeEnd narrower than the image): only [rangeStart, rangeEnd) is compiled, the code one
+    // microcode piece occupies at its fixed address in micro memory, whatever the rest holds (the runtime checks the
+    // piece's bytes before it runs the unit, ps2_vu1_core.cpp). Control leaving the range exits to the runtime; a branch
+    // or E bit whose delay slot lies outside is left to the interpreter; flags count as live wherever control leaves; and
+    // statusReaders (0/1, over all the pieces) replaces the image's own status reader scan.
+    bool writeImage(const std::filesystem::path &outDir, uint64_t hash, const std::vector<uint8_t> &code, uint32_t maxBlockPairs,
+                    std::map<std::string, uint32_t> &stats, bool exactVu0, bool *mayBeVu0Out, uint32_t rangeStart = 0u,
+                    uint32_t rangeEnd = kCodeSize, int statusReaders = -1)
+    {
+        VU1Interpreter vu(VU1Interpreter::Unit::VU1);
+        const bool piece = rangeStart != 0u || rangeEnd != kCodeSize;
+        uint32_t used = 0u;
+        for (uint32_t pc = 0; pc + 8u <= code.size(); pc += 8u)
+            if (std::any_of(code.begin() + pc, code.begin() + pc + 8u, [](uint8_t b) { return b != 0u; }))
+                used = pc / 8u + 1u;
+        const uint32_t total = kCodeSize / 8u;
+        const uint32_t lo = rangeStart / 8u;
+        const uint32_t hi = rangeEnd / 8u;
+        const uint32_t count = piece ? hi : std::min(total, used + 2u);
+        const auto outside = [&](uint32_t index) { return piece && (index < lo || index >= hi); };
+
+        Emitter emitter;
+        const bool mayBeVu0 = !piece && used * 8u <= 4096u;
+        if (mayBeVu0Out)
+            *mayBeVu0Out = mayBeVu0;
+        emitter.fastFmac = gFastFmac && (!mayBeVu0 || (gVu0Fast && !exactVu0));
+        const bool readsStatus = statusReaders >= 0 ? statusReaders != 0 : readsStatusIn(code, 0u, static_cast<uint32_t>(code.size()));
         emitter.noSticky = emitter.fastFmac && !readsStatus && !gSticky;
         stats[emitter.noSticky ? "images without sticky accumulation" : "images keeping sticky accumulation"] += 1u;
         emitter.pairs.resize(total);
@@ -1528,6 +1553,10 @@ namespace
             p.fallback = p.reserved || p.d.dBit || p.d.tBit;
             if ((p.branch || p.d.eBit) && !plainPair(next))
                 p.fallback = true;
+            if ((p.branch || p.d.eBit) && outside(nextPc(p.pc) / 8u))
+                p.fallback = true; // piece mode: the delay slot is another piece's code
+            if (outside(index))
+                continue;
             if (p.branch && p.d.eBit)
                 p.fallback = true;
             const uint32_t op = p.d.upper & 0x3Fu;
@@ -1586,7 +1615,7 @@ namespace
                     if (live[index])
                         continue;
                     for (const uint32_t next : successors[index])
-                        if (next < total && live[next])
+                        if ((next < total && live[next]) || (outside(next) && !outside(index)))
                         {
                             live[index] = true;
                             changed = true;
@@ -1620,7 +1649,7 @@ namespace
                     spanned[cut] = true;
         }
         std::vector<std::pair<uint32_t, uint32_t>> blocks;
-        for (uint32_t start = 0; start < count;)
+        for (uint32_t start = piece ? lo : 0u; start < count;)
         {
             uint32_t end = std::min(count, start + maxBlockPairs);
             uint32_t cut = end;
@@ -1712,7 +1741,12 @@ namespace
         out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(hash)
             << ">(VU1Interpreter &vu, const Vu1RunArgs &args)\n{\n    static constexpr FastBlock table[] = {\n";
         for (uint32_t index = 0; index < count; ++index)
-            out << "        &fastBlock<" << hex64(hash) << ", " << blockOf[index] << "u>,\n";
+        {
+            if (outside(index))
+                out << "        nullptr,\n"; // piece mode: not this unit's code
+            else
+                out << "        &fastBlock<" << hex64(hash) << ", " << blockOf[index] << "u>,\n";
+        }
         out << "    };\n    return runFast(vu, args, table, " << count << "u);\n}\n";
 
         char name[64];
@@ -1726,14 +1760,26 @@ namespace
 
 int main(int argc, char **argv)
 {
-    if (argc < 3)
+    // --pieces <dir>: also compile microcode pieces (vup_<start>_<end>_<name>.bin, a 16 KB image holding one piece at
+    // its fixed address, start/end in hex) as units the runtime runs whatever the rest of micro memory holds.
+    std::vector<std::string> positional;
+    std::filesystem::path piecesDir;
+    for (int i = 1; i < argc; ++i)
     {
-        std::cerr << "usage: vu1_recomp <capture-dir> <out-dir> [max-pairs-per-block]\n";
+        const std::string arg = argv[i];
+        if (arg == "--pieces" && i + 1 < argc)
+            piecesDir = argv[++i];
+        else
+            positional.push_back(arg);
+    }
+    if (positional.size() < 2u)
+    {
+        std::cerr << "usage: vu1_recomp <capture-dir> <out-dir> [max-pairs-per-block] [--pieces <dir>]\n";
         return 2;
     }
-    const std::filesystem::path captureDir = argv[1];
-    const std::filesystem::path outDir = argv[2];
-    const uint32_t blockPairs = argc > 3 ? static_cast<uint32_t>(std::stoul(argv[3])) : kDefaultBlockPairs;
+    const std::filesystem::path captureDir = positional[0];
+    const std::filesystem::path outDir = positional[1];
+    const uint32_t blockPairs = positional.size() > 2u ? static_cast<uint32_t>(std::stoul(positional[2])) : kDefaultBlockPairs;
     std::filesystem::create_directories(outDir);
     for (const auto &entry : std::filesystem::directory_iterator(outDir))
     {
@@ -1774,6 +1820,48 @@ int main(int argc, char **argv)
             hashes.push_back(hash ^ kVu0ExactTag);
         }
     }
+    // Pieces: one unit per (address, piece). Sticky status accumulation is kept if any piece reads the status flags.
+    struct PieceUnit
+    {
+        uint32_t start, end;
+        uint64_t bytesHash, unitHash;
+    };
+    std::vector<PieceUnit> pieceUnits;
+    if (!piecesDir.empty())
+    {
+        constexpr uint64_t kPieceTag = 0x5655315049454345ull; // "VU1PIECE"
+        std::vector<std::tuple<uint32_t, uint32_t, std::vector<uint8_t>>> pieces;
+        for (const auto &entry : std::filesystem::directory_iterator(piecesDir))
+        {
+            const std::string name = entry.path().filename().string();
+            unsigned start = 0u, end = 0u;
+            if (name.rfind("vup_", 0) != 0 || entry.path().extension() != ".bin" ||
+                std::sscanf(name.c_str(), "vup_%x_%x_", &start, &end) != 2 || start >= end || end > kCodeSize || (start | end) & 7u)
+                continue;
+            std::ifstream file(entry.path(), std::ios::binary);
+            std::vector<uint8_t> code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            if (code.size() != kCodeSize)
+            {
+                std::cerr << entry.path() << ": expected " << kCodeSize << " bytes\n";
+                return 1;
+            }
+            pieces.emplace_back(start, end, std::move(code));
+        }
+        std::sort(pieces.begin(), pieces.end(), [](const auto &a, const auto &b) { return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) < std::get<0>(b) : std::get<2>(a) < std::get<2>(b); });
+        bool anyStatusReader = false;
+        for (const auto &[start, end, code] : pieces)
+            anyStatusReader = anyStatusReader || readsStatusIn(code, start, end);
+        for (const auto &[start, end, code] : pieces)
+        {
+            const uint64_t unitHash = fnv1a64(code.data(), code.size()) ^ kPieceTag;
+            if (!writeImage(outDir, unitHash, code, blockPairs, stats, false, nullptr, start, end, anyStatusReader ? 1 : 0))
+                return 1;
+            pieceUnits.push_back({start, end, fnv1a64(code.data() + start, end - start), unitHash});
+        }
+        stats["piece units"] = static_cast<uint32_t>(pieceUnits.size());
+        stats[anyStatusReader ? "pieces keep sticky status (a piece reads it)" : "pieces without sticky status"] = 1u;
+    }
+
     for (const auto &[name, value] : stats)
         std::cout << name << ": " << value << "\n";
 
@@ -1782,9 +1870,17 @@ int main(int argc, char **argv)
     for (const uint64_t hash : hashes)
         reg << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(hash)
             << ">(VU1Interpreter &, const Vu1RunArgs &);\n";
+    for (const PieceUnit &unit : pieceUnits)
+        reg << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(unit.unitHash)
+            << ">(VU1Interpreter &, const Vu1RunArgs &);\n";
+    // ps2_vu1_core.cpp (declared here: ps2_vu1_impl.inl is in every generated file).
+    reg << "\nvoid registerVu1PieceUnit(uint32_t start, uint32_t end, uint64_t bytesHash, VU1InterpreterAccess::CompiledProgram program);\n";
     reg << "\nvoid registerGeneratedVu1Programs()\n{\n";
     for (const uint64_t hash : hashes)
         reg << "    registerVu1CompiledProgram(" << hex64(hash) << ", &VU1InterpreterAccess::runImage<" << hex64(hash) << ">);\n";
+    for (const PieceUnit &unit : pieceUnits)
+        reg << "    registerVu1PieceUnit(" << hx(unit.start) << ", " << hx(unit.end) << ", " << hex64(unit.bytesHash)
+            << ", &VU1InterpreterAccess::runImage<" << hex64(unit.unitHash) << ">);\n";
     reg << "}\n";
     std::ofstream file(outDir / "vu1_programs.cpp", std::ios::binary);
     file << reg.str();

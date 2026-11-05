@@ -1,3 +1,4 @@
-// urban.exe's icon (the same as the launcher's). GLFW (raylib's window) loads the resource named GLFW_ICON for the
-// window and the taskbar; Explorer shows the first icon of the file, this one.
+// yktk3.exe's icon, the same as the launcher's (tools/launcher/icon.ico: a baseball on the infield, the "3" badge).
+// GLFW (raylib's window) loads the resource named GLFW_ICON for the window and the taskbar; Explorer and the desktop
+// shortcut the launcher makes show the first icon of the file, this one.
 GLFW_ICON ICON "urban.ico"

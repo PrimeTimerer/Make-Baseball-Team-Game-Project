@@ -4,6 +4,7 @@
 #include "runtime/ps2_pnach.h"
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_display_options.h"
+#include "runtime/ps2_hotkeys.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -23,7 +24,7 @@
 #include "ps2_iop_host.h"
 #include "ps2_host_input.h"
 void ps2xSetLocalToHostGs(GS *gs); // ps2_memory.cpp: VIF1 FIFO image downloads
-void ps2xRequestVu1Trace(uint32_t fields); // vu/ps2_vu1_core.cpp: F8 debug capture
+void ps2xRequestVu1Trace(uint32_t fields); // vu/ps2_vu1_core.cpp: Ctrl+F8 debug capture
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -661,6 +662,28 @@ namespace
 
 void ps2xHostVsyncSetWindow(void *window) noexcept; // Kernel/host_vsync.cpp
 void ps2xEeFlushDeferredCycles() noexcept; // Kernel/EeScheduler.cpp
+void ps2xSetSpeedPercent(int percent) noexcept; // Kernel/EeScheduler.cpp: 100 normal, 200, 0 = turbo
+int ps2xSpeedPercent() noexcept;
+
+namespace
+{
+    std::chrono::steady_clock::time_point g_speedShownUntil; // the speed badge stays 2 s after F7/F8
+    std::chrono::steady_clock::time_point g_helpShownUntil;  // F1: the key list at the top left for 12 s
+    // The key list F1 shows (UTF-8; a port sets it in its own language with ps2x::hotkeys::setHelpText).
+    std::string g_hotkeyHelp = "Keys (F1 again closes)\n"
+                               "F2   menu\n"
+                               "F3   FPS\n"
+                               "F4   reload cheats\n"
+                               "F5   quick save          F9   quick load\n"
+                               "F7   200% speed          F8   turbo\n"
+                               "F11  full screen\n"
+                               "Ctrl+F6  profile capture   Ctrl+F7  profile mark   Ctrl+F8  debug dump";
+}
+
+void ps2x::hotkeys::setHelpText(std::string text)
+{
+    g_hotkeyHelp = std::move(text);
+}
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
                         bool hashImages, GSSharedPresent::Frame &diagnostic)
@@ -2999,6 +3022,12 @@ void PS2Runtime::run()
             float topAlpha = 0.0f;
             if (ps2x::savestate::overlayMessage(top, topAlpha) || ps2x::pnach::overlayMessage(top, topAlpha))
                 topRgba = 0x99000000u; // black, 60%
+            else if (std::chrono::steady_clock::now() < g_helpShownUntil)
+            {
+                top = g_hotkeyHelp; // F1
+                topAlpha = 1.0f;
+                topRgba = 0xD9000000u; // black, 85%
+            }
             else
             {
                 std::lock_guard<std::mutex> lock(ps2_host_display::overlayMutex);
@@ -3031,7 +3060,7 @@ void PS2Runtime::run()
             sharedFrame.height = presentHeight;
         }
 
-        // With PCSX2's GS the image is the child window's; this window presents nothing of its own unless the F1
+        // With PCSX2's GS the image is the child window's; this window presents nothing of its own unless the Ctrl+F1
         // debugger (drawn by raylib) is open. Its black frames covered the child in fullscreen: a window as big as the
         // monitor gets its swap chain flipped straight to the screen, skipping the composition that puts the child on
         // top (PROGRESS §98). PS2X_HOST_PRESENT=1 always presents, as before.
@@ -3077,6 +3106,23 @@ void PS2Runtime::run()
                 const int width = MeasureText(stateText.c_str(), fontSize);
                 DrawRectangle(12, 12, width + 24, fontSize + 16, Fade(BLACK, 0.6f * stateAlpha));
                 DrawText(stateText.c_str(), 24, 20, fontSize, Fade(RAYWHITE, stateAlpha));
+            }
+        }
+        {
+            // F7/F8: the speed in the top right corner while it is not 100% (and for 2 s after a change).
+            const int speed = ps2xSpeedPercent();
+            if (speed != 100 || std::chrono::steady_clock::now() < g_speedShownUntil)
+            {
+                char label[32];
+                if (speed <= 0)
+                    std::snprintf(label, sizeof(label), ">> TURBO");
+                else
+                    std::snprintf(label, sizeof(label), speed == 100 ? "Speed %d%%" : ">> %d%%", speed);
+                const int fontSize = std::max(18, GetScreenHeight() / 30);
+                const int width = MeasureText(label, fontSize);
+                const int x = GetScreenWidth() - width - 36;
+                DrawRectangle(x - 12, 12, width + 24, fontSize + 16, Fade(speed == 100 ? BLACK : DARKBLUE, 0.7f));
+                DrawText(label, x, 20, fontSize, RAYWHITE);
             }
         }
         if (!screenshotFields.empty() && eeScheduler().currentVSyncTick() >= screenshotFields.back())
@@ -3134,6 +3180,16 @@ void PS2Runtime::run()
         }
 #endif
         ps2_host_input::sample();
+        // The keys (F1 shows them, g_hotkeyHelp): F1 help, F2 menu, F3 FPS, F4 cheats, F5 / F9 quick save / load,
+        // F7 200% / F8 turbo, F11 full screen. Developer keys need Ctrl: Ctrl+F6 profile capture and Ctrl+F7 its marks
+        // (src/urban/native_profile.cpp), Ctrl+F8 a debug dump, Ctrl+F1 the debug panel (debug builds). F6, F10 and
+        // F12 stay free.
+        const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        if (IsKeyPressed(KEY_F1) && !ctrl)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            g_helpShownUntil = now < g_helpShownUntil ? now : now + std::chrono::seconds(12);
+        }
         if (IsKeyPressed(KEY_F4))
             ps2x::pnach::requestReload(); // reload the enabled .pnach files
         ps2x::menu::hostTick();           // F2: the in-game menu
@@ -3141,11 +3197,19 @@ void PS2Runtime::run()
             ps2x::savestate::requestQuickSave();
         if (IsKeyPressed(KEY_F9))
             ps2x::savestate::requestQuickLoad();
+        // F7: 200% speed, F8: turbo (as fast as the PC goes); the same key again goes back to 100%. Sound is muted
+        // while faster (ps2_audio.cpp).
+        if ((IsKeyPressed(KEY_F7) || IsKeyPressed(KEY_F8)) && !ctrl)
+        {
+            const int wanted = IsKeyPressed(KEY_F7) ? 200 : 0;
+            ps2xSetSpeedPercent(ps2xSpeedPercent() == wanted ? 100 : wanted);
+            g_speedShownUntil = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        }
         if (IsKeyPressed(KEY_F3))
             fpsOverlay.visible = !fpsOverlay.visible;
-        if (IsKeyPressed(KEY_F8))
+        if (IsKeyPressed(KEY_F8) && ctrl)
         {
-            // Debug capture: VU1 trace of the next 2 fields (vu1trace_<tick>.bin) plus the EE RAM (ram_<tick>.bin).
+            // Ctrl+F8, debug capture: VU1 trace of the next 2 fields (vu1trace_<tick>.bin) plus the EE RAM (ram_<tick>.bin).
             const unsigned long long tick = static_cast<unsigned long long>(m_memory.gs().vsyncTick.load());
             char name[64];
             std::snprintf(name, sizeof(name), "ram_%llu.bin", tick);
@@ -3155,7 +3219,7 @@ void PS2Runtime::run()
                 std::fclose(file);
             }
             ps2xRequestVu1Trace(2u);
-            std::fprintf(stderr, "[F8] wrote %s, VU1 trace requested\n", name);
+            std::fprintf(stderr, "[Ctrl+F8] wrote %s, VU1 trace requested\n", name);
         }
 
         if (WindowShouldClose())

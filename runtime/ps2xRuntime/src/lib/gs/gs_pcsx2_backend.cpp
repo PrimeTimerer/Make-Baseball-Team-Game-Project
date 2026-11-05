@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/gs/gs_aspect.h"
+#include "runtime/ps2_perf_stats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,8 @@ static_assert(sizeof(GSVSyncRegs) == sizeof(Pcsx2GsPrivRegs), "GSVSyncRegs must 
 namespace
 {
     const Pcsx2GsApi *g_api = nullptr;
+    std::mutex g_snapshotRequestMutex; // ps2x::perf::requestSnapshot: a path for the next present
+    std::string g_snapshotRequest;
     void(PS2X_PCSX2GS_CALL *g_setAspect)(uint32_t) = nullptr; // pcsx2gs_set_aspect, when the library has it
     const std::chrono::steady_clock::time_point g_processStart = std::chrono::steady_clock::now();
 #if defined(_WIN32)
@@ -670,6 +674,20 @@ void GSPcsx2Backend::VSync(const GSVSyncRegs &regs)
         const std::string path = (std::filesystem::path(snapshotDir) / ("field-" + std::to_string(m_fields) + ".bmp")).string();
         g_api->snapshot(path.c_str());
     }
+    // A one-shot snapshot asked for by the performance log (ps2x::perf::requestSnapshot).
+    std::string requested;
+    {
+        std::lock_guard<std::mutex> lock(g_snapshotRequestMutex);
+        requested.swap(g_snapshotRequest);
+    }
+    if (!requested.empty())
+        g_api->snapshot(requested.c_str());
+}
+
+void ps2x::perf::requestSnapshot(const std::string &path)
+{
+    std::lock_guard<std::mutex> lock(g_snapshotRequestMutex);
+    g_snapshotRequest = path;
 }
 
 void ps2x::gs::setAspect(Aspect aspect)

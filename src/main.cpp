@@ -22,6 +22,9 @@
 #include "urban/log.h"
 #include "urban/mods.h"
 #include "urban/mod_loader.h"
+#include "runtime/ps2_hotkeys.h"
+#include "urban/perf_log.h"
+#include "urban/player_cheats.h"
 #include "runtime/ps2_game_menu.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -66,6 +69,7 @@ void ps2xGsSetHandlerBusy(GSRegisters &gs, bool busy);
 
 #if URBAN_HAS_VU1_PROGRAMS
 void registerGeneratedVu1Programs(); // generated/vu1/vu1_programs.cpp
+void ps2xRegisterGeneratedExtraFunctions(PS2Runtime &runtime); // generated/register_functions.cpp: cheat routines
 #endif
 
 #if !defined(URBAN_ARCH_NAME)
@@ -1236,8 +1240,26 @@ int main(int argc, char *argv[])
     urban::log::configureFromEnvironment();
     urban::hangdump::startFromEnvironment();
     urban::nativeprofile::startFromEnvironment();
-    urban::nativeprofile::startCaptureHotkey(userDir); // F6: start/stop a profile capture (perfil_<n>.txt)
+    urban::nativeprofile::startCaptureHotkey(userDir); // Ctrl+F6: start/stop a profile capture (perfil_<n>.txt)
     urban::threadpolicy::startFromEnvironment();      // PS2X_THREAD_POLICY: cores and priority by CPU topology
+#if defined(_WIN32)
+    // Windows 11 may stop honouring the 1 ms timer this process asks for (raylib's timeBeginPeriod) while its window is
+    // hidden, minimized or covered and it plays no sound (EcoQoS). The EE's frame waits (a condition variable, so that
+    // interrupts can wake it) then end on the 15.6 ms tick: frames of 31 ms, ~80% speed, seen 2026-11-05 in hidden muted
+    // runs, and the same for a muted game left behind other windows. PCSX2 sleeps on a high-resolution waitable timer
+    // instead; here the process opts out of that throttling. PS2X_POWER_THROTTLING=1 leaves it to Windows.
+    if (const char *v = std::getenv("PS2X_POWER_THROTTLING"); !v || *v != '1')
+    {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+        PROCESS_POWER_THROTTLING_STATE state{};
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        state.StateMask = 0; // both off: full speed and the timer it asks for, seen or not
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+    }
+#endif
 
     std::filesystem::path iso;
     for (int i = 1; i < argc; ++i)
@@ -1262,7 +1284,7 @@ int main(int argc, char *argv[])
     {
         if (const char *env = std::getenv("URBAN_ISO"))
         {
-            iso = env;
+            iso = urban::mods::pathFromConfig(env); // config.ini [Game] Iso: ANSI or UTF-8
         }
     }
     if (iso.empty())
@@ -1359,7 +1381,7 @@ int main(int argc, char *argv[])
     {
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI)
-        // ImGui runtime debugger from PS2Recomp: F1 toggles it; URBAN_DEBUG_UI=1 opens it at start-up.
+        // ImGui runtime debugger from PS2Recomp: Ctrl+F1 toggles it (F1 is the key list); URBAN_DEBUG_UI=1 opens it at start-up.
         static PS2DebugPanel debugPanel;
         {
             const char *openAtStart = std::getenv("URBAN_DEBUG_UI");
@@ -1407,6 +1429,19 @@ int main(int argc, char *argv[])
                                                               : "F2 closes the menu. The game keeps running.");
             ps2x::menu::setEmptyText(portuguese ? "Nenhum mod ligado. Ligue os mods na aba Mods do launcher (config.ini [Mods] Dlls)."
                                                 : "No mod is on. Switch mods on in the launcher's Mods tab (config.ini [Mods] Dlls).");
+            // YKTK3's player cheats: the first tab (player_cheat_items.txt, player_cheats.ini).
+            urban::players::install(runtime.memory().getRDRAM(), userDir, exeDir);
+            // The performance log: logs/perf-<time>.txt, a line a second (PS2X_PERF_LOG=0: off).
+            urban::perflog::install(runtime.memory().getRDRAM(), userDir);
+            // F1: the key list, in Korean (PCSX2's GS draws it with the Korean and Japanese fonts).
+            ps2x::hotkeys::setHelpText("단축키  (F1을 다시 누르면 닫힘)\n"
+                                       "F2   게임 메뉴 (치트 · 선수 치트)\n"
+                                       "F3   FPS 표시\n"
+                                       "F4   치트 다시 읽기\n"
+                                       "F5   빠른 저장          F9   빠른 불러오기\n"
+                                       "F7   속도 200%          F8   터보 (최대 속도)\n"
+                                       "F11  전체 화면\n"
+                                       "Ctrl+F6  성능 프로필 기록   Ctrl+F7  프로필 표시   Ctrl+F8  디버그 덤프");
             const char *dlls = std::getenv("URBAN_MOD_DLLS");
             // The player's mods first, then the ones installed with the game (the same folder in the portable layout).
             std::vector<std::filesystem::path> modDirs{userDir / "mods"};
@@ -1433,6 +1468,7 @@ int main(int argc, char *argv[])
         // Urban Reign's game hooks (progressive scan, GS handler guard, multitap, 8 controllers, extra moves, animation
         // decoder, the game-frame counter on its main loop) patch Urban Reign addresses and are not installed for YKTK3.
         urban::opening::install();
+        ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)
         urban::hangdump::setRuntime(&runtime);
         urban::hangdump::installCrashReport();
         urban::calltrace::installFromEnvironment(runtime);

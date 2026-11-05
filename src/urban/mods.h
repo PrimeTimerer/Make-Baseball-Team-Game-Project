@@ -12,4 +12,8 @@ namespace urban::mods
     std::string readEnabled(const std::filesystem::path &configPath);
     // The files of an Enabled list that exist in the mods folder (log = report the missing ones).
     std::vector<std::string> pnachFiles(const std::filesystem::path &configPath, const std::string &enabled, bool log);
+
+    // A path written in config.ini: ANSI (the launcher writes it so) or UTF-8 (an editor such as Notepad saves it so).
+    // Never throws; an empty path when the text is neither.
+    std::filesystem::path pathFromConfig(const std::string &text);
 }

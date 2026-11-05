@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
+#include "ps2recomp/types.h"
 
 namespace ps2recomp
 {
@@ -74,6 +75,7 @@ namespace ps2recomp
         std::unordered_set<uint32_t> m_runtimeRelocatedValueSites;
         bool m_directTailCalls = true;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
+        std::map<uint32_t, CheatRegion> m_cheatRegions; // by start (tools/cheat_code.py)
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;

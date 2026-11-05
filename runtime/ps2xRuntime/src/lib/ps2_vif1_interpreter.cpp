@@ -367,7 +367,7 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                 copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU0_CODE_SIZE)
                     copyBytes = PS2_VU0_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
+                if (pos + copyBytes <= sizeBytes && std::memcmp(m_vu0Code + destAddr, data + pos, copyBytes) != 0)
                 {
                     std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
                     markVU0CodeModified();
@@ -644,7 +644,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
+                // Scenes send the same microcode again and again: the same bytes keep the compiled program found for
+                // the code in place (a new generation means hashing micro memory and matching its pieces again).
+                if (pos + copyBytes <= sizeBytes && std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();

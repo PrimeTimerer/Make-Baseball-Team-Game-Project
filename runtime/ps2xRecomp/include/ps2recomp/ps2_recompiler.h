@@ -65,6 +65,10 @@ namespace ps2recomp
         std::vector<Relocation> m_relocations;
 
         std::unordered_map<uint32_t, std::vector<Instruction>> m_decodedFunctions;
+        // Cheat code (config cheat_code): the words of the cheat routines, decoded instead of the ELF, and the regions.
+        std::unordered_map<uint32_t, uint32_t> m_cheatWords;
+        std::map<uint32_t, CheatRegion> m_cheatRegions;
+        bool loadCheatCode();
         std::unordered_map<std::string, bool> m_skipFunctions;
         std::unordered_set<uint32_t> m_skipFunctionStarts;
         std::unordered_set<std::string> m_stubFunctions;

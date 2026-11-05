@@ -2206,7 +2206,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    // Ctrl+F1 (F1 alone shows the key list, ps2_runtime.cpp).
+    if (IsKeyPressed(KEY_F1) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         toggleVisible();
     }

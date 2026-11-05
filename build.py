@@ -80,7 +80,32 @@ def build(target="urban"):
         return 1
     if not (BUILD / "CMakeCache.txt").exists() and configure():
         return 1
-    return in_vs("cmake", "--build", BUILD, "--target", target, "--", "-j", JOBS)
+    result = in_vs("cmake", "--build", BUILD, "--target", target, "--", "-j", JOBS)
+    if result == 0 and WINDOWS and target == "urban":
+        result = build_launcher()
+    return result
+
+
+def build_launcher():
+    """Windows: the launcher (tools/launcher: WPF; settings, controllers, memory card, cheats, logs, shortcuts) next to
+    yktk3.exe, built with the C# compiler of the .NET Framework 4 that is part of Windows."""
+    framework = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319"
+    csc = framework / "csc.exe"
+    if not csc.exists():
+        print(f"{csc} not found: the launcher needs the .NET Framework 4 (part of Windows).")
+        return 1
+    source = ROOT / "tools" / "launcher"
+    references = ["System.Core.dll", "System.Xaml.dll", "System.Xml.dll", "System.Windows.Forms.dll", "System.Drawing.dll",
+                  "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll", "System.Web.Extensions.dll",
+                  "Microsoft.VisualBasic.dll",
+                  framework / "WPF" / "PresentationCore.dll", framework / "WPF" / "PresentationFramework.dll",
+                  framework / "WPF" / "WindowsBase.dll"]
+    BIN.mkdir(parents=True, exist_ok=True)
+    icon = source / "icon.ico"  # Explorer, the taskbar and the window: a baseball on the infield, the "3" badge
+    return run([csc, "/nologo", "/target:winexe", "/optimize+", "/codepage:65001", f"/out:{BIN / 'YKTK3 Launcher.exe'}",
+                *([f"/win32icon:{icon}"] if icon.exists() else []),
+                *[f"/r:{reference}" for reference in references], f"/resource:{source / 'Theme.xaml'},Theme.xaml",
+                *sorted(source.glob("*.cs"))])
 
 
 def play(args=()):
@@ -190,6 +215,7 @@ UTILITIES = [
     ("Build and play", lambda: build() or play()),
     ("Configure again (CMake)", lambda: configure()),
     ("Build only the PCSX2 GS (pcsx2gs.dll / libpcsx2gs.so)", lambda: build("pcsx2gs")),
+    *([("Build only the launcher (YKTK3 Launcher.exe)", lambda: build_launcher())] if WINDOWS else []),
     ("Benchmark a savestate (bench/states)", lambda: bench()),
     (f"Open the game folder ({BIN.relative_to(ROOT).as_posix()})", open_game_folder),
     ("Make a release: folder + ZIP (build/release)" if WINDOWS else "Make a release: .tar.gz + .deb (build/release)",

@@ -202,6 +202,19 @@ namespace ps2recomp
         bool autoStubByName = true;
         bool directTailCalls = true;
         std::string runtimeRelocationsPath;
+        // tools/cheat_code.py: game code that .pnach cheats rewrite in memory and the code they add (cheat_code).
+        std::string cheatCodePath;
+    };
+
+    // A place in the game code that cheats rewrite in memory (tools/cheat_code.py): every version of [start, end) the
+    // cheats can leave there, decoded. The compiled code compares the words in memory and runs the matching version,
+    // as PCSX2 runs whatever is in memory; the original code when none matches.
+    struct CheatRegion
+    {
+        uint32_t start = 0;
+        uint32_t end = 0;
+        std::vector<std::vector<uint32_t>> words;
+        std::vector<std::vector<Instruction>> versions;
     };
 
 } // namespace ps2recomp
