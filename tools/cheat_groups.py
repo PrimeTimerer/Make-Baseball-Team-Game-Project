@@ -177,7 +177,7 @@ MONEY_FIX = [(0x104D68, 0x0803E080),  # j 0xF8200
 PARAMS = {
     "자금 최대 (포인터 코드)": [("605CA114", "자금 (천엔 단위 · 99,999,990 = 999억9999만엔)", 0, 99999990, "number")],
     "티켓 가격 설정": [("20172980", "티켓 가격 (엔)", 0, 65535, "number")],
-    "관중 수 설정 (구장 정원 무시)": [("2016EE78", "관중 수 (명)", 0, 65535, "number")],
+    "관중 수 설정 (구장 정원 무시)": [("200F8300", "관중 수 (명)", 0, 999999, "number")],
     "경영기획 효과 최대": [("20170EC8", "효과 값 1", 0, 32767, "number"), ("20170E48", "효과 값 2", 0, 32767, "number")],
     "경영기획 지정 기획 실행 + 비용 0": [("2012B900", "실행할 기획", 0, 156, "plan"), ("2012B910", "비용", 0, 32767, "number")],
     # The loop's list: u16 plan IDs (0x0B00 + the plan's number in plan.tbb) from 0xF0750, 0 ends it (then from the top).
@@ -412,9 +412,15 @@ def split(mods, elf_path, functions_path, excel=None):
                   note="코드표에만 있음")
         extra += 1
     # Cheats of this port with no source file, added last so that the numbers of the others stay. 관중 수: sub_16ED20
-    # (a game day's attendance from fans, ticket price and weather, capped at the stadium) ends with `move s1, v0` in
-    # the delay slot at 0x16EE78; `ori s1, zero, N` makes it N (any 0-65535, past the cap, through PARAMS).
-    add_group(ATTENDANCE, "", "", [(0x16EE78, 0x3411FFFF)], "tools/cheat_groups.py",
+    # (a game day's attendance from fans, ticket price and weather) caps it at the stadium from 0x16EE40, then stores
+    # s1. The cap is replaced by: s1 = the word at 0xF8300 (free memory below the ELF, the value the user sets:
+    # 0-999999, the game shows up to 99万9999人), then on to 0x16EE74 with v0 = s1 (the delay slot there keeps s1 = v0).
+    add_group(ATTENDANCE, "", "", [(0x16EE40, 0x3C110010),   # lui s1, 0x10
+                                   (0x16EE44, 0x8E318300),   # lw s1, -0x7D00(s1): [0xF8300]
+                                   (0x16EE48, 0x1000000A),   # b 0x16EE74
+                                   (0x16EE4C, 0x0220102D),   # move v0, s1
+                                   (0x0F8300, 999999)],      # the attendance
+              "tools/cheat_groups.py",
               note="경기 날 관중 수를 이 값으로 (구장 정원보다 커도 됨, 입장료 수입 = 관중 수 x 티켓 가격)")
     # One file per function, numbered by category
     rows, used = [], set()
