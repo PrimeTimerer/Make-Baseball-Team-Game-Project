@@ -28,6 +28,7 @@
 #include "urban/cheat_menu.h"
 #include "urban/staff_cheats.h"
 #include "urban/ichinen_cheats.h"
+#include "urban/match_script.h"
 #include "runtime/ps2_game_menu.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -1477,6 +1478,8 @@ int main(int argc, char *argv[])
         // Urban Reign's game hooks (progressive scan, GS handler guard, multitap, 8 controllers, extra moves, animation
         // decoder, the game-frame counter on its main loop) patch Urban Reign addresses and are not installed for YKTK3.
         urban::opening::install();
+        // Match scripts: forced HR / hit / strikeout / walk for chosen batters and pitchers (match_script.ini).
+        urban::matchscript::install(runtime, runtime.memory().getRDRAM(), userDir);
         ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)
         urban::hangdump::setRuntime(&runtime);
         urban::hangdump::installCrashReport();

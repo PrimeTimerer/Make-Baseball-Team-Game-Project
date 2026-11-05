@@ -54,6 +54,7 @@ set(URBAN_HOST_SOURCES
     urban/skill_table.cpp
     urban/staff_cheats.cpp
     urban/ichinen_cheats.cpp
+    urban/match_script.cpp
     urban/cheat_menu.cpp
     urban/sha256.cpp
     urban/thread_policy.cpp
