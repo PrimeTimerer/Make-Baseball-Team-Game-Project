@@ -25,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -578,6 +579,15 @@ namespace urban::matchscript
                     }
                 }
                 applyBoosts(ctx, rg);
+                // URBAN_SCRIPT_STATS=1: one line per plate appearance ("pa <batter>") and per ball in play ("play <batter>
+                // <detail>", HR = 0x15 / 0x1A / 0x1F), to count a player's results over simulated games.
+                static const bool stats = std::getenv("URBAN_SCRIPT_STATS") != nullptr;
+                static uint32_t lastAtBat = 0;
+                if (stats && r32(rg + 0xD4u) != lastAtBat)
+                {
+                    lastAtBat = r32(rg + 0xD4u);
+                    std::fprintf(stderr, "[stat] pa %u vs %u\n", g_batter, g_pitcher);
+                }
                 if (g_settings.enabled && !g_settings.rules.empty())
                     g_action = pick(g_batter, g_pitcher);
                 if (g_settings.limit > 0 && g_action != Action::None && g_action != Action::Strikeout && g_forcedInHalf >= g_settings.limit)
@@ -648,6 +658,9 @@ namespace urban::matchscript
                 w32(rg + 0x16D4u, 0u);
                 log(action, "in play", before, 0x400u + detail);
             }
+            static const bool stats = std::getenv("URBAN_SCRIPT_STATS") != nullptr;
+            if (stats)
+                std::fprintf(stderr, "[stat] play %u %x\n", batterId(rg), r32(rg + 0x161Cu));
             g_playSetup(rdram, ctx, runtime);
         }
 
@@ -679,12 +692,14 @@ namespace urban::matchscript
 
         std::mutex g_menuMutex;
         Settings g_menu; // the menu's copy (GS thread)
-        int g_pickTeam = 0, g_pickPlayer = 0, g_groupTarget = 0, g_groupRole = 0, g_groupAction = 0;
+        int g_pickTeam = 0, g_pickKind = 0, g_groupTarget = 0, g_groupRole = 0, g_groupAction = 0;
+        std::set<uint16_t> g_selected; // the checked players (global IDs), menu thread
         int g_boostTarget = 0, g_boostStat = 0;
 
         struct Player
         {
             uint16_t id = 0;
+            bool pitcher = false;
             std::string label;
         };
 
@@ -748,6 +763,7 @@ namespace urban::matchscript
                 Player player;
                 player.id = r16(record);
                 const bool pitcher = r8(record + 0x26u) != 0u;
+                player.pitcher = pitcher;
                 player.label = "#" + std::to_string(r8(record + 0x17u)) + " " + nameOf(record) + (pitcher ? " (투)" : "");
                 players.push_back(player);
             }
@@ -787,7 +803,7 @@ namespace urban::matchscript
             ui->text_disabled("3D 경기와 결과 표시·간이 경기(시뮬레이션)에서 고른 타자·투수의 결과를 정합니다.");
             ui->text_disabled("스윙과 화면 연출, 점수와 기록이 그 결과를 따라갑니다.");
 
-            // The player picker, shared by the rules and the stacking below.
+            // The player picker (several players, any clubs), shared by the rules and the stacking below.
             const int own = ownTeam();
             std::vector<std::string> teamLabels;
             for (int team = 0; team < kTeams; ++team)
@@ -796,28 +812,77 @@ namespace urban::matchscript
             for (const std::string &label : teamLabels)
                 teamItems.push_back(label.c_str());
             const std::vector<Player> players = playersOf(g_pickTeam);
-            if (g_pickPlayer >= static_cast<int>(players.size()))
-                g_pickPlayer = 0;
-            const bool havePlayer = !players.empty();
-            const std::string picked = havePlayer ? "고른 선수: " + players[static_cast<size_t>(g_pickPlayer)].label : "고른 선수 (위에서 고르기)";
+            const bool havePlayer = !g_selected.empty();
+            const std::string picked = havePlayer ? "고른 선수 " + std::to_string(g_selected.size()) + "명" : "고른 선수 (위에서 체크)";
             const char *targets[] = {kTargets[0], kTargets[1], kTargets[2], picked.c_str()};
-            auto targetOf = [&](int choice) { return choice < 3 ? -(choice + 1) : static_cast<int>(players[static_cast<size_t>(g_pickPlayer)].id); };
+            // A choice of the target combos: a group (one entry), or every checked player (one entry each).
+            auto targetsOf = [&](int choice) {
+                std::vector<int> list;
+                if (choice < 3)
+                    list.push_back(-(choice + 1));
+                else
+                    for (const uint16_t id : g_selected)
+                        list.push_back(id);
+                return list;
+            };
             auto nameOfTarget = [](int target) { return target >= 0 ? playerName(target) : std::string(kTargets[-target - 1]); };
 
-            ui->separator_text("선수 고르기 (대상 '고른 선수'에 쓰임)");
+            ui->separator_text("선수 고르기 (여러 명 체크, 구단을 바꿔 가며 고를 수 있음 · 대상 '고른 선수 N명'에 쓰임)");
             ui->set_next_width(170.0f);
-            if (ui->combo("##pickteam", &g_pickTeam, teamItems.data(), kTeams))
-                g_pickPlayer = 0;
-            if (!havePlayer)
-                ui->text_disabled("이 구단의 선수 목록을 아직 읽을 수 없습니다 (게임을 불러온 뒤에 나옵니다).");
-            else
-            {
-                std::vector<const char *> playerItems;
+            ui->combo("##pickteam", &g_pickTeam, teamItems.data(), kTeams);
+            ui->same_line();
+            const char *kinds[] = {"전체", "투수만", "야수만"};
+            ui->set_next_width(90.0f);
+            ui->combo("##pickkind", &g_pickKind, kinds, 3);
+            ui->same_line();
+            if (ui->small_button("보이는 선수 모두 체크"))
                 for (const Player &player : players)
-                    playerItems.push_back(player.label.c_str());
-                ui->same_line();
-                ui->set_next_width(220.0f);
-                ui->combo("##pickplayer", &g_pickPlayer, playerItems.data(), static_cast<int>(playerItems.size()));
+                    if (g_pickKind == 0 || (g_pickKind == 1) == player.pitcher)
+                        g_selected.insert(player.id);
+            ui->same_line();
+            if (ui->small_button("체크 모두 풀기"))
+                g_selected.clear();
+            if (players.empty())
+                ui->text_disabled("이 구단의 선수 목록을 아직 읽을 수 없습니다 (게임을 불러온 뒤에 나옵니다).");
+            else if (ui->begin_child("##pickplayers", 0.0f, 190.0f))
+            {
+                int column = 0;
+                for (const Player &player : players)
+                {
+                    if (g_pickKind != 0 && (g_pickKind == 1) != player.pitcher)
+                        continue;
+                    if (column++ % 3 != 0)
+                        ui->same_line();
+                    ui->push_id(player.id);
+                    int on = g_selected.count(player.id) ? 1 : 0;
+                    ui->set_next_width(0.0f);
+                    if (ui->checkbox(player.label.c_str(), &on))
+                    {
+                        if (on)
+                            g_selected.insert(player.id);
+                        else
+                            g_selected.erase(player.id);
+                    }
+                    ui->pop_id();
+                }
+                ui->end_child();
+            }
+            else
+                ui->end_child();
+            if (havePlayer)
+            {
+                std::string names;
+                int shown = 0;
+                for (const uint16_t id : g_selected)
+                {
+                    if (shown++ == 8)
+                    {
+                        names += " 외 " + std::to_string(g_selected.size() - 8) + "명";
+                        break;
+                    }
+                    names += (names.empty() ? "" : ", ") + playerName(id);
+                }
+                ui->text_wrapped(("고른 선수 " + std::to_string(g_selected.size()) + "명: " + names).c_str());
             }
 
             // Forced results
@@ -853,16 +918,25 @@ namespace urban::matchscript
             ui->same_line();
             if (ui->button("더하기##rule") && (g_groupTarget < 3 || havePlayer))
             {
-                const Rule rule{targetOf(g_groupTarget), g_groupRole == 1, static_cast<Action>(g_groupAction + 1)};
-                bool replaced = false;
-                for (Rule &existing : settings.rules)
-                    if (existing.target == rule.target && existing.pitcher == rule.pitcher)
-                    {
-                        existing.action = rule.action; // one result per target and role
-                        replaced = true;
-                    }
-                if (!replaced)
-                    settings.rules.push_back(rule);
+                for (const int target : targetsOf(g_groupTarget))
+                {
+                    const Rule rule{target, g_groupRole == 1, static_cast<Action>(g_groupAction + 1)};
+                    bool replaced = false;
+                    for (Rule &existing : settings.rules)
+                        if (existing.target == rule.target && existing.pitcher == rule.pitcher)
+                        {
+                            existing.action = rule.action; // one result per target and role
+                            replaced = true;
+                        }
+                    if (!replaced)
+                        settings.rules.push_back(rule);
+                }
+                changed = true;
+            }
+            ui->same_line();
+            if (ui->small_button("규칙 모두 빼기") && !settings.rules.empty())
+            {
+                settings.rules.clear();
                 changed = true;
             }
             ui->text(settings.limit > 0 ? ("한 이닝에 강제하는 홈런·안타·볼넷: " + std::to_string(settings.limit) + "번까지").c_str()
@@ -961,15 +1035,24 @@ namespace urban::matchscript
             ui->same_line();
             if (ui->button("더하기 (x2.0 +0, 위에서 조절)##boost") && (g_boostTarget < 3 || havePlayer))
             {
-                const Boost boost{targetOf(g_boostTarget), g_boostStat, 200, 0};
-                bool exists = false;
-                for (const Boost &existing : settings.boosts)
-                    exists = exists || (existing.target == boost.target && existing.stat == boost.stat);
-                if (!exists)
+                for (const int target : targetsOf(g_boostTarget))
                 {
-                    settings.boosts.push_back(boost);
-                    changed = true;
+                    const Boost boost{target, g_boostStat, 200, 0};
+                    bool exists = false;
+                    for (const Boost &existing : settings.boosts)
+                        exists = exists || (existing.target == boost.target && existing.stat == boost.stat);
+                    if (!exists)
+                    {
+                        settings.boosts.push_back(boost);
+                        changed = true;
+                    }
                 }
+            }
+            ui->same_line();
+            if (ui->small_button("중첩 모두 빼기") && !settings.boosts.empty())
+            {
+                settings.boosts.clear();
+                changed = true;
             }
             if (changed)
                 save(settings);
