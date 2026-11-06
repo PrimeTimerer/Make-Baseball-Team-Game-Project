@@ -203,7 +203,8 @@ def launcher_from_source(args=()):
 def release(args=()):
     if not WINDOWS:
         return run([sys.executable, ROOT / "tools" / "linux" / "release.py", *args])
-    return run([sys.executable, ROOT / "tools" / "release.py"])
+    # YKTK3's folder and ZIP (tools/release.py is the upstream Urban Reign one).
+    return run([sys.executable, ROOT / "tools" / "release_yktk3.py", *args])
 
 
 def has_disc_image():

@@ -7,6 +7,18 @@
 > 실행할 때 디스크의 실행 파일(`SLPM_658.53`)을 SHA-256으로 대조해 정품 디스크에서만 동작합니다.
 > 게임과 그 안의 모든 데이터·코드의 권리는 **SEGA**에 있습니다. 이 저장소는 SEGA와 관계없는 비영리 팬 프로젝트이며,
 > 게임의 코드나 데이터를 담고 있지 않습니다(변환된 게임 코드와 VU1 마이크로코드는 각자의 ISO에서 로컬로 만들어집니다).
+> 단, [릴리스](https://github.com/PrimeTimerer/Make-Baseball-Team-Game-Project/releases)의 ZIP에 든 `yktk3.exe`에는 변환된
+> 게임 코드가 들어 있습니다. 게임 데이터(그래픽·소리 등)는 들어 있지 않고, 실행에는 위처럼 각자의 정품 디스크 이미지가 필요합니다.
+
+## 받아서 실행 (릴리스)
+
+1. [릴리스](https://github.com/PrimeTimerer/Make-Baseball-Team-Game-Project/releases)에서 `YKTK3-PC-<날짜>.zip`을 받아 풉니다.
+2. `YKTK3 Launcher.exe`를 열고 직접 가지고 있는 디스크 이미지(`.iso`, SLPM-65853)를 고릅니다(또는 풀린 폴더 옆
+   `game` 폴더에 넣기).
+3. 플레이. 화면·컨트롤러·메모리카드·치트는 런처에서, 선수 치트·스카우트 등은 게임 중 F2에서 정합니다.
+
+릴리스 ZIP은 `py -3 build.py release`(`tools/release_yktk3.py`)가 만듭니다. 세이브·상태 파일·로그·각자의 설정과 디스크에서
+나온 파일(`game_data`, RAM·VU1 덤프)은 넣지 않습니다.
 
 ## 현재 상태
 
