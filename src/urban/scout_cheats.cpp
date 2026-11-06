@@ -51,6 +51,11 @@ namespace urban::scout
         // evaluations (u16), +0x63 set to 0x0C by a find, +0x74 the info bits shown (u16), +0x8C the database record.
         constexpr uint32_t kName = 0x2u, kAge = 0x15u, kStatus = 0x1Fu, kInterest = 0x2Fu, kEvaluation = 0x3Cu, kFresh = 0x63u,
                            kInfo = 0x74u, kRecord = 0x8Cu;
+        // +0x62: on the list to draft or sign now (国内新人 / 外国人 of 報告リスト). The overseas builder sets 1; the yearly
+        // domestic build (sub_00177C78) sets it for this year's candidates only, so the others wait for next season.
+        constexpr uint32_t kListed = 0x62u;
+        // The database record's uniform name (背ネーム, from +0x1A): 5-bit letters, A = 1 ... Z = 26, 0 ends.
+        constexpr uint32_t kBackName = 0x1Au;
         // The database ([0x5D1270]: +0 the records, +0xC their count): 0xA6-byte records sorted by id.
         constexpr uint32_t kDatabase = 0x5D1270u, kRecordSize = 0xA6u;
         constexpr int kTeams = 12;
@@ -74,6 +79,7 @@ namespace urban::scout
             int perDay = 0;         // finds a scout and day (0: the game's own odds)
             bool guard = true;      // CPU clubs lose the protected players
             bool guardFound = true; // ... every player the own team found too, not only the wish list and the kept ones
+            bool listNow = true;    // wished / inserted domestic players on this year's 国内新人 list (+0x62 = 1)
             std::set<uint16_t> want; // found at once
             std::set<uint16_t> keep; // protected without being on the wish list
         };
@@ -93,8 +99,8 @@ namespace urban::scout
             uint16_t id = 0u;
             bool foreign = false;
             int index = 0; // in its pool: domestic area * 39 + kind * 13 + n, overseas league * 18 + n
-            std::string name;
-            int age = 0, state = 0, status = 0, cpu = 0;
+            std::string name, back;
+            int age = 0, state = 0, status = 0, cpu = 0; // status: the rank, 0 S ... 4 D (as the game's ランク)
         };
         struct Write
         {
@@ -114,8 +120,8 @@ namespace urban::scout
         struct DbRow
         {
             uint16_t id = 0u;
-            std::string name;
-            int age = 0;
+            std::string name, back;
+            int age = 0, rank = 0;
         };
 
         uint8_t *g_rdram = nullptr;
@@ -127,7 +133,12 @@ namespace urban::scout
         std::set<uint16_t> g_onRoster; // ids on the 12 rosters now (for the menu's 선수 넣기)
         // Overseas players' real models: scout_models.tsv (name<TAB>model, made by tools/scout_models.py from
         // gamezukushi.com's lists; 架空 = made up, 現役 = the real player himself). Read once at start.
-        std::map<std::string, std::string> g_models;
+        struct Note
+        {
+            std::string model, position, summary, modelEn, modelKo; // the model in English / Korean (tools/scout_model_names.tsv)
+        };
+        std::map<uint16_t, Note> g_notes;               // by player id
+        std::map<std::string, std::string> g_models;    // model by name (the site's list, older files)
         std::vector<Write> g_writes;
         std::vector<Insert> g_inserts;
         std::vector<DbRow> g_db;         // the database for the menu (built once a load)
@@ -215,6 +226,8 @@ namespace urban::scout
                     settings.guard = value != "0";
                 else if (key == "guardfound")
                     settings.guardFound = value != "0";
+                else if (key == "listnow")
+                    settings.listNow = value != "0";
                 else if (key == "want")
                     settings.want = idsOf(value);
                 else if (key == "keep")
@@ -242,6 +255,7 @@ namespace urban::scout
                      << "perday=" << settings.perDay << "\n"
                      << "guard=" << (settings.guard ? 1 : 0) << "\n"
                      << "guardfound=" << (settings.guardFound ? 1 : 0) << "\n"
+                     << "listnow=" << (settings.listNow ? 1 : 0) << "\n"
                      << "want=" << textOf(settings.want) << "\n"
                      << "keep=" << textOf(settings.keep) << "\n";
             }
@@ -302,6 +316,24 @@ namespace urban::scout
             (void)address;
             return std::string();
 #endif
+        }
+
+        std::string backNameOf(uint32_t record)
+        {
+            if (!valid(record, kRecordSize))
+                return std::string();
+            uint64_t bits = 0u;
+            for (uint32_t k = 0; k < 8u; ++k)
+                bits |= static_cast<uint64_t>(g_rdram[record + kBackName + k]) << (8u * k);
+            std::string text;
+            for (int k = 0; k < 12; ++k)
+            {
+                const unsigned letter = static_cast<unsigned>(bits >> (5 * k)) & 31u;
+                if (letter == 0u)
+                    break;
+                text += letter <= 26u ? static_cast<char>('A' + letter - 1u) : letter == 27u ? '.' : letter == 28u ? '-' : ' ';
+            }
+            return text;
         }
 
         // The database record of `id` (binary search, as sub_00125488), 0 when there is none.
@@ -453,20 +485,43 @@ namespace urban::scout
                     if (read16(entryOf(insert.foreign, first + k)) == 0u)
                         slot = first + k;
                 std::string replaced;
-                for (int k = 0; k < size && slot < 0; ++k)
+                for (int pass = 0; pass < 4 && slot < 0; ++pass)
                 {
-                    const uint32_t other = entryOf(insert.foreign, first + k);
-                    const uint16_t otherId = read16(other);
-                    if (g_rdram[stateOf(insert.foreign, first + k)] == 0u && !g_settings.want.count(otherId) && !g_settings.keep.count(otherId) &&
-                        !(insert.from >= 0 && insert.fromForeign == insert.foreign && insert.from == first + k))
+                    int worst = -1;
+                    for (int k = 0; k < size; ++k)
                     {
-                        slot = first + k;
+                        const int index = first + k;
+                        const uint32_t other = entryOf(insert.foreign, index);
+                        const uint16_t otherId = read16(other);
+                        const uint8_t otherState = g_rdram[stateOf(insert.foreign, index)];
+                        const bool wanted = g_settings.want.count(otherId) != 0u;
+                        if (g_settings.keep.count(otherId) || (insert.from >= 0 && insert.fromForeign == insert.foreign && insert.from == index))
+                            continue;
+                        const bool fits = pass == 0   ? otherState == 0u && !wanted
+                                          : pass == 1 ? otherState < 3u && !wanted
+                                          : pass == 2 ? !wanted
+                                                      : true;
+                        if (!fits)
+                            continue;
+                        if (pass < 3)
+                        {
+                            worst = index;
+                            break;
+                        }
+                        if (worst < 0 || g_rdram[other + kStatus] > g_rdram[entryOf(insert.foreign, worst) + kStatus])
+                            worst = index; // the lowest rank (D) first
+                    }
+                    if (worst >= 0)
+                    {
+                        slot = worst;
+                        const uint32_t other = entryOf(insert.foreign, slot);
                         replaced = nameAt(other + kName);
+                        g_settings.want.erase(read16(other));
                     }
                 }
                 if (slot < 0)
                 {
-                    g_message = "그곳의 13칸·18칸이 모두 발굴·찜한 선수라 넣을 자리가 없습니다";
+                    g_message = "그곳의 13칸·18칸이 모두 독점 선수라 넣을 자리가 없습니다";
                     continue;
                 }
                 const uint32_t entry = entryOf(insert.foreign, slot);
@@ -474,6 +529,8 @@ namespace urban::scout
                 g_rdram[stateOf(insert.foreign, slot)] = 3u;
                 g_rdram[entry + kFresh] = 0x0Cu;
                 write16(entry + kInfo, 0xFFFFu);
+                if (!insert.foreign && g_settings.listNow)
+                    g_rdram[entry + kListed] = 1u;
                 if (insert.from >= 0)
                 {
                     std::memset(g_rdram + entryOf(insert.fromForeign, insert.from), 0, kEntry);
@@ -482,7 +539,7 @@ namespace urban::scout
                 g_message = nameAt(entry + kName) + (insert.from >= 0 ? " 옮김: " : " 넣음: ") +
                             (insert.foreign ? std::string(kLeagues[insert.group])
                                             : std::string(kAreas[insert.group / 3]) + " · " + kKinds[insert.group % 3]) +
-                            " (발굴 상태)" + (replaced.empty() ? std::string() : ", 빈 칸이 없어 미발굴 후보 " + replaced + "와(과) 바꿈");
+                            " (발굴 상태)" + (replaced.empty() ? std::string() : ", 빈 칸이 없어 " + replaced + " 대신");
                 std::fprintf(stderr, "[scout] %u %s %s slot %d%s\n", insert.id, insert.from >= 0 ? "moved to" : "put in",
                              insert.foreign ? "overseas" : "domestic", slot, insert.from >= 0 ? " (old slot emptied)" : "");
             }
@@ -500,6 +557,8 @@ namespace urban::scout
                         row.id = read16(record);
                         row.name = nameAt(record + 2u);
                         row.age = g_rdram[record + 0x15u];
+                        row.rank = (read16(record + 0x4Eu) >> 2) & 0xFu;
+                        row.back = backNameOf(record);
                         g_db.push_back(std::move(row));
                     }
                 g_dbBase = base;
@@ -536,6 +595,8 @@ namespace urban::scout
                     if (g_settings.enabled)
                     {
                         // The wish list: found now, everything shown (as a find does: state 3, +0x63 = 0x0C).
+                        if (!overseas && g_settings.listNow && g_settings.want.count(id) && g_rdram[entry + kListed] == 0u)
+                            g_rdram[entry + kListed] = 1u;
                         if (g_settings.want.count(id) && state < 3u)
                         {
                             state = 3u;
@@ -560,6 +621,7 @@ namespace urban::scout
                         row.foreign = overseas;
                         row.index = index;
                         row.name = nameOf(entry);
+                        row.back = backNameOf(read32(entry + kRecord));
                         row.age = g_rdram[entry + kAge];
                         row.state = state;
                         row.status = g_rdram[entry + kStatus];
@@ -580,16 +642,76 @@ namespace urban::scout
         int g_toArea = 0, g_toKind = 0, g_toLeague = 0; // where 선수 넣기 / 옮기기 put a player
         char g_dbSearch[64] = "";
 
-        // "이름 (모델: …)" when the lists know a real model.
-        std::string displayName(const std::string &name, bool overseas)
+        // "이름 (모델: …)" when the notes know a real model (OB / 現役 / 架空: the name is the player himself or made up).
+        std::string displayName(uint16_t id, const std::string &name)
         {
-            if (!overseas)
-                return name.empty() ? "?" : name;
-            const auto model = g_models.find(name);
-            if (model == g_models.end() || model->second.empty() || model->second == "架空" || model->second == "現役")
-                return name.empty() ? "?" : name;
-            return name + " (모델: " + model->second + ")";
+            const std::string shown = name.empty() ? "?" : name;
+            std::string model;
+            if (const auto note = g_notes.find(id); note != g_notes.end())
+                model = note->second.model;
+            if (model.empty())
+                if (const auto byName = g_models.find(name); byName != g_models.end())
+                    model = byName->second;
+            if (model.empty() || model == "架空" || model == "現役" || model == "OB" || model == "-")
+                return shown;
+            if (model == "特殊")
+                return shown + " (특수 선수)";
+            if (const auto note = g_notes.find(id); note != g_notes.end() && !note->second.modelKo.empty())
+                return shown + " (모델: " + note->second.modelKo + " · " + note->second.modelEn + ")";
+            return shown + " (모델: " + model + ")";
         }
+        std::string modelOf(uint16_t id, const std::string &name)
+        {
+            if (const auto note = g_notes.find(id); note != g_notes.end() && !note->second.model.empty())
+                return note->second.model;
+            const auto byName = g_models.find(name);
+            return byName == g_models.end() ? std::string() : byName->second;
+        }
+        const Note *noteOf(uint16_t id)
+        {
+            const auto note = g_notes.find(id);
+            return note == g_notes.end() ? nullptr : &note->second;
+        }
+        // A query: part of the name, of the uniform name (letters, any case) or the id.
+        // Letters and digits only, lower case (English); spaces dropped (any other text).
+        std::string folded(const std::string &text)
+        {
+            std::string out;
+            for (unsigned char c : text)
+                if (c >= 0x80u)
+                    out += static_cast<char>(c);
+                else if (std::isalnum(c))
+                    out += static_cast<char>(std::tolower(c));
+            return out;
+        }
+        bool matchesQuery(const std::string &name, const std::string &back, uint16_t id, const std::string &query)
+        {
+            if (name.find(query) != std::string::npos || std::to_string(id) == query)
+                return true;
+            const std::string key = folded(query);
+            if (key.empty())
+                return false;
+            if (folded(name).find(key) != std::string::npos || folded(back).find(key) != std::string::npos)
+                return true;
+            const std::string model = modelOf(id, name);
+            if (!model.empty() && (model.find(query) != std::string::npos || folded(model).find(key) != std::string::npos))
+                return true;
+            const auto note = g_notes.find(id);
+            return note != g_notes.end() &&
+                   (folded(note->second.modelEn).find(key) != std::string::npos || folded(note->second.modelKo).find(key) != std::string::npos);
+        }
+        constexpr const char *kRanks[5] = {"S", "A", "B", "C", "D"};
+        // S gold, A red, B orange, C green, D grey (R in the low byte).
+        constexpr uint32_t kRankColors[5] = {0xFF2CD7FFu, 0xFF5A5AFFu, 0xFF50BEFFu, 0xFF78C878u, 0xFF968C8Cu};
+        void rankCell(const Pcsx2GsUi *ui, int rank)
+        {
+            if (rank >= 0 && rank < 5)
+                ui->text_colored(kRankColors[rank], kRanks[rank]);
+            else
+                ui->text_disabled("?");
+            ui->tooltip("게임의 랭크(ランク): S가 가장 좋고 D가 가장 낮음. 성장 폭발 횟수·코멘트에 영향 (S/A는 발굴 때 '유력 선수' 메일)");
+        }
+        int g_rankFilter = 0; // 0 all, 1 S, 2 A or better, 3 B or better
 
         // The place pickers: a domestic area and kind, or an overseas league.
         void drawTarget(const Pcsx2GsUi *ui, bool overseas)
@@ -636,7 +758,8 @@ namespace urban::scout
         void drawPool(const Pcsx2GsUi *ui, Settings &settings, const std::vector<Row> &rows, bool overseas, bool &changed)
         {
             ui->set_next_width(200.0f);
-            ui->input_text("##search", "이름 · ID", g_search, sizeof(g_search));
+            ui->input_text("##search", "이름 · 영문 · 실존 모델 · ID", g_search, sizeof(g_search));
+            ui->tooltip("게임 이름, 등 이름(영문), 실존 모델 이름(가타카나·영어·한국어, 예: 사이 영, cy young), 선수 ID로 찾습니다.");
             ui->same_line();
             std::vector<std::string> places{overseas ? "모든 리그" : "모든 지역·구분"};
             if (overseas)
@@ -654,6 +777,10 @@ namespace urban::scout
             const char *shows[4] = {"모두", "발굴한 선수", "미발굴", "찜·독점"};
             ui->set_next_width(120.0f);
             ui->combo("##show", &g_show, shows, 4);
+            ui->same_line();
+            const char *ranks[4] = {"모든 랭크", "S만", "A 이상", "B 이상"};
+            ui->set_next_width(100.0f);
+            ui->combo("##rank", &g_rankFilter, ranks, 4);
             std::string query = trim(g_search);
             std::vector<const Row *> shown;
             for (const Row &row : rows)
@@ -665,7 +792,9 @@ namespace urban::scout
                 const bool wanted = settings.want.count(row.id) || settings.keep.count(row.id);
                 if ((g_show == 1 && row.state < 3) || (g_show == 2 && row.state >= 3) || (g_show == 3 && !wanted))
                     continue;
-                if (!query.empty() && row.name.find(query) == std::string::npos && std::to_string(row.id) != query)
+                if (!query.empty() && !matchesQuery(row.name, row.back, row.id, query))
+                    continue;
+                if (g_rankFilter > 0 && row.status > g_rankFilter - 1)
                     continue;
                 shown.push_back(&row);
             }
@@ -689,19 +818,49 @@ namespace urban::scout
                     settings.want.erase(row->id);
                 changed = true;
             }
-            if (!ui->begin_table(overseas ? "foreign" : "domestic", 8,
-                                 PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS | PCSX2GS_TABLE_RESIZABLE, 0.0f, 0.0f))
+            if (!ui->begin_table(overseas ? "foreign" : "domestic", 12,
+                                 PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS | PCSX2GS_TABLE_RESIZABLE |
+                                     PCSX2GS_TABLE_SORTABLE | PCSX2GS_TABLE_SCROLL_X,
+                                 0.0f, 0.0f))
                 return;
-            ui->table_freeze(0, 1);
-            ui->table_column("찜", 0, 34.0f);
-            ui->table_column("독점", 0, 40.0f);
-            ui->table_column("이름", 0, overseas ? 300.0f : 130.0f);
+            ui->table_freeze(3, 1);
+            ui->table_column("찜", PCSX2GS_COLUMN_NO_SORT, 34.0f);
+            ui->table_column("독점", PCSX2GS_COLUMN_NO_SORT, 40.0f);
+            ui->table_column("이름", 0, 300.0f);
+            ui->table_column("영문", 0, 90.0f);
+            ui->table_column("랭크", 0, 40.0f);
             ui->table_column("나이", 0, 36.0f);
+            ui->table_column("포지션", 0, 80.0f);
+            ui->table_column("능력 (상한)", PCSX2GS_COLUMN_NO_SORT, 270.0f);
             ui->table_column(overseas ? "리그" : "지역 · 구분", 0, 170.0f);
             ui->table_column("우리 구단", 0, 100.0f);
-            ui->table_column("CPU 관심", 0, 64.0f);
-            ui->table_column("", 0, 0.0f);
+            ui->table_column("CPU 관심", PCSX2GS_COLUMN_DESCENDING_FIRST, 64.0f);
+            ui->table_column("", PCSX2GS_COLUMN_NO_SORT, 180.0f);
             ui->table_headers();
+            int column = -1, down = 0;
+            ui->table_sort(&column, &down);
+            if (column >= 0)
+                std::stable_sort(shown.begin(), shown.end(), [&](const Row *a, const Row *b) {
+                    const auto key = [&](const Row *row) -> long long {
+                        switch (column)
+                        {
+                        case 4: return row->status;
+                        case 5: return row->age;
+                        case 8: return row->index;
+                        case 9: return row->state;
+                        case 10: return row->cpu;
+                        default: return 0;
+                        }
+                    };
+                    if (column == 2 || column == 3 || column == 6)
+                    {
+                        const Note *na = noteOf(a->id), *nb = noteOf(b->id);
+                        const std::string x = column == 2 ? a->name : column == 3 ? a->back : na ? na->position : std::string();
+                        const std::string y = column == 2 ? b->name : column == 3 ? b->back : nb ? nb->position : std::string();
+                        return down ? x > y : x < y;
+                    }
+                    return down ? key(a) > key(b) : key(a) < key(b);
+                });
             ui->clipper_begin(static_cast<int>(shown.size()));
             int first = 0, end = 0;
             while (ui->clipper_step(&first, &end))
@@ -733,10 +892,25 @@ namespace urban::scout
                     }
                     ui->tooltip("독점: CPU 구단의 관심·평가를 계속 지워서 이 선수를 쫓지 못하게 (찜·발굴한 선수는 설정에 따라 자동)");
                     ui->table_next_column();
-                    ui->text(displayName(row.name, row.foreign).c_str());
-                    ui->tooltip(("선수 ID " + std::to_string(row.id)).c_str());
+                    ui->text(displayName(row.id, row.name).c_str());
+                    {
+                        const std::string model = modelOf(row.id, row.name);
+                        ui->tooltip(("선수 ID " + std::to_string(row.id) + (model.empty() ? std::string() : " · 모델: " + model)).c_str());
+                    }
+                    ui->table_next_column();
+                    ui->text(row.back.c_str());
+                    ui->table_next_column();
+                    rankCell(ui, row.status);
                     ui->table_next_column();
                     ui->text(std::to_string(row.age).c_str());
+                    const Note *note = noteOf(row.id);
+                    ui->table_next_column();
+                    ui->text(note ? note->position.c_str() : "");
+                    ui->table_next_column();
+                    if (note && !note->summary.empty())
+                        ui->text(note->summary.c_str());
+                    else
+                        ui->text_disabled("(선수 데이터 파일 없음)");
                     ui->table_next_column();
                     ui->text(placeText(row).c_str());
                     ui->table_next_column();
@@ -784,7 +958,8 @@ namespace urban::scout
             if (!message.empty())
                 ui->text_colored(0xFF66CCFFu, message.c_str());
             ui->set_next_width(220.0f);
-            ui->input_text("##dbsearch", "이름 · ID로 찾기", g_dbSearch, sizeof(g_dbSearch));
+            ui->input_text("##dbsearch", "이름 · 영문 · 실존 모델 · ID로 찾기", g_dbSearch, sizeof(g_dbSearch));
+            ui->tooltip("게임 이름, 등 이름(영문), 실존 모델 이름(가타카나·영어·한국어, 예: 랜디 존슨, randy johnson), 선수 ID로 찾습니다.");
             ui->same_line();
             ui->text_disabled(("DB 선수 " + std::to_string(db.size()) + "명 (찾을 말을 쓰면 목록이 나옵니다)").c_str());
             const std::string query = trim(g_dbSearch);
@@ -797,7 +972,7 @@ namespace urban::scout
                     for (char c : name)
                         if (c != ' ')
                             compact += c;
-                    if (row.name.find(query) != std::string::npos || compact.find(query) != std::string::npos || std::to_string(row.id) == query)
+                    if (compact.find(query) != std::string::npos || matchesQuery(row.name, row.back, row.id, query))
                         shown.push_back(&row);
                 }
             if (shown.empty())
@@ -805,14 +980,19 @@ namespace urban::scout
             std::map<uint16_t, const Row *> pooled;
             for (const Row &row : rows)
                 pooled[row.id] = &row;
-            if (!ui->begin_table("database", 5, PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
+            if (!ui->begin_table("database", 9, PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS | PCSX2GS_TABLE_SCROLL_X,
+                                 0.0f, 0.0f))
                 return;
-            ui->table_freeze(0, 1);
+            ui->table_freeze(2, 1);
             ui->table_column("ID", 0, 50.0f);
             ui->table_column("이름", 0, 320.0f);
+            ui->table_column("영문", 0, 90.0f);
+            ui->table_column("랭크", 0, 40.0f);
             ui->table_column("나이", 0, 36.0f);
-            ui->table_column("지금", 0, 170.0f);
-            ui->table_column("", 0, 0.0f);
+            ui->table_column("포지션", 0, 80.0f);
+            ui->table_column("능력 (상한)", 0, 270.0f);
+            ui->table_column("지금", 0, 110.0f);
+            ui->table_column("", 0, 190.0f);
             ui->table_headers();
             ui->clipper_begin(static_cast<int>(shown.size()));
             int first = 0, end = 0;
@@ -825,9 +1005,18 @@ namespace urban::scout
                     ui->table_next_column();
                     ui->text(std::to_string(row.id).c_str());
                     ui->table_next_column();
-                    ui->text(displayName(row.name, true).c_str());
+                    ui->text(displayName(row.id, row.name).c_str());
+                    ui->table_next_column();
+                    ui->text(row.back.c_str());
+                    ui->table_next_column();
+                    rankCell(ui, row.rank);
                     ui->table_next_column();
                     ui->text(std::to_string(row.age).c_str());
+                    const Note *note = noteOf(row.id);
+                    ui->table_next_column();
+                    ui->text(note ? note->position.c_str() : "");
+                    ui->table_next_column();
+                    ui->text(note ? note->summary.c_str() : "");
                     ui->table_next_column();
                     const auto pool = pooled.find(row.id);
                     if (onRoster.count(row.id))
@@ -909,6 +1098,13 @@ namespace urban::scout
             }
             ui->end_disabled();
             ui->tooltip("CPU 구단의 관심·평가 값을 계속 0으로 둡니다. 드래프트·외국인 영입에서 CPU가 노리지 않게 하려는 것으로, 드래프트에서 직접 확인이 필요합니다.");
+            int listNow = settings.listNow ? 1 : 0;
+            if (ui->checkbox("찜·넣은 국내 선수를 지금 국내신인 리스트에 올리기", &listNow))
+            {
+                settings.listNow = listNow != 0;
+                changed = true;
+            }
+            ui->tooltip("게임은 올해 지명·교섭 대상인 국내 후보만 보고 리스트(国内新人)에 보입니다(+0x62). 켜면 찜하거나 DB에서 넣은 국내 선수도 지금 대상이 됩니다. 실험 기능: 드래프트에서 확인 필요.");
             ui->text_disabled(("찜 " + std::to_string(settings.want.size()) + "명 · 독점 " + std::to_string(settings.keep.size()) +
                                "명. 찜한 선수는 '선수 치트 켜기'처럼 이 탭이 켜져 있을 때 바로 발굴됩니다.")
                                   .c_str());
@@ -968,13 +1164,34 @@ namespace urban::scout
             {
                 if (!line.empty() && line.back() == '\r')
                     line.pop_back();
-                const size_t tab = line.find('\t');
-                if (line.empty() || line[0] == '#' || tab == std::string::npos)
+                if (line.empty() || line[0] == '#')
                     continue;
-                const size_t second = line.find('\t', tab + 1);
-                g_models.emplace(line.substr(0, tab), line.substr(tab + 1, second == std::string::npos ? std::string::npos : second - tab - 1));
+                std::vector<std::string> fields;
+                std::istringstream cells(line);
+                std::string cell;
+                while (std::getline(cells, cell, '\t'))
+                    fields.push_back(cell);
+                if (fields.size() < 2u)
+                    continue;
+                const bool byId = !fields[0].empty() && std::all_of(fields[0].begin(), fields[0].end(), [](char c) { return c >= '0' && c <= '9'; });
+                if (!byId) // name, model, league (the site's list alone)
+                {
+                    g_models.emplace(fields[0], fields[1]);
+                    continue;
+                }
+                const unsigned long id = std::strtoul(fields[0].c_str(), nullptr, 10);
+                Note note;
+                note.model = fields.size() > 2u ? fields[2] : std::string();
+                note.position = fields.size() > 3u ? fields[3] : std::string();
+                note.summary = fields.size() > 4u ? fields[4] : std::string();
+                note.modelEn = fields.size() > 5u ? fields[5] : std::string();
+                note.modelKo = fields.size() > 6u ? fields[6] : std::string();
+                if (fields.size() > 1u && !note.model.empty())
+                    g_models.emplace(fields[1], note.model);
+                if (id > 0u && id <= 0xFFFFu)
+                    g_notes[static_cast<uint16_t>(id)] = std::move(note);
             }
-            if (!g_models.empty())
+            if (!g_models.empty() || !g_notes.empty())
                 break;
         }
         std::error_code error;
@@ -990,8 +1207,8 @@ namespace urban::scout
             return;
         }
         ps2x::pnach::addFrameHook(frame);
-        std::fprintf(stderr, "[scout] %s, %d a day, %zu wanted, %zu overseas models\n", g_settings.enabled ? "on" : "off", g_settings.perDay,
-                     g_settings.want.size(), g_models.size());
+        std::fprintf(stderr, "[scout] %s, %d a day, %zu wanted, %zu player notes, %zu models\n", g_settings.enabled ? "on" : "off",
+                     g_settings.perDay, g_settings.want.size(), g_notes.size(), g_models.size());
 #if defined(URBAN_SCOUT_MENU)
         ps2x::menu::addPanel("스카우트", [](const Pcsx2GsUi *ui) { draw(ui); });
 #endif
