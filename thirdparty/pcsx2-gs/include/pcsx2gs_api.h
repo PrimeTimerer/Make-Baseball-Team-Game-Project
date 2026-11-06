@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define PCSX2GS_API_VERSION 4u
+#define PCSX2GS_API_VERSION 5u
 
 typedef struct Pcsx2GsOpenParams
 {
@@ -47,7 +47,7 @@ typedef struct Pcsx2GsPrivRegs
     uint64_t siglblid;
 } Pcsx2GsPrivRegs;
 
-// In-game menu (version 4): a small immediate-mode UI on top of the image, drawn with the DLL's own ImGui. The draw
+// In-game menu (UI version 3, API 5): a small immediate-mode UI on top of the image, drawn with the DLL's own ImGui. The draw
 // callback set with set_menu runs on the GS thread at every present and builds the menu with these calls (UTF-8
 // strings; the bool results say "clicked" / "changed" / "open"). Mods will draw their panels with the same table.
 typedef struct Pcsx2GsUi
@@ -83,7 +83,41 @@ typedef struct Pcsx2GsUi
     void (*set_next_width)(float width); // width of the next item (0 = default)
     void (*begin_disabled)(int disabled);
     void (*end_disabled)(void);
+    // version 3. Sizes are in the same units as set_next_width (they grow with the menu's text); 0 = fill / default.
+    int (*input_int)(const char *label, int *value, int step);                          // typed number; step > 0 adds -/+
+    int (*input_text)(const char *label, const char *hint, char *buffer, uint32_t size); // UTF-8; hint shown when empty
+    int (*slider_int)(const char *label, int *value, int min, int max);
+    int (*selectable)(const char *label, int selected, uint32_t flags); // PCSX2GS_SELECT_*; returns clicked
+    int (*begin_table)(const char *id, int columns, uint32_t flags, float width, float height); // PCSX2GS_TABLE_*
+    void (*end_table)(void);                                            // only after begin_table returned 1
+    void (*table_column)(const char *label, uint32_t flags, float width); // PCSX2GS_COLUMN_*; width 0 = stretch
+    void (*table_freeze)(int columns, int rows);                          // header row / first columns stay put
+    void (*table_headers)(void);
+    void (*table_next_row)(void);
+    int (*table_next_column)(void);
+    int (*table_sort)(int *column, int *descending); // the current sort (column -1 = none); 1 once after a change
+    void (*table_row_color)(uint32_t rgba);          // background of the current row (R in the low byte)
+    void (*tooltip)(const char *text);               // for the last item, while the mouse is on it
+    int (*item_hovered)(void);
+    int (*item_double_clicked)(void);
+    int (*collapsing_header)(const char *label, int open_first);
+    void (*progress_bar)(float fraction, uint32_t rgba, float width, float height, const char *overlay); // rgba 0 = default
+    uint32_t (*key_mods)(void);                    // PCSX2GS_KEY_SHIFT / PCSX2GS_KEY_CTRL while held
+    void (*avail)(float *width, float *height);    // room left in the window or child
+    void (*same_line_at)(float x);                 // same line, starting at x from the left edge
+    int (*button_colored)(const char *label, uint32_t rgba, float width); // rgba 0 = the usual color
+    int (*begin_panel)(const char *id, float width, float height, int border); // child area (end_child); negative = fill minus
+    void (*clipper_begin)(int count);          // many rows of one height in a scrolling area: draw only the visible ones,
+    int (*clipper_step)(int *first, int *end); // while it returns 1: the rows [first, end)
 } Pcsx2GsUi;
+
+enum
+{
+    PCSX2GS_TABLE_SORTABLE = 1u << 0, PCSX2GS_TABLE_SCROLL = 1u << 1, PCSX2GS_TABLE_BORDERS = 1u << 2,
+    PCSX2GS_TABLE_ROW_BG = 1u << 3, PCSX2GS_TABLE_RESIZABLE = 1u << 4, PCSX2GS_TABLE_SCROLL_X = 1u << 5,
+    PCSX2GS_COLUMN_DEFAULT_SORT = 1u << 0, PCSX2GS_COLUMN_NO_SORT = 1u << 1, PCSX2GS_COLUMN_DESCENDING_FIRST = 1u << 2,
+    PCSX2GS_SELECT_SPAN_COLUMNS = 1u << 0, PCSX2GS_SELECT_ALLOW_OVERLAP = 1u << 1, PCSX2GS_SELECT_DOUBLE_CLICK = 1u << 2,
+};
 
 typedef void (*Pcsx2GsMenuFn)(const Pcsx2GsUi *ui, void *user);
 
@@ -97,6 +131,9 @@ typedef struct Pcsx2GsMenuInput
     float wheel;            // notches since the last input (positive = up)
     uint32_t keys;          // PCSX2GS_KEY_* bits held
     uint32_t pad;           // PCSX2GS_PAD_* bits held (any controller)
+    // API version 5: the characters typed since the last input (UTF-32), for the menu's text fields only
+    uint32_t char_count;
+    uint32_t chars[16];
 } Pcsx2GsMenuInput;
 
 enum
@@ -104,6 +141,9 @@ enum
     PCSX2GS_KEY_UP = 1u << 0, PCSX2GS_KEY_DOWN = 1u << 1, PCSX2GS_KEY_LEFT = 1u << 2, PCSX2GS_KEY_RIGHT = 1u << 3,
     PCSX2GS_KEY_ENTER = 1u << 4, PCSX2GS_KEY_SPACE = 1u << 5, PCSX2GS_KEY_ESCAPE = 1u << 6, PCSX2GS_KEY_TAB = 1u << 7,
     PCSX2GS_KEY_SHIFT = 1u << 8, PCSX2GS_KEY_CTRL = 1u << 9,
+    PCSX2GS_KEY_BACKSPACE = 1u << 10, PCSX2GS_KEY_DELETE = 1u << 11, PCSX2GS_KEY_HOME = 1u << 12, PCSX2GS_KEY_END = 1u << 13,
+    PCSX2GS_KEY_PAGE_UP = 1u << 14, PCSX2GS_KEY_PAGE_DOWN = 1u << 15, PCSX2GS_KEY_A = 1u << 16, PCSX2GS_KEY_C = 1u << 17,
+    PCSX2GS_KEY_V = 1u << 18, PCSX2GS_KEY_X = 1u << 19, PCSX2GS_KEY_Z = 1u << 20, PCSX2GS_KEY_Y = 1u << 21,
     PCSX2GS_PAD_UP = 1u << 0, PCSX2GS_PAD_DOWN = 1u << 1, PCSX2GS_PAD_LEFT = 1u << 2, PCSX2GS_PAD_RIGHT = 1u << 3,
     PCSX2GS_PAD_ACCEPT = 1u << 4, PCSX2GS_PAD_BACK = 1u << 5, PCSX2GS_PAD_L1 = 1u << 6, PCSX2GS_PAD_R1 = 1u << 7,
 };

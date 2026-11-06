@@ -22,12 +22,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -64,6 +66,75 @@ namespace urban::players
         constexpr const char *kTeamNames[kTeams] = {"라이온즈", "호크스",   "파이터즈", "마린즈",   "버팔로즈", "골든이글스",
                                                     "드래곤즈", "스왈로즈", "자이언츠", "타이거즈", "카프",     "요코하마"};
 
+        // The abilities the editor sets by value: 6-byte entries [kind][aptitude 得意度 0-4][value][limit 上限][u16 exp] in
+        // the ability block (own-record offsets; a CPU record's block is elsewhere, at block + offset - 0x6C). The game's
+        // values are 0-99 (S+ cheats write up to 255; the match copy clamps to 99). 球速 0-99 = 111-162 km/h.
+        enum StatGroup
+        {
+            kPitching = 0,
+            kBatting = 1,
+            kFielding = 2,
+            kPitches = 3
+        };
+        struct Stat
+        {
+            const char *key, *label, *jp;
+            uint32_t offset;
+            int group;
+        };
+        constexpr Stat kStats[] = {
+            {"stamina", "체력", "体力", 0x6Eu, kPitching},       {"speedP", "구속", "球速", 0xDEu, kPitching},
+            {"stuff", "구위", "球威", 0xE4u, kPitching},         {"control", "제구", "制球力", 0xEAu, kPitching},
+            {"mentalP", "정신력(투)", "精神力", 0xF0u, kPitching}, {"contactL", "교타 좌", "左巧打力", 0xF8u, kBatting},
+            {"contactR", "교타 우", "右巧打力", 0xFEu, kBatting},  {"power", "장타", "長打力", 0x104u, kBatting},
+            {"speed", "주력", "走力", 0x10Au, kBatting},          {"arm", "어깨", "肩力", 0x110u, kBatting},
+            {"bunt", "번트", "バント", 0x116u, kBatting},         {"running", "주루", "走塁", 0x11Cu, kBatting},
+            {"lead", "리드", "リード", 0x122u, kBatting},         {"eye", "선구안", "選球眼", 0x128u, kBatting},
+            {"mentalB", "정신력(타)", "精神力", 0x12Eu, kBatting}, {"catching", "포구", "捕球", 0x134u, kBatting},
+            {"throwing", "송구", "送球", 0x13Au, kBatting},       {"posP", "투수", "投手", 0x74u, kFielding},
+            {"posC", "포수", "捕手", 0x7Au, kFielding},           {"pos1B", "1루수", "一塁手", 0x80u, kFielding},
+            {"pos2B", "2루수", "二塁手", 0x86u, kFielding},       {"pos3B", "3루수", "三塁手", 0x8Cu, kFielding},
+            {"posSS", "유격수", "遊撃手", 0x92u, kFielding},      {"posOF", "외야수", "外野手", 0x98u, kFielding},
+            {"pitch1", "변화구 1", "変化球", 0xA2u, kPitches},    {"pitch2", "변화구 2", "変化球", 0xA8u, kPitches},
+            {"pitch3", "변화구 3", "変化球", 0xAEu, kPitches},    {"pitch4", "변화구 4", "変化球", 0xB4u, kPitches},
+            {"pitch5", "변화구 5", "変化球", 0xBAu, kPitches},    {"pitch6", "변화구 6", "変化球", 0xC0u, kPitches},
+            {"pitch7", "변화구 7", "変化球", 0xC6u, kPitches},    {"pitch8", "변화구 8", "変化球", 0xCCu, kPitches},
+            {"pitch9", "변화구 9", "変化球", 0xD2u, kPitches},    {"pitch10", "변화구 10", "変化球", 0xD8u, kPitches},
+        };
+        constexpr int kStatCount = static_cast<int>(sizeof(kStats) / sizeof(kStats[0]));
+        enum StatIndex
+        {
+            sStamina = 0, sSpeedP, sStuff, sControl, sMentalP, sContactL, sContactR, sPower, sSpeed, sArm, sBunt, sRunning,
+            sLead, sEye, sMentalB, sCatching, sThrowing, sPosP, sPosC, sPos1B, sPos2B, sPos3B, sPosSS, sPosOF, sPitch1
+        };
+        // Ranks by the owner's notes: 90 S+, 80 S, 70 A+, 60 A, 55 B+, 50 B, 45 C+, 40 C, 35 D+, below D. A rank picked in
+        // the editor gives its highest value. 得意度 (growth aptitude) 4 S, 3 A, 2 B, 1 C, 0 D.
+        constexpr int kGradeCount = 10;
+        constexpr const char *kGrades[kGradeCount] = {"S+", "S", "A+", "A", "B+", "B", "C+", "C", "D+", "D"};
+        constexpr int kGradeLow[kGradeCount] = {90, 80, 70, 60, 55, 50, 45, 40, 35, 0};
+        constexpr int kGradeTop[kGradeCount] = {99, 89, 79, 69, 59, 54, 49, 44, 39, 34};
+        constexpr const char *kAptitudes[5] = {"D", "C", "B", "A", "S"};
+        int gradeOf(int value)
+        {
+            for (int g = 0; g < kGradeCount - 1; ++g)
+                if (value >= kGradeLow[g])
+                    return g;
+            return kGradeCount - 1;
+        }
+        // An ability as an edit sets it: -1 leaves a field as it is; limit -2 raises the limit to the value when lower.
+        struct StatEdit
+        {
+            int value = -1, limit = -1, apt = -1;
+            bool operator==(const StatEdit &) const = default;
+        };
+        // A player's own edits: the locked abilities (written at every frame, over everything else).
+        struct PlayerEdit
+        {
+            bool on = true;
+            std::string name;
+            std::map<int, StatEdit> stats; // by kStats index
+        };
+
         struct Run
         {
             uint32_t offset = 0u;
@@ -99,6 +170,8 @@ namespace urban::players
             uint32_t mask = 0u;       // the default items (bit i = g_items[i])
             std::vector<uint16_t> skills; // the default skills, in slot order (at most 8)
             std::map<uint16_t, Pin> pins; // the picked players, by player ID, on any team
+            std::map<uint16_t, PlayerEdit> edits; // players' locked abilities, by player ID (on top of items and pins)
+            std::map<int, StatEdit> groupStats;   // locked abilities for the default target's players (kStats index)
         };
         struct Row
         {
@@ -108,6 +181,9 @@ namespace urban::players
             bool pitcher = false;
             std::string name;
             std::array<uint16_t, kSkillSlots> skills{}; // the slots as the record has them now
+            std::array<uint8_t, kBlockSize> block{};    // the ability block as it is now
+            int position = 0;                           // the best position: 0 P, 1 C, 2 1B, 3 2B, 4 3B, 5 SS, 6 OF
+            int value(int stat, int field = 2) const { return block[kStats[stat].offset - kBlock + static_cast<uint32_t>(field)]; }
         };
         using Slots = std::array<uint16_t, kSkillSlots>;
         // A player whose skills the cheat changed in this run: what the slots held before and what it wrote last.
@@ -132,6 +208,22 @@ namespace urban::players
             std::map<size_t, std::vector<std::pair<uint32_t, uint8_t>>> items;
         };
         std::map<uint16_t, StatBackup> g_statBackups; // EE thread only, by player ID
+        // A player whose abilities a lock wrote in this run: per ability the aptitude, value and limit before the first write.
+        struct LockBackup
+        {
+            uint32_t record = 0u, block = 0u;
+            std::map<int, std::array<uint8_t, 3>> before;
+        };
+        std::map<uint16_t, LockBackup> g_lockBackups; // EE thread only, by player ID
+        // One-time edits from the menu (under g_mutex), written by the frame hook where it finds the player.
+        struct OneShot
+        {
+            uint16_t id = 0u;
+            int stat = 0;
+            StatEdit edit;
+            int age = 0;
+        };
+        std::vector<OneShot> g_oneShots;
         std::filesystem::file_time_type g_settingsTime{}; // player_cheats.ini as last read or written (under g_mutex)
 
         std::string trim(std::string text)
@@ -299,9 +391,33 @@ namespace urban::players
             return text;
         }
 
+        int statIndex(const std::string &key)
+        {
+            for (int i = 0; i < kStatCount; ++i)
+                if (key == kStats[i].key)
+                    return i;
+            return -1;
+        }
+
+        // "<value>,<limit>,<aptitude>" (-1 = as it is, limit -2 = raised to the value when lower).
+        StatEdit editOf(std::istringstream &fields)
+        {
+            StatEdit edit;
+            std::string field;
+            if (std::getline(fields, field, ','))
+                edit.value = std::clamp(std::atoi(trim(field).c_str()), -1, 255);
+            if (std::getline(fields, field, ','))
+                edit.limit = std::clamp(std::atoi(trim(field).c_str()), -2, 255);
+            if (std::getline(fields, field, ','))
+                edit.apt = std::clamp(std::atoi(trim(field).c_str()), -1, 4);
+            return edit;
+        }
+
         // player_cheats.ini: enabled=, all=, scope=own|teams|all, teams=own+<team>..., items=key+key, skills=<hex>+<hex>,
-        // pin=<player id>,<on>,<key+key>,<name>, pinskills=<player id>,<hex+hex>. Files without scope= (before
-        // 2026-11-05) keep their meaning: the own team.
+        // pin=<player id>,<on>,<key+key>,<name>, pinskills=<player id>,<hex+hex>; since 2026-11-06 the value edits:
+        // glock=<ability>,<value>,<limit>,<aptitude> (the default target), edit=<player id>,<on>,<name> and
+        // lock=<player id>,<ability>,<value>,<limit>,<aptitude>. Files without scope= (before 2026-11-05) keep their
+        // meaning: the own team.
         Settings loadSettings(const std::filesystem::path &path)
         {
             Settings settings;
@@ -345,6 +461,40 @@ namespace urban::players
                     settings.mask = maskOf(value);
                 else if (key == "skills")
                     settings.skills = skillsOf(value);
+                else if (key == "glock")
+                {
+                    std::istringstream fields(value);
+                    std::string stat;
+                    std::getline(fields, stat, ',');
+                    const int index = statIndex(trim(stat));
+                    if (index >= 0)
+                        settings.groupStats[index] = editOf(fields);
+                }
+                else if (key == "edit" || key == "lock")
+                {
+                    std::istringstream fields(value);
+                    std::string id;
+                    if (!std::getline(fields, id, ','))
+                        continue;
+                    const unsigned long number = std::strtoul(trim(id).c_str(), nullptr, 10);
+                    if (number == 0u || number > 0xFFFFu)
+                        continue;
+                    PlayerEdit &edit = settings.edits[static_cast<uint16_t>(number)];
+                    if (key == "edit")
+                    {
+                        std::string on, name;
+                        std::getline(fields, on, ',');
+                        std::getline(fields, name);
+                        edit.on = trim(on) != "0";
+                        edit.name = trim(name);
+                        continue;
+                    }
+                    std::string stat;
+                    std::getline(fields, stat, ',');
+                    const int index = statIndex(trim(stat));
+                    if (index >= 0)
+                        edit.stats[index] = editOf(fields);
+                }
                 else if (key == "pin" || key == "pinskills" || key == "pinslots")
                 {
                     std::istringstream fields(value);
@@ -414,6 +564,14 @@ namespace urban::players
                         file << "," << s;
                     file << "\n";
                 }
+            }
+            for (const auto &[stat, edit] : settings.groupStats)
+                file << "glock=" << kStats[stat].key << "," << edit.value << "," << edit.limit << "," << edit.apt << "\n";
+            for (const auto &[id, edit] : settings.edits)
+            {
+                file << "edit=" << id << "," << (edit.on ? 1 : 0) << "," << edit.name << "\n";
+                for (const auto &[stat, value] : edit.stats)
+                    file << "lock=" << id << "," << kStats[stat].key << "," << value.value << "," << value.limit << "," << value.apt << "\n";
             }
         }
 
@@ -595,6 +753,99 @@ namespace urban::players
             backup->second.written = want;
         }
 
+        // The byte at `address` before any item of this run wrote it (else as it is now).
+        uint8_t originalByte(uint16_t id, uint32_t address)
+        {
+            const auto backup = g_statBackups.find(id);
+            if (backup != g_statBackups.end())
+                for (const auto &[item, kept] : backup->second.items)
+                    for (const auto &[at, value] : kept)
+                        if (at == address)
+                            return value;
+            return g_rdram[address];
+        }
+
+        // A lock taken off under an item still on: the item gives back what was there before the lock when it goes off.
+        void handBack(uint16_t id, uint32_t address, uint8_t value)
+        {
+            const auto backup = g_statBackups.find(id);
+            if (backup != g_statBackups.end())
+                for (auto &[item, kept] : backup->second.items)
+                    for (auto &[at, old] : kept)
+                        if (at == address)
+                            old = value;
+        }
+
+        void writeStat(uint32_t entry, const StatEdit &edit)
+        {
+            if (edit.apt >= 0)
+                g_rdram[entry + 1u] = static_cast<uint8_t>(edit.apt);
+            if (edit.value >= 0)
+                g_rdram[entry + 2u] = static_cast<uint8_t>(std::min(edit.value, 255));
+            if (edit.limit >= 0)
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, 255));
+            else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < edit.value)
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, 255));
+        }
+
+        // The locked abilities: the player's own (`own`), else the default target's (`group`); after the items, so they
+        // win. One no longer locked gets its bytes from before the first write back when Settings::restore is on.
+        void applyLocks(uint32_t record, uint32_t block, uint16_t id, const std::map<int, StatEdit> *group,
+                        const std::map<int, StatEdit> *own)
+        {
+            auto backup = g_lockBackups.find(id);
+            if (backup != g_lockBackups.end() && (backup->second.record != record || backup->second.block != block))
+            {
+                g_lockBackups.erase(backup); // another place now (a trade, another save): the old bytes belong there
+                backup = g_lockBackups.end();
+            }
+            const auto held = [&](int stat) { return (own && own->count(stat) != 0u) || (group && group->count(stat) != 0u); };
+            if (backup != g_lockBackups.end())
+            {
+                for (auto it = backup->second.before.begin(); it != backup->second.before.end();)
+                {
+                    if (held(it->first))
+                    {
+                        ++it;
+                        continue;
+                    }
+                    if (g_settings.restore)
+                    {
+                        const uint32_t entry = block + kStats[it->first].offset - kBlock;
+                        for (uint32_t b = 0; b < 3u; ++b)
+                        {
+                            g_rdram[entry + 1u + b] = it->second[b];
+                            handBack(id, entry + 1u + b, it->second[b]);
+                        }
+                    }
+                    it = backup->second.before.erase(it);
+                }
+                if (backup->second.before.empty() && !(own && !own->empty()) && !(group && !group->empty()))
+                {
+                    g_lockBackups.erase(backup);
+                    return;
+                }
+            }
+            if ((!own || own->empty()) && (!group || group->empty()))
+                return;
+            if (backup == g_lockBackups.end())
+                backup = g_lockBackups.emplace(id, LockBackup{record, block, {}}).first;
+            const auto write = [&](int stat, const StatEdit &edit)
+            {
+                const uint32_t entry = block + kStats[stat].offset - kBlock;
+                if (backup->second.before.find(stat) == backup->second.before.end())
+                    backup->second.before[stat] = {originalByte(id, entry + 1u), originalByte(id, entry + 2u), originalByte(id, entry + 3u)};
+                writeStat(entry, edit);
+            };
+            if (group)
+                for (const auto &[stat, edit] : *group)
+                    if (!own || own->count(stat) == 0u)
+                        write(stat, edit);
+            if (own)
+                for (const auto &[stat, edit] : *own)
+                    write(stat, edit);
+        }
+
         // EE thread, at every vblank after the .pnach patches: find the 12 rosters (the own team by its class) and write
         // the chosen items and skills into the targeted players.
         void frame()
@@ -639,8 +890,9 @@ namespace urban::players
                 for (std::vector<Row> &rows : g_rows)
                     rows.clear();
             const bool apply = team >= 0 && g_settings.enabled;
-            if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty())
+            if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty() && g_lockBackups.empty() && g_oneShots.empty())
                 return;
+            std::map<uint16_t, uint32_t> blocks; // where the one-time edits go (only while there are some)
             for (int t = 0; t < kTeams; ++t)
             {
                 if (rosters[t] == 0u)
@@ -668,8 +920,19 @@ namespace urban::players
                         row.pitcher = g_rdram[record + kPitcher] != 0u;
                         row.name = nameOf(record);
                         row.skills = readSkills(record);
+                        std::memcpy(row.block.data(), g_rdram + block, kBlockSize);
+                        if (!row.pitcher)
+                        {
+                            int best = sPosC;
+                            for (int stat = sPosC; stat <= sPosOF; ++stat)
+                                if (row.value(stat) > row.value(best))
+                                    best = stat;
+                            row.position = best - sPosP;
+                        }
                         g_rows[static_cast<size_t>(t)].push_back(std::move(row));
                     }
+                    if (!g_oneShots.empty())
+                        blocks[id] = block;
                     uint32_t mask = 0u;
                     const std::vector<uint16_t> *skills = nullptr;
                     const std::array<int, kSkillSlots> *slots = nullptr;
@@ -695,14 +958,46 @@ namespace urban::players
                         applyItems(record, block, own, id, mask);
                     if (skills || slots || !g_skillBackups.empty())
                         applySkills(record, id, skills, slots);
+                    // Value edits over the items: the player's own locks, else the default target's (not for a picked
+                    // player switched off).
+                    const std::map<int, StatEdit> *groupLocks = nullptr, *ownLocks = nullptr;
+                    if (apply)
+                    {
+                        const auto pin = g_settings.pins.find(id);
+                        if (scoped && !g_settings.groupStats.empty() && (pin == g_settings.pins.end() || pin->second.on))
+                            groupLocks = &g_settings.groupStats;
+                        const auto edit = g_settings.edits.find(id);
+                        if (edit != g_settings.edits.end() && edit->second.on && !edit->second.stats.empty())
+                            ownLocks = &edit->second.stats;
+                    }
+                    if (groupLocks || ownLocks || !g_lockBackups.empty())
+                        applyLocks(record, block, id, groupLocks, ownLocks);
                 }
+            }
+            // One-time edits (the editor's 적용): written once where the player is now; dropped after ~10 s unfound.
+            for (auto it = g_oneShots.begin(); it != g_oneShots.end();)
+            {
+                const auto at = blocks.find(it->id);
+                if (at == blocks.end())
+                {
+                    if (++it->age > 600)
+                    {
+                        std::fprintf(stderr, "[players] edit for %u dropped: not on a roster\n", it->id);
+                        it = g_oneShots.erase(it);
+                    }
+                    else
+                        ++it;
+                    continue;
+                }
+                const uint32_t entry = at->second + kStats[it->stat].offset - kBlock;
+                writeStat(entry, it->edit);
+                std::fprintf(stderr, "[players] edit %u %s: %d / %d / %d\n", it->id, kStats[it->stat].key, g_rdram[entry + 2u],
+                             g_rdram[entry + 3u], g_rdram[entry + 1u]);
+                it = g_oneShots.erase(it);
             }
         }
 
 #if defined(URBAN_PLAYER_MENU)
-        uint16_t g_selected = 0u; // what the items show: 0 = the default items, else a picked player (GS thread)
-        int g_browse = -1;        // the team the player list shows (-1: the own team)
-        int g_range = 0;          // the player list: 0 everyone, 1 pitchers, 2 fielders
 
         // The chosen skills (at most 8, in slot order), then every skill by group, two to a row.
         void drawSkills(const Pcsx2GsUi *ui, std::vector<uint16_t> &skills, bool &changed)
@@ -905,74 +1200,955 @@ namespace urban::players
             return text.empty() ? std::string("고른 구단 없음") : text + " 전원";
         }
 
-        // GS thread, while the menu is open. Works on a copy; a change is stored and saved at the end. The layout follows
-        // PROSPI 26 Studio's 대상 고르기: the target (own team / chosen teams / every team / picked players only), the items,
-        // then the player list where a picked player gets items of their own.
-        void draw(const Pcsx2GsUi *ui)
+        // ---- The player editor (GS thread) ----
+        // Laid out like Football Manager's squad screen and the game's own lists: every club's players in a sortable,
+        // filtered table on the left (tick several for bulk edits), the focused player's card on the right with the
+        // abilities by value or rank, once (적용) or locked (고정), and the S+ items, skills and slots of their own.
+        struct Draft
         {
-            if (g_safeMode)
-            {
-                ui->text_wrapped("안전 모드로 시작해서 선수 치트가 꺼져 있습니다.");
-                return;
-            }
-            if (g_items.empty())
-            {
-                ui->text_wrapped(("항목 파일이 없습니다: " + utf8(g_itemsPath)).c_str());
-                return;
-            }
-            Settings settings;
-            int team;
-            std::array<std::vector<Row>, kTeams> rows;
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                settings = g_settings;
-                team = g_team;
-                rows = g_rows;
-            }
-            bool changed = false;
-            size_t players = 0;
-            for (const std::vector<Row> &list : rows)
-                players += list.size();
-            const auto rowOf = [&](uint16_t id) -> const Row * {
-                for (const std::vector<Row> &list : rows)
-                    for (const Row &row : list)
-                        if (row.id == id)
-                            return &row;
-                return nullptr;
-            };
+            int value = 0, limit = 0, apt = 0;
+            bool use = false; // bulk and group rows: part of the next action
+        };
+        uint16_t g_focus = 0u;              // the player on the card
+        std::set<uint16_t> g_picked;        // the ticked players
+        bool g_bulk = false;                // the card edits the ticked players
+        std::map<int, Draft> g_drafts;      // the card's typed values by kStats index
+        int g_draftFor = -1;                // whose: a player ID, 0 = the ticked players (reset when the card changes)
+        std::map<int, Draft> g_groupDrafts; // the group tab's rows
+        char g_search[64] = "";
+        int g_teamFilter = 0; // 0 every club, 1 the own club, 2 + t club t
+        int g_posFilter = 0;  // 0 all, 1 pitchers, 2 fielders, 3 + p: best position C ... OF
+        int g_onlyEdited = 0, g_onlyPicked = 0;
+        int g_lastClick = -1; // the row last clicked, in the shown order (shift-click ranges)
+        int g_fillGrade = 0;  // the quick fill's rank
+        constexpr const char *kPositions[7] = {"투", "포", "1루", "2루", "3루", "유", "외"};
+        // IM_COL32 order (R in the low byte): S+ gold, S orange, A+/A red, B+/B yellow, C+/C green, D+ blue, D grey.
+        constexpr uint32_t kGradeColors[kGradeCount] = {0xFF2CD7FFu, 0xFF28AAFFu, 0xFF5A5AFFu, 0xFF7882FFu, 0xFF50BEFFu,
+                                                        0xFF78DCF0u, 0xFF6EDCAAu, 0xFF78C878u, 0xFFE6AA6Eu, 0xFF968C8Cu};
+        constexpr uint32_t kLockedRow = 0x5A285A28u, kPinnedRow = 0x5A143C5Au, kChangedText = 0xFF66CCFFu;
 
-            int enabled = settings.enabled ? 1 : 0;
-            // イチネンモード (one-year mode) runs: its state object [0x62B45C] exists only then. Its new club borrows one
-            // team's place, which holds that team's own players until the expansion draft is over.
-            const bool ichinen = valid(read32(0x62B45Cu), 0x10u);
-            if (ui->checkbox("선수 치트 켜기", &enabled))
+        uint32_t gradeColor(int value) { return kGradeColors[gradeOf(value)]; }
+        int kmOf(int value) { return 111 + (std::min(value, 99) * 51 + 49) / 99; }
+        std::string valueText(int stat, int value)
+        {
+            char text[32];
+            if (stat == sSpeedP)
+                std::snprintf(text, sizeof(text), "%dkm %s", kmOf(value), kGrades[gradeOf(value)]);
+            else
+                std::snprintf(text, sizeof(text), "%s %d", kGrades[gradeOf(value)], value);
+            return text;
+        }
+        std::string aptText(int apt) { return apt >= 0 && apt <= 4 ? kAptitudes[apt] : std::to_string(apt); }
+        std::string editText(const StatEdit &edit)
+        {
+            std::string text = edit.value >= 0 ? valueText(-1, edit.value) : std::string("값 그대로");
+            if (edit.limit >= 0)
+                text += " 상한 " + std::to_string(edit.limit);
+            if (edit.apt >= 0)
+                text += std::string(" 득의 ") + kAptitudes[edit.apt];
+            return text;
+        }
+
+        const Row *findRow(const std::array<std::vector<Row>, kTeams> &rows, uint16_t id)
+        {
+            for (const std::vector<Row> &list : rows)
+                for (const Row &row : list)
+                    if (row.id == id)
+                        return &row;
+            return nullptr;
+        }
+
+        // The S+ items a player gets now (the frame hook's choice).
+        uint32_t itemsFor(const Settings &settings, const Row &row, int own)
+        {
+            if (!settings.enabled)
+                return 0u;
+            const auto pin = settings.pins.find(row.id);
+            if (pin != settings.pins.end())
+                return pin->second.on ? pin->second.mask : 0u;
+            return inScope(settings, row.team, own) ? settings.mask : 0u;
+        }
+
+        // The items that write ability `stat`'s aptitude, value or limit (they win over a one-time edit, not over a lock).
+        uint32_t coverMask(int stat)
+        {
+            static std::array<uint32_t, kStatCount> masks{};
+            static bool done = false;
+            if (!done)
             {
-                settings.enabled = enabled != 0;
+                for (int s = 0; s < kStatCount; ++s)
+                    for (size_t i = 0; i < g_items.size() && i < 32u; ++i)
+                        for (const Run &run : g_items[i].runs)
+                            if (run.offset < kStats[s].offset + 4u && run.offset + run.bytes.size() > kStats[s].offset + 1u)
+                                masks[static_cast<size_t>(s)] |= 1u << i;
+                done = true;
+            }
+            return masks[static_cast<size_t>(stat)];
+        }
+
+        // What a typed row stands for: the value always; the limit when typed (else raised to the value when lower); the
+        // aptitude when changed. Without a player (bulk, group): the aptitude as picked, -1 leaving each player's own.
+        StatEdit editFrom(const Draft &draft, const Row *row, int stat)
+        {
+            StatEdit edit;
+            edit.value = std::clamp(draft.value, 0, 255);
+            if (row)
+            {
+                edit.limit = draft.limit != row->value(stat, 3) ? std::clamp(draft.limit, 0, 255) : -2;
+                edit.apt = draft.apt != std::min(row->value(stat, 1), 4) ? std::clamp(draft.apt, 0, 4) : -1;
+            }
+            else
+            {
+                edit.limit = -2;
+                edit.apt = draft.apt >= 0 && draft.apt <= 4 ? draft.apt : -1;
+            }
+            return edit;
+        }
+
+        void queueEdit(uint16_t id, int stat, const StatEdit &edit)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_oneShots.push_back(OneShot{id, stat, edit, 0});
+        }
+
+        void setLock(Settings &settings, uint16_t id, const std::string &name, int stat, const StatEdit *edit)
+        {
+            if (edit)
+            {
+                PlayerEdit &player = settings.edits[id];
+                if (player.name.empty())
+                    player.name = name;
+                player.stats[stat] = *edit;
+                return;
+            }
+            const auto player = settings.edits.find(id);
+            if (player == settings.edits.end())
+                return;
+            player->second.stats.erase(stat);
+            if (player->second.stats.empty())
+                settings.edits.erase(player);
+        }
+
+        const StatEdit *lockOf(const Settings &settings, uint16_t id, int stat)
+        {
+            const auto player = settings.edits.find(id);
+            if (player == settings.edits.end())
+                return nullptr;
+            const auto lock = player->second.stats.find(stat);
+            return lock == player->second.stats.end() ? nullptr : &lock->second;
+        }
+
+        int lockCount(const Settings &settings, uint16_t id)
+        {
+            const auto player = settings.edits.find(id);
+            return player == settings.edits.end() ? 0 : static_cast<int>(player->second.stats.size());
+        }
+
+        bool shownStat(const Row *row, int stat)
+        {
+            return kStats[stat].group != kPitches || !row || row->value(stat, 0) != 0; // an empty pitch slot
+        }
+
+        void resetDrafts(int owner)
+        {
+            if (g_draftFor != owner)
+            {
+                g_drafts.clear();
+                g_draftFor = owner;
+            }
+        }
+
+        // The card's row for one player: the lock's values when locked, else the player's own.
+        Draft &cardDraft(int stat, const Row &row, const StatEdit *lock)
+        {
+            auto it = g_drafts.find(stat);
+            if (it == g_drafts.end())
+            {
+                Draft draft;
+                draft.value = lock && lock->value >= 0 ? lock->value : row.value(stat);
+                draft.limit = lock && lock->limit >= 0 ? lock->limit : row.value(stat, 3);
+                draft.apt = lock && lock->apt >= 0 ? lock->apt : std::min(row.value(stat, 1), 4);
+                it = g_drafts.emplace(stat, draft).first;
+            }
+            return it->second;
+        }
+
+        bool draftChanged(const Draft &draft, const Row &row, int stat)
+        {
+            return draft.value != row.value(stat) || draft.limit != row.value(stat, 3) || draft.apt != std::min(row.value(stat, 1), 4);
+        }
+
+        const char *groupTitle(int group)
+        {
+            return group == kPitching ? "투수 능력" : group == kBatting ? "타격 · 주루 · 수비" : group == kFielding ? "수비 위치 (적성)" : "변화구";
+        }
+
+        // One player's abilities of one group: name, now, the new value (typed or by rank), limit, aptitude, 고정, 적용.
+        void drawStatTable(const Pcsx2GsUi *ui, Settings &settings, const Row &row, int group, uint32_t items, bool groupLocked,
+                           bool &changed)
+        {
+            ui->push_id(500 + group);
+            if (!ui->begin_table("stats", 8, PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
+            {
+                ui->pop_id();
+                return;
+            }
+            ui->table_column("능력", 0, 86.0f);
+            ui->table_column("지금 (상한·득의도)", 0, 150.0f);
+            ui->table_column("새 값", 0, 60.0f);
+            ui->table_column("등급", 0, 62.0f);
+            ui->table_column("상한", 0, 56.0f);
+            ui->table_column("득의도", 0, 54.0f);
+            ui->table_column("고정", 0, 40.0f);
+            ui->table_column("", 0, 0.0f);
+            ui->table_headers();
+            for (int stat = 0; stat < kStatCount; ++stat)
+            {
+                if (kStats[stat].group != group || !shownStat(&row, stat))
+                    continue;
+                const StatEdit *lock = lockOf(settings, row.id, stat);
+                Draft &draft = cardDraft(stat, row, lock);
+                ui->push_id(stat);
+                ui->table_next_row();
+                if (lock)
+                    ui->table_row_color(kLockedRow);
+                ui->table_next_column();
+                if (draftChanged(draft, row, stat))
+                    ui->text_colored(kChangedText, kStats[stat].label);
+                else
+                    ui->text(kStats[stat].label);
+                if (group == kPitches)
+                {
+                    char kind[48];
+                    std::snprintf(kind, sizeof(kind), "%s · 구종 번호 0x%02X", kStats[stat].jp, row.value(stat, 0));
+                    ui->tooltip(kind);
+                }
+                else
+                    ui->tooltip(kStats[stat].jp);
+                ui->table_next_column();
+                const int now = row.value(stat);
+                ui->text_colored(gradeColor(now), valueText(stat, now).c_str());
+                ui->same_line();
+                ui->text_disabled(("/" + std::to_string(row.value(stat, 3)) + " · " + aptText(row.value(stat, 1))).c_str());
+                bool typed = false;
+                ui->table_next_column();
+                ui->set_next_width(56.0f);
+                if (ui->input_int("##value", &draft.value, 0))
+                {
+                    draft.value = std::clamp(draft.value, 0, 255);
+                    typed = true;
+                }
+                ui->tooltip("0~99 (99가 게임 최대, S+ 치트는 198·255까지 씀)");
+                ui->table_next_column();
+                int rank = gradeOf(draft.value);
+                ui->set_next_width(58.0f);
+                if (ui->combo("##rank", &rank, kGrades, kGradeCount))
+                {
+                    draft.value = kGradeTop[rank];
+                    typed = true;
+                }
+                ui->tooltip("등급을 고르면 그 등급의 가장 높은 값 (S+ 99, S 89, A+ 79, A 69, B+ 59, B 54, C+ 49, C 44, D+ 39, D 34)");
+                ui->table_next_column();
+                ui->set_next_width(52.0f);
+                if (ui->input_int("##limit", &draft.limit, 0))
+                {
+                    draft.limit = std::clamp(draft.limit, 0, 255);
+                    typed = true;
+                }
+                ui->tooltip("상한(上限): 성장으로 오를 수 있는 최대. 새 값이 더 크면 상한도 그만큼 올립니다.");
+                ui->table_next_column();
+                ui->set_next_width(50.0f);
+                if (ui->combo("##apt", &draft.apt, kAptitudes, 5))
+                    typed = true;
+                ui->tooltip("득의도(得意度): 연습으로 오르는 빠르기 S > A > B > C > D");
+                ui->table_next_column();
+                int locked = lock ? 1 : 0;
+                if (ui->checkbox("##lock", &locked))
+                {
+                    const StatEdit edit = editFrom(draft, &row, stat);
+                    setLock(settings, row.id, row.name, stat, locked ? &edit : nullptr);
+                    changed = true;
+                }
+                else if (typed && lock)
+                {
+                    const StatEdit edit = editFrom(draft, &row, stat);
+                    if (!(edit == *lock))
+                    {
+                        setLock(settings, row.id, row.name, stat, &edit);
+                        changed = true;
+                    }
+                }
+                ui->tooltip("고정: 이 값을 매 프레임 다시 씁니다 (성장·노화·S+ 항목보다 우선). 끄면 원래 값으로 (위 설정이 켜져 있을 때).");
+                ui->table_next_column();
+                if (ui->small_button("적용"))
+                    queueEdit(row.id, stat, editFrom(draft, &row, stat));
+                ui->tooltip("한 번만 씁니다. 그 뒤로는 게임(성장·노화)이 바꿀 수 있습니다.");
+                if (!lock && (items & coverMask(stat)) != 0u)
+                {
+                    ui->same_line();
+                    ui->text_disabled("S+ 항목이 씀");
+                    ui->tooltip("S+ 항목이 매 프레임 이 칸을 써서 '적용'은 바로 덮입니다. 이 값을 쓰려면 '고정'을 켜세요.");
+                }
+                else if (!lock && groupLocked && settings.groupStats.count(stat) != 0u)
+                {
+                    ui->same_line();
+                    ui->text_disabled("단체 고정");
+                    ui->tooltip(("단체 적용 탭의 고정 값 " + editText(settings.groupStats.at(stat)) + "이 쓰입니다. 여기서 고정하면 이 선수만 이 값으로.").c_str());
+                }
+                ui->pop_id();
+            }
+            ui->end_table();
+            ui->pop_id();
+        }
+
+        // The S+ items and skills of one player of their own (a pin) instead of the default ones.
+        void drawPinTab(const Pcsx2GsUi *ui, Settings &settings, const Row &row, int own, bool slotsOnly, bool &changed)
+        {
+            const auto pin = settings.pins.find(row.id);
+            if (pin == settings.pins.end())
+            {
+                const bool scoped = inScope(settings, row.team, own);
+                ui->text_wrapped(scoped ? ("단체 설정을 받는 중: S+ 항목 " + std::to_string(std::popcount(settings.mask)) + "개 · 스킬 " +
+                                           std::to_string(settings.skills.size()) + "개 ('단체 적용' 탭에서 바꿈).")
+                                              .c_str()
+                                        : "단체 설정 대상이 아닙니다: 이 선수에게 S+ 항목·스킬을 쓰지 않습니다.");
+                if (ui->button("이 선수만 따로 정하기"))
+                {
+                    Pin added;
+                    added.mask = settings.mask;
+                    added.skills = settings.skills;
+                    added.name = row.name;
+                    settings.pins[row.id] = std::move(added);
+                    changed = true;
+                }
+                ui->text_disabled("따로 정하면 단체 S+ 항목·스킬 대신 이 선수만의 항목·스킬·슬롯을 씁니다 (지금 단체 항목을 복사해서 시작).");
+                ui->text_disabled("능력치 수치·등급 고정은 이것과 상관없이 늘 맨 위에 씁니다.");
+                return;
+            }
+            int on = pin->second.on ? 1 : 0;
+            if (ui->checkbox("이 선수에게 적용", &on))
+            {
+                pin->second.on = on != 0;
                 changed = true;
+            }
+            ui->tooltip("끄면 이 선수는 S+ 항목·스킬도, 단체 능력치 고정도 받지 않습니다 (개별 고정은 그대로).");
+            ui->same_line();
+            if (ui->small_button("따로 정하기 해제 (단체 설정으로)"))
+            {
+                settings.pins.erase(pin);
+                changed = true;
+                return;
+            }
+            ui->begin_disabled(on ? 0 : 1);
+            if (slotsOnly)
+                drawSlotEditor(ui, pin->second, &row, changed);
+            else
+                drawItems(ui, pin->second.mask, pin->second.skills, changed);
+            ui->end_disabled();
+        }
+
+        void fillDrafts(const Row *row, int group, int value, const Settings &settings, uint16_t id)
+        {
+            for (int stat = 0; stat < kStatCount; ++stat)
+            {
+                if ((group >= 0 && kStats[stat].group != group) || (group < 0 && kStats[stat].group == kPitches) || !shownStat(row, stat))
+                    continue;
+                if (row)
+                    cardDraft(stat, *row, lockOf(settings, id, stat)).value = value;
+                else
+                {
+                    auto it = g_drafts.find(stat);
+                    if (it == g_drafts.end())
+                    {
+                        Draft draft;
+                        draft.apt = -1; // as each player has it
+                        it = g_drafts.emplace(stat, draft).first;
+                    }
+                    it->second.value = value;
+                    it->second.use = true;
+                }
+            }
+        }
+
+        void drawPlayerCard(const Pcsx2GsUi *ui, Settings &settings, const Row &row, int own, bool &changed)
+        {
+            resetDrafts(row.id);
+            char head[160];
+            std::snprintf(head, sizeof(head), "%d  %s", row.number, row.name.empty() ? "?" : row.name.c_str());
+            ui->heading(head);
+            const uint32_t items = itemsFor(settings, row, own);
+            const auto pin = settings.pins.find(row.id);
+            const bool excluded = pin != settings.pins.end() && !pin->second.on;
+            const bool groupLocked = settings.enabled && inScope(settings, row.team, own) && !excluded;
+            std::snprintf(head, sizeof(head), "%s · %s · %d세 · ID %u", kTeamNames[row.team], row.pitcher ? "투수" : kPositions[row.position],
+                          row.age, row.id);
+            ui->text_disabled(head);
+            const int locks = lockCount(settings, row.id);
+            std::string state = !settings.enabled ? "선수 치트 꺼짐: 켜야 고정·S+ 항목이 써집니다 ('적용'은 바로 씀)"
+                                : pin != settings.pins.end() ? (pin->second.on ? "S+ 항목·스킬: 이 선수만 따로 (" + std::to_string(std::popcount(items)) + "항목)"
+                                                                               : std::string("이 선수 적용 끔 (S+ 항목·단체 고정 안 받음)"))
+                                : items != 0u ? "S+ 항목·스킬: 단체 설정 (" + std::to_string(std::popcount(items)) + "항목)"
+                                              : std::string("S+ 항목: 대상 아님");
+            if (settings.enabled)
+                state += " · 개별 고정 " + std::to_string(locks) + "개" + (groupLocked && !settings.groupStats.empty() ? " · 단체 고정 " + std::to_string(settings.groupStats.size()) + "개" : "");
+            ui->text_colored(kChangedText, state.c_str());
+            const auto edit = settings.edits.find(row.id);
+            if (edit != settings.edits.end())
+            {
+                int on = edit->second.on ? 1 : 0;
+                if (ui->checkbox("이 선수의 개별 고정 쓰기", &on))
+                {
+                    edit->second.on = on != 0;
+                    changed = true;
+                }
+                ui->same_line();
+                if (ui->small_button("이 선수 고정 모두 해제"))
+                {
+                    settings.edits.erase(edit);
+                    g_drafts.clear();
+                    changed = true;
+                }
+            }
+            if (!ui->begin_tab_bar("card"))
+                return;
+            if (ui->begin_tab("능력치 (수치·등급)"))
+            {
+                ui->text("빠른 입력:");
+                ui->same_line();
+                ui->set_next_width(58.0f);
+                ui->combo("##fill", &g_fillGrade, kGrades, kGradeCount);
+                const int value = kGradeTop[g_fillGrade];
+                const struct
+                {
+                    const char *label;
+                    int group;
+                } fills[] = {{"투수 능력에", kPitching}, {"타자 능력에", kBatting}, {"수비 위치에", kFielding}, {"변화구에", kPitches}};
+                for (const auto &fill : fills)
+                {
+                    ui->same_line();
+                    if (ui->small_button(fill.label))
+                        fillDrafts(&row, fill.group, value, settings, row.id);
+                }
+                ui->same_line();
+                ui->text_disabled("(새 값 칸에 넣기만 함)");
+                int dirty = 0;
+                for (int stat = 0; stat < kStatCount; ++stat)
+                    if (const auto it = g_drafts.find(stat); it != g_drafts.end() && shownStat(&row, stat) && draftChanged(it->second, row, stat))
+                        ++dirty;
+                ui->begin_disabled(dirty == 0 ? 1 : 0);
+                if (ui->button(("바꾼 능력 " + std::to_string(dirty) + "개 고정").c_str()))
+                {
+                    for (const auto &[stat, draft] : g_drafts)
+                        if (shownStat(&row, stat) && draftChanged(draft, row, stat))
+                        {
+                            const StatEdit lock = editFrom(draft, &row, stat);
+                            setLock(settings, row.id, row.name, stat, &lock);
+                        }
+                    changed = true;
+                }
+                ui->same_line();
+                if (ui->button(("바꾼 능력 " + std::to_string(dirty) + "개 1회 적용").c_str()))
+                    for (const auto &[stat, draft] : g_drafts)
+                        if (shownStat(&row, stat) && draftChanged(draft, row, stat))
+                            queueEdit(row.id, stat, editFrom(draft, &row, stat));
+                ui->end_disabled();
+                ui->same_line();
+                if (ui->button("입력 되돌리기"))
+                    g_drafts.clear();
+                ui->tooltip("새 값·상한·득의도 칸을 지금 값(고정 중이면 고정 값)으로 되돌립니다.");
+                const int order[2][4] = {{kPitching, kPitches, kBatting, kFielding}, {kBatting, kFielding, kPitching, kPitches}};
+                for (int group : order[row.pitcher ? 0 : 1])
+                {
+                    ui->separator_text(groupTitle(group));
+                    if (group == kPitches && std::none_of(std::begin(kStats), std::end(kStats), [&](const Stat &stat) {
+                            return stat.group == kPitches && row.value(static_cast<int>(&stat - kStats), 0) != 0;
+                        }))
+                    {
+                        ui->text_disabled("변화구 없음");
+                        continue;
+                    }
+                    drawStatTable(ui, settings, row, group, items, groupLocked, changed);
+                }
+                ui->end_tab();
+            }
+            if (ui->begin_tab("S+ 항목 · 스킬"))
+            {
+                drawPinTab(ui, settings, row, own, false, changed);
+                ui->end_tab();
+            }
+            if (ui->begin_tab("스킬 슬롯"))
+            {
+                drawPinTab(ui, settings, row, own, true, changed);
+                ui->end_tab();
+            }
+            ui->end_tab_bar();
+        }
+
+        // The ticked players together: abilities (ticked rows only), locks for all of them, S+ items of their own.
+        void drawBulkCard(const Pcsx2GsUi *ui, Settings &settings, const std::vector<const Row *> &targets, bool &changed)
+        {
+            resetDrafts(0);
+            const int count = static_cast<int>(targets.size());
+            ui->heading(("고른 선수 " + std::to_string(count) + "명 일괄 편집").c_str());
+            std::string names;
+            for (int i = 0; i < count && i < 8; ++i)
+                names += (i ? ", " : "") + targets[static_cast<size_t>(i)]->name;
+            if (count > 8)
+                names += " 외 " + std::to_string(count - 8) + "명";
+            ui->text_wrapped(names.c_str());
+            if (count == 0)
+            {
+                ui->text_disabled("왼쪽 목록에서 선수를 체크하세요 (Ctrl+클릭, Shift+클릭으로 여러 명).");
+                return;
+            }
+            if (!ui->begin_tab_bar("bulk"))
+                return;
+            if (ui->begin_tab("능력치 (수치·등급)"))
+            {
+                ui->text("빠른 입력:");
+                ui->same_line();
+                ui->set_next_width(58.0f);
+                ui->combo("##fill", &g_fillGrade, kGrades, kGradeCount);
+                const struct
+                {
+                    const char *label;
+                    int group;
+                } fills[] = {{"투수 능력에", kPitching}, {"타자 능력에", kBatting}, {"수비 위치에", kFielding}};
+                for (const auto &fill : fills)
+                {
+                    ui->same_line();
+                    if (ui->small_button(fill.label))
+                        fillDrafts(nullptr, fill.group, kGradeTop[g_fillGrade], settings, 0u);
+                }
+                ui->same_line();
+                if (ui->small_button("체크 모두 해제"))
+                    for (auto &[stat, draft] : g_drafts)
+                        draft.use = false;
+                int used = 0;
+                for (const auto &[stat, draft] : g_drafts)
+                    used += draft.use ? 1 : 0;
+                ui->begin_disabled(used == 0 ? 1 : 0);
+                if (ui->button(("체크한 능력 " + std::to_string(used) + "개 고정 (" + std::to_string(count) + "명)").c_str()))
+                {
+                    for (const auto &[stat, draft] : g_drafts)
+                        if (draft.use)
+                            for (const Row *row : targets)
+                            {
+                                const StatEdit lock = editFrom(draft, nullptr, stat);
+                                setLock(settings, row->id, row->name, stat, &lock);
+                            }
+                    changed = true;
+                }
+                ui->same_line();
+                if (ui->button(("체크한 능력 1회 적용 (" + std::to_string(count) + "명)").c_str()))
+                    for (const auto &[stat, draft] : g_drafts)
+                        if (draft.use)
+                            for (const Row *row : targets)
+                                queueEdit(row->id, stat, editFrom(draft, nullptr, stat));
+                ui->same_line();
+                if (ui->button(("체크한 능력 고정 해제 (" + std::to_string(count) + "명)").c_str()))
+                {
+                    for (const auto &[stat, draft] : g_drafts)
+                        if (draft.use)
+                            for (const Row *row : targets)
+                                setLock(settings, row->id, row->name, stat, nullptr);
+                    changed = true;
+                }
+                ui->end_disabled();
+                ui->text_disabled("체크한 능력만 씁니다. 득의도 '그대로'는 선수마다 원래 값을 둡니다. 상한은 새 값보다 낮을 때만 올립니다.");
+                static const char *const aptitudes[6] = {"그대로", "D", "C", "B", "A", "S"};
+                for (int group : {kPitching, kBatting, kFielding})
+                {
+                    ui->separator_text(groupTitle(group));
+                    ui->push_id(600 + group);
+                    if (ui->begin_table("bulkstats", 7, PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
+                    {
+                        ui->table_column("쓰기", 0, 36.0f);
+                        ui->table_column("능력", 0, 86.0f);
+                        ui->table_column("지금 (최소~최대)", 0, 120.0f);
+                        ui->table_column("새 값", 0, 60.0f);
+                        ui->table_column("등급", 0, 62.0f);
+                        ui->table_column("득의도", 0, 70.0f);
+                        ui->table_column("고정 중", 0, 0.0f);
+                        ui->table_headers();
+                        for (int stat = 0; stat < kStatCount; ++stat)
+                        {
+                            if (kStats[stat].group != group)
+                                continue;
+                            int low = 255, high = 0, locked = 0;
+                            for (const Row *row : targets)
+                            {
+                                low = std::min(low, row->value(stat));
+                                high = std::max(high, row->value(stat));
+                                locked += lockOf(settings, row->id, stat) ? 1 : 0;
+                            }
+                            auto it = g_drafts.find(stat);
+                            if (it == g_drafts.end())
+                            {
+                                Draft draft;
+                                draft.value = high;
+                                draft.apt = -1;
+                                it = g_drafts.emplace(stat, draft).first;
+                            }
+                            Draft &draft = it->second;
+                            ui->push_id(stat);
+                            ui->table_next_row();
+                            if (locked == count)
+                                ui->table_row_color(kLockedRow);
+                            ui->table_next_column();
+                            int use = draft.use ? 1 : 0;
+                            if (ui->checkbox("##use", &use))
+                                draft.use = use != 0;
+                            ui->table_next_column();
+                            ui->text(kStats[stat].label);
+                            ui->tooltip(kStats[stat].jp);
+                            ui->table_next_column();
+                            ui->text_colored(gradeColor(low), valueText(stat, low).c_str());
+                            if (high != low)
+                            {
+                                ui->same_line();
+                                ui->text_colored(gradeColor(high), ("~ " + valueText(stat, high)).c_str());
+                            }
+                            ui->table_next_column();
+                            ui->set_next_width(56.0f);
+                            if (ui->input_int("##value", &draft.value, 0))
+                            {
+                                draft.value = std::clamp(draft.value, 0, 255);
+                                draft.use = true;
+                            }
+                            ui->table_next_column();
+                            int rank = gradeOf(draft.value);
+                            ui->set_next_width(58.0f);
+                            if (ui->combo("##rank", &rank, kGrades, kGradeCount))
+                            {
+                                draft.value = kGradeTop[rank];
+                                draft.use = true;
+                            }
+                            ui->table_next_column();
+                            int apt = draft.apt + 1;
+                            ui->set_next_width(66.0f);
+                            if (ui->combo("##apt", &apt, aptitudes, 6))
+                            {
+                                draft.apt = apt - 1;
+                                draft.use = true;
+                            }
+                            ui->table_next_column();
+                            if (locked > 0)
+                                ui->text_colored(kChangedText, (std::to_string(locked) + " / " + std::to_string(count) + "명").c_str());
+                            ui->pop_id();
+                        }
+                        ui->end_table();
+                    }
+                    ui->pop_id();
+                }
+                ui->end_tab();
+            }
+            if (ui->begin_tab("S+ 항목 (따로 정하기)"))
+            {
+                int pinned = 0;
+                for (const Row *row : targets)
+                    pinned += settings.pins.count(row->id) ? 1 : 0;
+                ui->text_wrapped(("따로 정한 선수 " + std::to_string(pinned) + " / " + std::to_string(count) + "명. 따로 정한 선수는 단체 S+ 항목·스킬 대신 자기 항목을 씁니다.").c_str());
+                if (ui->button("고른 선수 모두 따로 정하기 (지금 단체 항목 복사)"))
+                {
+                    for (const Row *row : targets)
+                        if (!settings.pins.count(row->id))
+                        {
+                            Pin added;
+                            added.mask = settings.mask;
+                            added.skills = settings.skills;
+                            added.name = row->name;
+                            settings.pins[row->id] = std::move(added);
+                        }
+                    changed = true;
+                }
+                ui->same_line();
+                if (ui->button("고른 선수 따로 정하기 해제"))
+                {
+                    for (const Row *row : targets)
+                        settings.pins.erase(row->id);
+                    changed = true;
+                }
+                if (pinned == count)
+                {
+                    // Shown: the first one's items; a click sets or clears that item for every ticked player.
+                    Pin &first = settings.pins[targets.front()->id];
+                    uint32_t mask = first.mask;
+                    std::vector<uint16_t> skills = first.skills;
+                    bool itemsChanged = false;
+                    ui->text_disabled("아래 체크는 첫 선수 기준으로 보이고, 바꾸면 고른 선수 모두에게 같은 항목을 켜고 끕니다. 스킬은 선수 카드에서 하나씩.");
+                    drawItems(ui, mask, skills, itemsChanged);
+                    if (itemsChanged)
+                    {
+                        const uint32_t on = mask & ~first.mask, off = first.mask & ~mask;
+                        for (const Row *row : targets)
+                        {
+                            Pin &pin = settings.pins[row->id];
+                            pin.mask = (pin.mask | on) & ~off;
+                        }
+                        changed = true;
+                    }
+                }
+                ui->end_tab();
+            }
+            ui->end_tab_bar();
+        }
+
+        enum Column
+        {
+            cPick = 0, cNumber, cName, cTeam, cPos, cAge, cStamina, cSpeedP, cStuff, cControl, cContact, cPower, cSpeed, cArm,
+            cEye, cField, cState, cColumns
+        };
+        int fieldValue(const Row &row) { return row.value(row.pitcher ? sPosP : sPosP + row.position); }
+        int sortKey(const Row &row, int column, const Settings &settings)
+        {
+            switch (column)
+            {
+            case cPick: return g_picked.count(row.id) ? 1 : 0;
+            case cNumber: return row.number;
+            case cTeam: return row.team;
+            case cPos: return row.pitcher ? 0 : row.position;
+            case cAge: return row.age;
+            case cStamina: return row.value(sStamina);
+            case cSpeedP: return row.value(sSpeedP);
+            case cStuff: return row.value(sStuff);
+            case cControl: return row.value(sControl);
+            case cContact: return row.value(sContactL) + row.value(sContactR);
+            case cPower: return row.value(sPower);
+            case cSpeed: return row.value(sSpeed);
+            case cArm: return row.value(sArm);
+            case cEye: return row.value(sEye);
+            case cField: return fieldValue(row);
+            case cState: return lockCount(settings, row.id) + (settings.pins.count(row.id) ? 100 : 0);
+            default: return 0;
+            }
+        }
+
+        bool matches(const Row &row, const std::string &query)
+        {
+            if (query.empty())
+                return true;
+            if (std::all_of(query.begin(), query.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                return std::atoi(query.c_str()) == row.number || std::atoi(query.c_str()) == row.id;
+            std::string name = row.name, wanted = query;
+            for (char &c : name)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char &c : wanted)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            std::string compact;
+            for (char c : name)
+                if (c != ' ')
+                    compact += c;
+            return name.find(wanted) != std::string::npos || compact.find(wanted) != std::string::npos;
+        }
+
+        void drawList(const Pcsx2GsUi *ui, Settings &settings, std::vector<const Row *> list, int own)
+        {
+            const uint32_t flags = PCSX2GS_TABLE_SORTABLE | PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_SCROLL_X | PCSX2GS_TABLE_ROW_BG |
+                                   PCSX2GS_TABLE_BORDERS | PCSX2GS_TABLE_RESIZABLE;
+            if (!ui->begin_table("roster", cColumns, flags, 0.0f, 0.0f))
+                return;
+            ui->table_freeze(3, 1);
+            ui->table_column("고름", 0, 30.0f);
+            ui->table_column("#", 0, 30.0f);
+            ui->table_column("이름", 0, 116.0f);
+            ui->table_column("구단", 0, 70.0f);
+            ui->table_column("위치", 0, 32.0f);
+            ui->table_column("나이", PCSX2GS_COLUMN_DESCENDING_FIRST, 32.0f);
+            const char *abilities[] = {"체력", "구속", "구위", "제구", "교타", "장타", "주력", "어깨", "선구", "수비"};
+            for (int i = 0; i < 10; ++i)
+                ui->table_column(abilities[i], PCSX2GS_COLUMN_DESCENDING_FIRST, i == 1 ? 66.0f : 48.0f);
+            ui->table_column("설정", PCSX2GS_COLUMN_DESCENDING_FIRST, 96.0f);
+            ui->table_headers();
+            int column = -1, down = 0;
+            ui->table_sort(&column, &down);
+            if (column == cName)
+                std::stable_sort(list.begin(), list.end(), [&](const Row *a, const Row *b) { return down ? a->name > b->name : a->name < b->name; });
+            else if (column >= 0)
+                std::stable_sort(list.begin(), list.end(), [&](const Row *a, const Row *b) {
+                    const int x = sortKey(*a, column, settings), y = sortKey(*b, column, settings);
+                    return down ? x > y : x < y;
+                });
+            ui->clipper_begin(static_cast<int>(list.size()));
+            int first = 0, end = 0;
+            while (ui->clipper_step(&first, &end))
+                for (int i = first; i < end; ++i)
+                {
+                    const Row &row = *list[static_cast<size_t>(i)];
+                    ui->table_next_row();
+                    const int locks = lockCount(settings, row.id);
+                    const bool pinned = settings.pins.count(row.id) != 0u;
+                    if (locks > 0)
+                        ui->table_row_color(kLockedRow);
+                    else if (pinned)
+                        ui->table_row_color(kPinnedRow);
+                    ui->push_id(row.id);
+                    ui->table_next_column();
+                    int ticked = g_picked.count(row.id) ? 1 : 0;
+                    if (ui->checkbox("##pick", &ticked))
+                    {
+                        if (ticked)
+                            g_picked.insert(row.id);
+                        else
+                            g_picked.erase(row.id);
+                        g_lastClick = i;
+                    }
+                    ui->table_next_column();
+                    char label[24];
+                    std::snprintf(label, sizeof(label), "%d##row", row.number);
+                    if (ui->selectable(label, !g_bulk && row.id == g_focus ? 1 : 0, PCSX2GS_SELECT_SPAN_COLUMNS))
+                    {
+                        const uint32_t mods = ui->key_mods();
+                        if ((mods & PCSX2GS_KEY_SHIFT) && g_lastClick >= 0 && g_lastClick < static_cast<int>(list.size()))
+                        {
+                            for (int k = std::min(g_lastClick, i); k <= std::max(g_lastClick, i); ++k)
+                                g_picked.insert(list[static_cast<size_t>(k)]->id);
+                        }
+                        else if (mods & PCSX2GS_KEY_CTRL)
+                        {
+                            if (!g_picked.erase(row.id))
+                                g_picked.insert(row.id);
+                        }
+                        else
+                        {
+                            g_focus = row.id;
+                            g_bulk = false;
+                        }
+                        g_lastClick = i;
+                    }
+                    ui->table_next_column();
+                    ui->text(row.name.empty() ? "?" : row.name.c_str());
+                    ui->table_next_column();
+                    ui->text(own == row.team ? (std::string(kTeamNames[row.team]) + "*").c_str() : kTeamNames[row.team]);
+                    ui->table_next_column();
+                    ui->text(row.pitcher ? "투" : kPositions[row.position]);
+                    ui->table_next_column();
+                    ui->text(std::to_string(row.age).c_str());
+                    const int cells[10] = {row.value(sStamina), row.value(sSpeedP), row.value(sStuff), row.value(sControl),
+                                           (row.value(sContactL) + row.value(sContactR)) / 2, row.value(sPower), row.value(sSpeed),
+                                           row.value(sArm), row.value(sEye), fieldValue(row)};
+                    for (int k = 0; k < 10; ++k)
+                    {
+                        ui->table_next_column();
+                        ui->text_colored(gradeColor(cells[k]), valueText(k == 1 ? sSpeedP : -1, cells[k]).c_str());
+                    }
+                    ui->table_next_column();
+                    std::string state;
+                    if (locks > 0)
+                        state = "고정 " + std::to_string(locks);
+                    if (pinned)
+                        state += std::string(state.empty() ? "" : " · ") + (settings.pins.at(row.id).on ? "따로" : "끔");
+                    else if (settings.enabled && inScope(settings, row.team, own))
+                        state += std::string(state.empty() ? "" : " · ") + "단체";
+                    ui->text_disabled(state.c_str());
+                    ui->pop_id();
+                }
+            ui->end_table();
+        }
+
+        void drawFinder(const Pcsx2GsUi *ui, Settings &settings, const std::array<std::vector<Row>, kTeams> &rows, int own, bool &changed)
+        {
+            ui->set_next_width(210.0f);
+            ui->input_text("##search", "이름 · 등번호 · ID", g_search, sizeof(g_search));
+            ui->tooltip("이름 일부(일본어 그대로), 등번호, 선수 ID. 비우면 모두.");
+            ui->same_line();
+            std::vector<std::string> teamLabels{"모든 구단", own >= 0 ? std::string("내 구단 (") + kTeamNames[own] + ")" : std::string("내 구단")};
+            for (int t = 0; t < kTeams; ++t)
+                teamLabels.push_back(std::string(kTeamNames[t]) + " " + std::to_string(rows[static_cast<size_t>(t)].size()) + "명");
+            std::vector<const char *> teamPointers;
+            for (const std::string &label : teamLabels)
+                teamPointers.push_back(label.c_str());
+            ui->set_next_width(150.0f);
+            ui->combo("##team", &g_teamFilter, teamPointers.data(), static_cast<int>(teamPointers.size()));
+            ui->same_line();
+            const char *positions[] = {"모든 위치", "투수", "야수", "포수", "1루수", "2루수", "3루수", "유격수", "외야수"};
+            ui->set_next_width(100.0f);
+            ui->combo("##pos", &g_posFilter, positions, 9);
+            ui->tooltip("야수의 위치는 수비 적성이 가장 높은 곳입니다.");
+            ui->same_line();
+            ui->checkbox("설정한 선수만", &g_onlyEdited);
+            ui->same_line();
+            ui->checkbox("고른 선수만", &g_onlyPicked);
+
+            const std::string query = trim(g_search);
+            std::vector<const Row *> shown;
+            for (int t = 0; t < kTeams; ++t)
+            {
+                if (g_teamFilter == 1 ? t != own : g_teamFilter >= 2 && t != g_teamFilter - 2)
+                    continue;
+                for (const Row &row : rows[static_cast<size_t>(t)])
+                {
+                    if (g_posFilter == 1 && !row.pitcher)
+                        continue;
+                    if (g_posFilter == 2 && row.pitcher)
+                        continue;
+                    if (g_posFilter >= 3 && (row.pitcher || row.position != g_posFilter - 2))
+                        continue;
+                    if (g_onlyEdited && !settings.edits.count(row.id) && !settings.pins.count(row.id))
+                        continue;
+                    if (g_onlyPicked && !g_picked.count(row.id))
+                        continue;
+                    if (!matches(row, query))
+                        continue;
+                    shown.push_back(&row);
+                }
+            }
+            ui->text_disabled(("보이는 선수 " + std::to_string(shown.size()) + "명 · 고른 선수 " + std::to_string(g_picked.size()) + "명").c_str());
+            ui->same_line();
+            if (ui->small_button("보이는 선수 모두 고르기"))
+                for (const Row *row : shown)
+                    g_picked.insert(row->id);
+            ui->same_line();
+            if (ui->small_button("고르기 모두 해제"))
+                g_picked.clear();
+            if (!g_picked.empty())
+            {
+                ui->same_line();
+                if (ui->button_colored(("고른 " + std::to_string(g_picked.size()) + "명 일괄 편집").c_str(), g_bulk ? 0xFF1A1FC9u : 0u, 0.0f))
+                    g_bulk = true;
             }
             ui->same_line();
-            if (team < 0)
-                ui->text_disabled("내 구단을 찾는 중: 세이브를 불러오거나 새 게임을 시작하면 자동으로 찾습니다");
-            else
-                ui->text_disabled((std::string(ichinen ? "이치넨 구단 (" : "내 구단 ") + kTeamNames[team] + (ichinen ? " 자리)" : " (자동 감지)") +
-                                   " · 12개 구단 선수 " + std::to_string(players) + "명")
-                                      .c_str());
-            int restore = settings.restore ? 1 : 0;
-            if (ui->checkbox("끄거나 대상에서 빼면 원래 능력치로 (이번 실행에서 처음 쓰기 전 값)", &restore))
-            {
-                settings.restore = restore != 0;
-                changed = true;
-            }
-            if (ichinen)
-            {
-                ui->text_colored(0xFF5050FFu, "이치넨 모드: 드래프트가 끝나기 전에는 '내 구단' 자리에 원래 구단 선수들이 있습니다.");
-                ui->text_colored(0xFF5050FFu, "대상을 '고른 선수만'으로 두고, 드래프트 뒤 아래 '선수 고르기'에서 내 선수를 고르세요.");
-            }
+            ui->text_disabled("행 클릭 = 카드 열기 · Ctrl+클릭 / Shift+클릭 = 여러 명 고르기 · 머리줄 클릭 = 정렬");
 
-            // 1. Who gets the default items.
-            ui->separator_text("대상 고르기: 기본 항목을 쓸 선수");
+            float width = 0.0f, height = 0.0f;
+            ui->avail(&width, &height);
+            const float listWidth = std::max(width * 0.56f, 360.0f);
+            ui->begin_panel("list", listWidth, 0.0f, 0);
+            if (shown.empty())
+                ui->text_disabled(own < 0 && rows[0].empty() ? "게임을 시작하면(세이브 불러오기·새 게임) 명단이 나옵니다." : "조건에 맞는 선수가 없습니다.");
+            else
+                drawList(ui, settings, shown, own);
+            ui->end_child();
+            ui->same_line();
+            ui->begin_panel("card", 0.0f, 0.0f, 1);
+            if (g_bulk)
+            {
+                std::vector<const Row *> targets;
+                for (uint16_t id : g_picked)
+                    if (const Row *row = findRow(rows, id))
+                        targets.push_back(row);
+                if (ui->small_button("< 한 선수 카드로"))
+                    g_bulk = false;
+                drawBulkCard(ui, settings, targets, changed);
+            }
+            else if (const Row *row = findRow(rows, g_focus))
+                drawPlayerCard(ui, settings, *row, own, changed);
+            else
+            {
+                ui->heading("선수 카드");
+                ui->text_wrapped("왼쪽 목록에서 선수를 클릭하면 여기에 능력치 편집 카드가 열립니다.");
+                ui->text_disabled("새 값(숫자) 또는 등급을 고른 뒤: '적용' = 한 번만 씀, '고정' = 매 프레임 유지.");
+                ui->text_disabled("여러 명을 체크하고 '일괄 편집'을 누르면 같은 값을 한 번에 씁니다.");
+            }
+            ui->end_child();
+        }
+
+        // Who gets the default items, the items and skills, and the group's ability locks.
+        void drawGroupTab(const Pcsx2GsUi *ui, Settings &settings, int team, bool &changed)
+        {
+            ui->separator_text("대상 고르기: 단체 설정을 받을 선수");
             const int mode = settings.all ? settings.scope : 3;
-            const char *modes[4] = {"내 구단 전원", "고른 구단 전원", "모든 구단 모든 선수", "고른 선수만"};
+            const char *modes[4] = {"내 구단 전원", "고른 구단 전원", "모든 구단 모든 선수", "따로 정한 선수만"};
             for (int m = 0; m < 4; ++m)
             {
                 if (m != 0)
@@ -1008,7 +2184,7 @@ namespace urban::players
                 for (int t = 0; t < kTeams; ++t)
                 {
                     ui->push_id(200000 + t);
-                    if (t % 4 != 0)
+                    if (t % 6 != 0)
                         ui->same_line();
                     int on = ((settings.teams >> t) & 1u) ? 1 : 0;
                     const std::string label = std::string(kTeamNames[t]) + (t == team ? " (내)" : "");
@@ -1020,176 +2196,260 @@ namespace urban::players
                     ui->pop_id();
                 }
             }
-            ui->text_colored(0xFF66CCFFu, ("적용 대상: " + scopeText(settings, team) + (settings.pins.empty() ? std::string()
-                                                                                                   : " + 고른 선수 " + std::to_string(settings.pins.size()) + "명 (각자 항목)"))
-                                              .c_str());
-            ui->text_disabled("'선수 치트 켜기'가 켜져 있을 때만 씁니다 (고르기만으로는 안 바뀜).");
-
-            // 2. The items: the default ones or a picked player's.
-            ui->separator_text("능력치 · 스킬");
-            if (g_selected != 0u && settings.pins.find(g_selected) == settings.pins.end())
-                g_selected = 0u;
-            std::vector<uint16_t> targets{0u};
-            std::vector<std::string> names{"기본 항목: 위 대상 전원"};
-            for (const auto &[id, pin] : settings.pins)
+            ui->text_colored(kChangedText, ("단체 대상: " + scopeText(settings, team)).c_str());
+            ui->text_disabled("'따로 정한 선수'(선수 카드의 S+ 항목 탭)는 단체 S+ 항목·스킬 대신 자기 것을 씁니다. 개별 고정은 늘 맨 위.");
+            if (ui->collapsing_header("S+ 항목 · 스킬 (단체 대상 전원)", 1))
+                drawItems(ui, settings.mask, settings.skills, changed);
+            if (ui->collapsing_header(("능력치 수치·등급 고정 (단체 대상 전원) · " + std::to_string(settings.groupStats.size()) + "개").c_str(), 1))
             {
-                const Row *row = rowOf(id);
-                targets.push_back(id);
-                names.push_back("고른 선수: " + (pin.name.empty() ? "ID " + std::to_string(id) : pin.name) +
-                                (row ? std::string(" · ") + kTeamNames[row->team] : std::string(" · 로스터에 없음")));
-            }
-            std::vector<const char *> pointers;
-            for (const std::string &name : names)
-                pointers.push_back(name.c_str());
-            int current = 0;
-            for (size_t i = 0; i < targets.size(); ++i)
-                if (targets[i] == g_selected)
-                    current = static_cast<int>(i);
-            ui->set_next_width(340.0f);
-            if (ui->combo("편집 대상", &current, pointers.data(), static_cast<int>(pointers.size())))
-                g_selected = targets[static_cast<size_t>(current)];
-            const auto selected = settings.pins.find(g_selected);
-            bool apply = true;
-            if (selected != settings.pins.end())
-            {
-                ui->same_line();
-                int on = selected->second.on ? 1 : 0;
-                if (ui->checkbox("이 선수에게 적용", &on))
+                ui->text_disabled("'쓰기'를 켠 능력을 대상 전원에게 매 프레임 그 값으로 (S+ 항목보다 우선, 선수 카드의 개별 고정이 더 우선).");
+                if (!settings.groupStats.empty())
                 {
-                    selected->second.on = on != 0;
-                    changed = true;
-                }
-                apply = selected->second.on;
-            }
-            uint32_t &mask = selected == settings.pins.end() ? settings.mask : selected->second.mask;
-            std::vector<uint16_t> &skills = selected == settings.pins.end() ? settings.skills : selected->second.skills;
-            ui->begin_disabled(apply ? 0 : 1);
-            drawItems(ui, mask, skills, changed);
-            if (selected != settings.pins.end())
-                drawSlotEditor(ui, selected->second, rowOf(selected->first), changed);
-            ui->end_disabled();
-
-            // 3. The players: any team's, picked ones get items of their own.
-            ui->separator_text("선수 고르기: 고른 선수는 자기 항목을 씁니다 (구단이 바뀌어도 따라감)");
-            if (g_browse < 0 || g_browse >= kTeams)
-                g_browse = team >= 0 ? team : 0;
-            std::vector<std::string> teamLabels;
-            for (int t = 0; t < kTeams; ++t)
-                teamLabels.push_back(std::string(kTeamNames[t]) + " · " + std::to_string(rows[static_cast<size_t>(t)].size()) + "명" +
-                                     (t == team ? " (내 구단)" : ""));
-            std::vector<const char *> teamPointers;
-            for (const std::string &label : teamLabels)
-                teamPointers.push_back(label.c_str());
-            ui->set_next_width(260.0f);
-            ui->combo("구단##browse", &g_browse, teamPointers.data(), kTeams);
-            ui->same_line();
-            const char *ranges[3] = {"전체", "투수", "야수"};
-            ui->set_next_width(90.0f);
-            ui->combo("범위##range", &g_range, ranges, 3);
-            std::vector<const Row *> visible;
-            for (const Row &row : rows[static_cast<size_t>(g_browse)])
-                if (g_range == 0 || (g_range == 1) == row.pitcher)
-                    visible.push_back(&row);
-            if (ui->small_button("보이는 선수 전체 고르기"))
-            {
-                for (const Row *row : visible)
-                    if (settings.pins.find(row->id) == settings.pins.end())
-                    {
-                        Pin added;
-                        added.mask = settings.mask;
-                        added.skills = settings.skills;
-                        added.name = row->name;
-                        settings.pins[row->id] = std::move(added);
-                    }
-                changed = true;
-            }
-            ui->same_line();
-            if (ui->small_button("보이는 선수 고르기 해제"))
-            {
-                for (const Row *row : visible)
-                    settings.pins.erase(row->id);
-                changed = true;
-            }
-            if (!settings.pins.empty())
-            {
-                ui->same_line();
-                if (ui->small_button(("고른 선수 모두 해제 (" + std::to_string(settings.pins.size()) + ")").c_str()))
-                {
-                    settings.pins.clear();
-                    changed = true;
-                }
-            }
-            const bool scoped = inScope(settings, g_browse, team);
-            ui->begin_child("players", 0.0f, 190.0f);
-            if (visible.empty())
-                ui->text_disabled(team < 0 ? "게임을 시작하면 명단이 나옵니다." : "이 구단·범위에 선수가 없습니다.");
-            for (const Row *row : visible)
-            {
-                ui->push_id(row->id);
-                auto pin = settings.pins.find(row->id);
-                int pinned = pin != settings.pins.end() ? 1 : 0;
-                if (ui->checkbox("고르기", &pinned))
-                {
-                    if (pinned)
-                    {
-                        Pin added;
-                        added.mask = settings.mask;
-                        added.skills = settings.skills;
-                        added.name = row->name;
-                        settings.pins[row->id] = std::move(added);
-                        g_selected = row->id;
-                    }
-                    else
-                        settings.pins.erase(row->id);
-                    changed = true;
-                    pin = settings.pins.find(row->id);
-                }
-                ui->same_line();
-                char line[160];
-                std::snprintf(line, sizeof(line), "%2d번  %s  (%s, %d세)", row->number, row->name.empty() ? "?" : row->name.c_str(),
-                              row->pitcher ? "투수" : "야수", row->age);
-                ui->text(line);
-                ui->same_line();
-                if (pin == settings.pins.end())
-                    ui->text_disabled(scoped ? "기본 항목" : "대상 아님");
-                else
-                {
-                    const std::string state = pin->second.on ? "개별 " + std::to_string(std::popcount(pin->second.mask)) + "/" +
-                                                                   std::to_string(g_items.size()) + "항목 · 스킬 " +
-                                                                   std::to_string(pin->second.skills.size())
-                                                             : std::string("개별: 끔");
-                    ui->text_colored(0xFF66CCFFu, state.c_str());
                     ui->same_line();
-                    if (ui->small_button(g_selected == row->id ? "설정 중" : "설정"))
-                        g_selected = row->id;
+                    if (ui->small_button("단체 고정 모두 해제"))
+                    {
+                        settings.groupStats.clear();
+                        changed = true;
+                    }
+                }
+                static const char *const aptitudes[6] = {"그대로", "D", "C", "B", "A", "S"};
+                for (int group : {kPitching, kBatting, kFielding})
+                {
+                    ui->separator_text(groupTitle(group));
+                    ui->push_id(700 + group);
+                    if (ui->begin_table("groupstats", 5, PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
+                    {
+                        ui->table_column("쓰기", 0, 36.0f);
+                        ui->table_column("능력", 0, 90.0f);
+                        ui->table_column("새 값", 0, 60.0f);
+                        ui->table_column("등급", 0, 62.0f);
+                        ui->table_column("득의도", 0, 0.0f);
+                        ui->table_headers();
+                        for (int stat = 0; stat < kStatCount; ++stat)
+                        {
+                            if (kStats[stat].group != group)
+                                continue;
+                            const auto locked = settings.groupStats.find(stat);
+                            auto it = g_groupDrafts.find(stat);
+                            if (it == g_groupDrafts.end())
+                            {
+                                Draft draft;
+                                draft.value = locked != settings.groupStats.end() && locked->second.value >= 0 ? locked->second.value : 99;
+                                draft.apt = locked != settings.groupStats.end() ? locked->second.apt : -1;
+                                it = g_groupDrafts.emplace(stat, draft).first;
+                            }
+                            Draft &draft = it->second;
+                            ui->push_id(stat);
+                            ui->table_next_row();
+                            if (locked != settings.groupStats.end())
+                                ui->table_row_color(kLockedRow);
+                            ui->table_next_column();
+                            int use = locked != settings.groupStats.end() ? 1 : 0;
+                            bool typed = false;
+                            const bool toggled = ui->checkbox("##use", &use) != 0;
+                            ui->table_next_column();
+                            ui->text(kStats[stat].label);
+                            ui->tooltip(kStats[stat].jp);
+                            ui->table_next_column();
+                            ui->set_next_width(56.0f);
+                            if (ui->input_int("##value", &draft.value, 0))
+                            {
+                                draft.value = std::clamp(draft.value, 0, 255);
+                                typed = true;
+                            }
+                            ui->table_next_column();
+                            int rank = gradeOf(draft.value);
+                            ui->set_next_width(58.0f);
+                            if (ui->combo("##rank", &rank, kGrades, kGradeCount))
+                            {
+                                draft.value = kGradeTop[rank];
+                                typed = true;
+                            }
+                            ui->table_next_column();
+                            int apt = draft.apt + 1;
+                            ui->set_next_width(66.0f);
+                            if (ui->combo("##apt", &apt, aptitudes, 6))
+                            {
+                                draft.apt = apt - 1;
+                                typed = true;
+                            }
+                            if (toggled || (typed && use))
+                            {
+                                if (use)
+                                    settings.groupStats[stat] = editFrom(draft, nullptr, stat);
+                                else
+                                    settings.groupStats.erase(stat);
+                                changed = true;
+                            }
+                            ui->pop_id();
+                        }
+                        ui->end_table();
+                    }
+                    ui->pop_id();
+                }
+            }
+        }
+
+        // Everyone with settings of their own, on a roster now or not.
+        void drawSummary(const Pcsx2GsUi *ui, Settings &settings, const std::array<std::vector<Row>, kTeams> &rows, int team, bool &changed)
+        {
+            ui->text_colored(kChangedText, ("단체: " + scopeText(settings, team) + " · S+ 항목 " + std::to_string(std::popcount(settings.mask)) +
+                                            "개 · 스킬 " + std::to_string(settings.skills.size()) + "개 · 능력 고정 " +
+                                            std::to_string(settings.groupStats.size()) + "개")
+                                               .c_str());
+            for (const auto &[stat, edit] : settings.groupStats)
+                ui->text_disabled(("  " + std::string(kStats[stat].label) + ": " + editText(edit)).c_str());
+            std::set<uint16_t> ids;
+            for (const auto &[id, pin] : settings.pins)
+                ids.insert(id);
+            for (const auto &[id, edit] : settings.edits)
+                ids.insert(id);
+            ui->separator_text(("개별 설정한 선수 " + std::to_string(ids.size()) + "명").c_str());
+            if (ids.empty())
+                ui->text_disabled("아직 없습니다. '선수 찾기·편집'에서 선수 카드를 열어 고정하거나 따로 정하세요.");
+            if (!ui->begin_panel("summary", 0.0f, 0.0f, 0))
+            {
+                ui->end_child();
+                return;
+            }
+            for (uint16_t id : ids)
+            {
+                const Row *row = findRow(rows, id);
+                const auto pin = settings.pins.find(id);
+                const auto edit = settings.edits.find(id);
+                std::string name = row ? row->name : pin != settings.pins.end() ? pin->second.name : edit->second.name;
+                if (name.empty())
+                    name = "ID " + std::to_string(id);
+                ui->push_id(id);
+                std::string line = name + " · " + (row ? kTeamNames[row->team] : "로스터에 없음 (돌아오면 다시 적용)");
+                if (pin != settings.pins.end())
+                    line += pin->second.on ? " · S+ 따로 " + std::to_string(std::popcount(pin->second.mask)) + "항목 · 스킬 " + std::to_string(pin->second.skills.size())
+                                           : std::string(" · 적용 끔");
+                ui->text(line.c_str());
+                if (row)
+                {
+                    ui->same_line();
+                    if (ui->small_button("카드 열기"))
+                    {
+                        g_focus = id;
+                        g_bulk = false;
+                    }
+                }
+                if (edit != settings.edits.end())
+                {
+                    ui->same_line();
+                    if (ui->small_button("고정 모두 해제"))
+                    {
+                        settings.edits.erase(edit);
+                        changed = true;
+                        ui->pop_id();
+                        break;
+                    }
+                }
+                if (pin != settings.pins.end())
+                {
+                    ui->same_line();
+                    if (ui->small_button("따로 정하기 해제"))
+                    {
+                        settings.pins.erase(pin);
+                        changed = true;
+                        ui->pop_id();
+                        break;
+                    }
+                }
+                if (edit != settings.edits.end())
+                {
+                    std::string locks = edit->second.on ? "  고정: " : "  고정 (꺼 둠): ";
+                    int n = 0;
+                    for (const auto &[stat, value] : edit->second.stats)
+                        locks += (n++ ? ", " : "") + std::string(kStats[stat].label) + " " + editText(value);
+                    ui->text_disabled(locks.c_str());
                 }
                 ui->pop_id();
             }
             ui->end_child();
+        }
 
-            // Picked players on no roster now (released, retired, another save): kept for when they are back.
-            int away = 0;
-            for (auto it = settings.pins.begin(); it != settings.pins.end();)
+        // GS thread, while the menu is open. Works on a copy; a change is stored and saved at the end.
+        void draw(const Pcsx2GsUi *ui)
+        {
+            if (g_safeMode)
             {
-                if (rowOf(it->first) || team < 0)
+                ui->text_wrapped("안전 모드로 시작해서 선수 치트가 꺼져 있습니다.");
+                return;
+            }
+            if (g_items.empty())
+            {
+                ui->text_wrapped(("항목 파일이 없습니다: " + utf8(g_itemsPath)).c_str());
+                return;
+            }
+            if (ui->version < 3u)
+            {
+                ui->text_wrapped("pcsx2gs.dll이 이 실행 파일보다 오래되었습니다. 다시 빌드하세요.");
+                return;
+            }
+            Settings settings;
+            int team;
+            std::array<std::vector<Row>, kTeams> rows;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                settings = g_settings;
+                team = g_team;
+                rows = g_rows;
+            }
+            bool changed = false;
+            size_t players = 0;
+            for (const std::vector<Row> &list : rows)
+                players += list.size();
+
+            int enabled = settings.enabled ? 1 : 0;
+            // イチネンモード (one-year mode) runs: its state object [0x62B45C] exists only then. Its new club borrows one
+            // team's place, which holds that team's own players until the expansion draft is over.
+            const bool ichinen = valid(read32(0x62B45Cu), 0x10u);
+            if (ui->checkbox("선수 치트 켜기", &enabled))
+            {
+                settings.enabled = enabled != 0;
+                changed = true;
+            }
+            ui->tooltip("켜져 있을 때만 S+ 항목·스킬·고정을 매 프레임 씁니다. '적용'(1회)은 꺼져 있어도 바로 씁니다.");
+            ui->same_line();
+            if (team < 0)
+                ui->text_disabled("내 구단을 찾는 중: 세이브를 불러오거나 새 게임을 시작하면 자동으로 찾습니다");
+            else
+                ui->text_disabled((std::string(ichinen ? "이치넨 구단 (" : "내 구단 ") + kTeamNames[team] + (ichinen ? " 자리)" : " (자동 감지)") +
+                                   " · 12개 구단 선수 " + std::to_string(players) + "명")
+                                      .c_str());
+            ui->same_line();
+            int restore = settings.restore ? 1 : 0;
+            if (ui->checkbox("끄거나 빼면 원래 능력치로", &restore))
+            {
+                settings.restore = restore != 0;
+                changed = true;
+            }
+            ui->tooltip("S+ 항목·고정을 끄거나 대상에서 빼면, 이번 실행에서 처음 쓰기 전 값으로 되돌립니다.");
+            if (ichinen)
+            {
+                ui->text_colored(0xFF5050FFu, "이치넨 모드: 드래프트가 끝나기 전에는 '내 구단' 자리에 원래 구단 선수들이 있습니다.");
+                ui->text_colored(0xFF5050FFu, "단체 대상을 '따로 정한 선수만'으로 두고, 드래프트 뒤 내 선수를 고르세요.");
+            }
+            if (ui->begin_tab_bar("playertabs"))
+            {
+                if (ui->begin_tab("선수 찾기 · 편집"))
                 {
-                    ++it;
-                    continue;
+                    drawFinder(ui, settings, rows, team, changed);
+                    ui->end_tab();
                 }
-                if (away++ == 0)
-                    ui->separator_text("로스터에 없는 고른 선수 (돌아오면 다시 적용)");
-                ui->push_id(100000 + it->first);
-                const bool remove = ui->small_button("고르기 해제") != 0;
-                ui->same_line();
-                ui->text_disabled((it->second.name.empty() ? "ID " + std::to_string(it->first) : it->second.name).c_str());
-                ui->pop_id();
-                if (remove)
+                if (ui->begin_tab("단체 적용"))
                 {
-                    it = settings.pins.erase(it);
-                    changed = true;
+                    drawGroupTab(ui, settings, team, changed);
+                    ui->end_tab();
                 }
-                else
-                    ++it;
+                if (ui->begin_tab("설정 현황"))
+                {
+                    drawSummary(ui, settings, rows, team, changed);
+                    ui->end_tab();
+                }
+                ui->end_tab_bar();
             }
 
             if (changed)

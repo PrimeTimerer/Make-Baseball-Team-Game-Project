@@ -64,6 +64,32 @@ typedef struct UrbanModUi
     void (*set_next_width)(float width); /* width of the next item (0 = default) */
     void (*begin_disabled)(int disabled);
     void (*end_disabled)(void);
+    /* version 3 (check ui->version >= 3 before use); sizes in set_next_width units, 0 = fill / default */
+    int (*input_int)(const char *label, int *value, int step);
+    int (*input_text)(const char *label, const char *hint, char *buffer, uint32_t size);
+    int (*slider_int)(const char *label, int *value, int min, int max);
+    int (*selectable)(const char *label, int selected, uint32_t flags);
+    int (*begin_table)(const char *id, int columns, uint32_t flags, float width, float height); /* end_table only after 1 */
+    void (*end_table)(void);
+    void (*table_column)(const char *label, uint32_t flags, float width);
+    void (*table_freeze)(int columns, int rows);
+    void (*table_headers)(void);
+    void (*table_next_row)(void);
+    int (*table_next_column)(void);
+    int (*table_sort)(int *column, int *descending);
+    void (*table_row_color)(uint32_t rgba);
+    void (*tooltip)(const char *text);
+    int (*item_hovered)(void);
+    int (*item_double_clicked)(void);
+    int (*collapsing_header)(const char *label, int open_first);
+    void (*progress_bar)(float fraction, uint32_t rgba, float width, float height, const char *overlay);
+    uint32_t (*key_mods)(void);
+    void (*avail)(float *width, float *height);
+    void (*same_line_at)(float x);
+    int (*button_colored)(const char *label, uint32_t rgba, float width);
+    int (*begin_panel)(const char *id, float width, float height, int border); /* always pair with end_child */
+    void (*clipper_begin)(int count);
+    int (*clipper_step)(int *first, int *end);
 } UrbanModUi;
 
 typedef void (*UrbanModDrawFn)(const UrbanModUi *ui, void *user);

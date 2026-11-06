@@ -50,7 +50,8 @@ namespace ps2x::menu
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             int open = 1;
-            if (ui->begin_window(g_title.c_str(), &open, 760.0f, 540.0f))
+            // Large by default (the player editor's list and card side by side); never more than the screen.
+            if (ui->begin_window(g_title.c_str(), &open, 1500.0f, 960.0f))
             {
                 if (!g_hint.empty())
                     ui->text_disabled(g_hint.c_str());
@@ -92,10 +93,18 @@ namespace ps2x::menu
                 {KEY_RIGHT, PCSX2GS_KEY_RIGHT}, {KEY_ENTER, PCSX2GS_KEY_ENTER}, {KEY_KP_ENTER, PCSX2GS_KEY_ENTER},
                 {KEY_SPACE, PCSX2GS_KEY_SPACE}, {KEY_ESCAPE, PCSX2GS_KEY_ESCAPE}, {KEY_TAB, PCSX2GS_KEY_TAB},
                 {KEY_LEFT_SHIFT, PCSX2GS_KEY_SHIFT}, {KEY_RIGHT_SHIFT, PCSX2GS_KEY_SHIFT},
-                {KEY_LEFT_CONTROL, PCSX2GS_KEY_CTRL}, {KEY_RIGHT_CONTROL, PCSX2GS_KEY_CTRL}};
+                {KEY_LEFT_CONTROL, PCSX2GS_KEY_CTRL}, {KEY_RIGHT_CONTROL, PCSX2GS_KEY_CTRL},
+                {KEY_BACKSPACE, PCSX2GS_KEY_BACKSPACE}, {KEY_DELETE, PCSX2GS_KEY_DELETE}, {KEY_HOME, PCSX2GS_KEY_HOME},
+                {KEY_END, PCSX2GS_KEY_END}, {KEY_PAGE_UP, PCSX2GS_KEY_PAGE_UP}, {KEY_PAGE_DOWN, PCSX2GS_KEY_PAGE_DOWN},
+                {KEY_A, PCSX2GS_KEY_A}, {KEY_C, PCSX2GS_KEY_C}, {KEY_V, PCSX2GS_KEY_V}, {KEY_X, PCSX2GS_KEY_X},
+                {KEY_Z, PCSX2GS_KEY_Z}, {KEY_Y, PCSX2GS_KEY_Y}};
             for (const auto &entry : keys)
                 if (IsKeyDown(entry.key))
                     input.keys |= entry.bit;
+            // Typed characters (an IME's finished syllables too) for the menu's text fields; the game gets none of
+            // them, its input is blocked while the menu is open.
+            for (int c = GetCharPressed(); c > 0 && input.char_count < 16u; c = GetCharPressed())
+                input.chars[input.char_count++] = static_cast<uint32_t>(c);
             using namespace ps2_host_gamepads;
             for (int device = 0; device < kMaxDevices; ++device)
             {

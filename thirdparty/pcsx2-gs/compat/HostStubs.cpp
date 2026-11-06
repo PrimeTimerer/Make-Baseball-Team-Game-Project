@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -65,6 +66,7 @@ namespace
     void *g_menuUser = nullptr;
     Pcsx2GsMenuInput g_menuInput{};
     float g_menuWheel = 0.0f;
+    std::vector<uint32_t> g_menuChars; // typed characters not yet given to ImGui (UTF-32)
 
     int UiBeginWindow(const char *title, int *open, float width, float height)
     {
@@ -74,8 +76,13 @@ namespace
         ImGui::GetStyle().FontScaleMain = scale;
         width = std::min(width * scale, display.x - 24.0f);
         height = std::min(height * scale, display.y - 24.0f);
-        ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Appearing);
-        ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        // Centered at the first open and after the game window is resized; otherwise where and as large as the player
+        // left it (ImGui keeps that for the session).
+        static ImVec2 lastDisplay(0.0f, 0.0f);
+        const ImGuiCond when = (display.x != lastDisplay.x || display.y != lastDisplay.y) ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+        lastDisplay = display;
+        ImGui::SetNextWindowSize(ImVec2(width, height), when);
+        ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), when, ImVec2(0.5f, 0.5f));
         bool keep = open ? *open != 0 : true;
         const bool visible = ImGui::Begin(title, open ? &keep : nullptr, ImGuiWindowFlags_NoCollapse);
         if (open)
@@ -142,11 +149,184 @@ namespace
     void UiBeginDisabled(int disabled) { ImGui::BeginDisabled(disabled != 0); }
     void UiEndDisabled() { ImGui::EndDisabled(); }
 
-    const Pcsx2GsUi g_ui = {2u, UiBeginWindow, UiEndWindow, UiBeginTabBar, UiEndTabBar, UiBeginTab, UiEndTab, UiText,
+    // Version 3: sizes in set_next_width units (scaled with the text).
+    float UiScale() { return ImGui::GetStyle().FontScaleMain; }
+    ImVec2 UiScaled(float width, float height) { return ImVec2(width * UiScale(), height * UiScale()); }
+    int UiInputInt(const char *label, int *value, int step)
+    {
+        int current = value ? *value : 0;
+        const bool changed = ImGui::InputInt(label, &current, step > 0 ? step : 0, step > 0 ? step * 10 : 0);
+        if (value)
+            *value = current;
+        return changed ? 1 : 0;
+    }
+    int UiInputText(const char *label, const char *hint, char *buffer, uint32_t size)
+    {
+        if (!buffer || size == 0u)
+            return 0;
+        const bool changed = hint && *hint ? ImGui::InputTextWithHint(label, hint, buffer, size) : ImGui::InputText(label, buffer, size);
+        return changed ? 1 : 0;
+    }
+    int UiSliderInt(const char *label, int *value, int min, int max)
+    {
+        int current = value ? *value : 0;
+        const bool changed = ImGui::SliderInt(label, &current, min, max);
+        if (value)
+            *value = current;
+        return changed ? 1 : 0;
+    }
+    int UiSelectable(const char *label, int selected, uint32_t flags)
+    {
+        ImGuiSelectableFlags select = ImGuiSelectableFlags_None;
+        if (flags & PCSX2GS_SELECT_SPAN_COLUMNS)
+            select |= ImGuiSelectableFlags_SpanAllColumns;
+        if (flags & PCSX2GS_SELECT_ALLOW_OVERLAP)
+            select |= ImGuiSelectableFlags_AllowOverlap;
+        if (flags & PCSX2GS_SELECT_DOUBLE_CLICK)
+            select |= ImGuiSelectableFlags_AllowDoubleClick;
+        return ImGui::Selectable(label ? label : "", selected != 0, select) ? 1 : 0;
+    }
+    int UiBeginTable(const char *id, int columns, uint32_t flags, float width, float height)
+    {
+        if (columns < 1 || columns > 64)
+            return 0;
+        ImGuiTableFlags table = ImGuiTableFlags_SizingFixedFit;
+        if (flags & PCSX2GS_TABLE_SORTABLE)
+            table |= ImGuiTableFlags_Sortable;
+        if (flags & PCSX2GS_TABLE_SCROLL)
+            table |= ImGuiTableFlags_ScrollY;
+        if (flags & PCSX2GS_TABLE_SCROLL_X)
+            table |= ImGuiTableFlags_ScrollX;
+        if (flags & PCSX2GS_TABLE_BORDERS)
+            table |= ImGuiTableFlags_Borders;
+        if (flags & PCSX2GS_TABLE_ROW_BG)
+            table |= ImGuiTableFlags_RowBg;
+        if (flags & PCSX2GS_TABLE_RESIZABLE)
+            table |= ImGuiTableFlags_Resizable;
+        return ImGui::BeginTable(id, columns, table, UiScaled(width, height)) ? 1 : 0;
+    }
+    void UiEndTable() { ImGui::EndTable(); }
+    void UiTableColumn(const char *label, uint32_t flags, float width)
+    {
+        ImGuiTableColumnFlags column = width > 0.0f ? ImGuiTableColumnFlags_WidthFixed : ImGuiTableColumnFlags_WidthStretch;
+        if (flags & PCSX2GS_COLUMN_DEFAULT_SORT)
+            column |= ImGuiTableColumnFlags_DefaultSort;
+        if (flags & PCSX2GS_COLUMN_NO_SORT)
+            column |= ImGuiTableColumnFlags_NoSort;
+        if (flags & PCSX2GS_COLUMN_DESCENDING_FIRST)
+            column |= ImGuiTableColumnFlags_PreferSortDescending;
+        ImGui::TableSetupColumn(label ? label : "", column, width > 0.0f ? width * UiScale() : 0.0f);
+    }
+    void UiTableFreeze(int columns, int rows) { ImGui::TableSetupScrollFreeze(columns, rows); }
+    void UiTableHeaders() { ImGui::TableHeadersRow(); }
+    void UiTableNextRow() { ImGui::TableNextRow(); }
+    int UiTableNextColumn() { return ImGui::TableNextColumn() ? 1 : 0; }
+    int UiTableSort(int *column, int *descending)
+    {
+        ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
+        int sortColumn = -1, down = 0, changed = 0;
+        if (specs)
+        {
+            if (specs->SpecsCount > 0)
+            {
+                sortColumn = specs->Specs[0].ColumnIndex;
+                down = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending ? 1 : 0;
+            }
+            if (specs->SpecsDirty)
+            {
+                changed = 1;
+                specs->SpecsDirty = false;
+            }
+        }
+        if (column)
+            *column = sortColumn;
+        if (descending)
+            *descending = down;
+        return changed;
+    }
+    void UiTableRowColor(uint32_t rgba)
+    {
+        if (rgba != 0u)
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, rgba);
+    }
+    void UiTooltip(const char *text)
+    {
+        if (text && *text && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", text);
+    }
+    int UiItemHovered() { return ImGui::IsItemHovered() ? 1 : 0; }
+    int UiItemDoubleClicked() { return ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) ? 1 : 0; }
+    int UiCollapsingHeader(const char *label, int openFirst)
+    {
+        return ImGui::CollapsingHeader(label ? label : "", openFirst ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None) ? 1 : 0;
+    }
+    void UiProgressBar(float fraction, uint32_t rgba, float width, float height, const char *overlay)
+    {
+        if (rgba != 0u)
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImGui::ColorConvertU32ToFloat4(rgba));
+        ImGui::ProgressBar(std::clamp(fraction, 0.0f, 1.0f),
+                           ImVec2(width > 0.0f ? width * UiScale() : -FLT_MIN, height > 0.0f ? height * UiScale() : 0.0f), overlay);
+        if (rgba != 0u)
+            ImGui::PopStyleColor();
+    }
+    uint32_t UiKeyMods()
+    {
+        const ImGuiIO &io = ImGui::GetIO();
+        return (io.KeyShift ? PCSX2GS_KEY_SHIFT : 0u) | (io.KeyCtrl ? PCSX2GS_KEY_CTRL : 0u);
+    }
+    void UiAvail(float *width, float *height)
+    {
+        const ImVec2 room = ImGui::GetContentRegionAvail();
+        if (width)
+            *width = room.x / UiScale();
+        if (height)
+            *height = room.y / UiScale();
+    }
+    void UiSameLineAt(float x) { ImGui::SameLine(x * UiScale()); }
+    int UiButtonColored(const char *label, uint32_t rgba, float width)
+    {
+        if (rgba != 0u)
+        {
+            const ImVec4 color = ImGui::ColorConvertU32ToFloat4(rgba);
+            ImGui::PushStyleColor(ImGuiCol_Button, color);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(std::min(color.x + 0.15f, 1.0f), std::min(color.y + 0.15f, 1.0f),
+                                                                 std::min(color.z + 0.15f, 1.0f), color.w));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, color);
+        }
+        const bool clicked = ImGui::Button(label ? label : "", ImVec2(width > 0.0f ? width * UiScale() : 0.0f, 0.0f));
+        if (rgba != 0u)
+            ImGui::PopStyleColor(3);
+        return clicked ? 1 : 0;
+    }
+    int UiBeginPanel(const char *id, float width, float height, int border)
+    {
+        return ImGui::BeginChild(id, UiScaled(width, height), border ? ImGuiChildFlags_Borders : ImGuiChildFlags_None) ? 1 : 0;
+    }
+    ImGuiListClipper g_clipper; // one list at a time (GS thread)
+    void UiClipperBegin(int count) { g_clipper.Begin(std::max(count, 0)); }
+    int UiClipperStep(int *first, int *end)
+    {
+        if (g_clipper.Step())
+        {
+            if (first)
+                *first = g_clipper.DisplayStart;
+            if (end)
+                *end = g_clipper.DisplayEnd;
+            return 1;
+        }
+        g_clipper.End();
+        return 0;
+    }
+
+    const Pcsx2GsUi g_ui = {3u, UiBeginWindow, UiEndWindow, UiBeginTabBar, UiEndTabBar, UiBeginTab, UiEndTab, UiText,
                             UiTextWrapped, UiTextDisabled, UiTextColored, UiHeading, UiCheckbox, UiButton, UiSameLine,
                             UiSeparator, UiSpacing, UiBeginChild, UiEndChild, UiPushId, UiPopId, UiCombo, UiRadio,
                             UiSmallButton, UiSeparatorText, UiIndent, UiUnindent, UiSetNextWidth, UiBeginDisabled,
-                            UiEndDisabled};
+                            UiEndDisabled, UiInputInt, UiInputText, UiSliderInt, UiSelectable, UiBeginTable, UiEndTable,
+                            UiTableColumn, UiTableFreeze, UiTableHeaders, UiTableNextRow, UiTableNextColumn, UiTableSort,
+                            UiTableRowColor, UiTooltip, UiItemHovered, UiItemDoubleClicked, UiCollapsingHeader, UiProgressBar,
+                            UiKeyMods, UiAvail, UiSameLineAt, UiButtonColored, UiBeginPanel, UiClipperBegin,
+                            UiClipperStep};
 
     // The menu's look: ImGui's dark style with the launcher's red.
     void ApplyMenuStyle()
@@ -183,12 +363,14 @@ namespace
         Pcsx2GsMenuInput input;
         float wheel;
         bool active;
+        std::vector<uint32_t> chars;
         {
             std::lock_guard<std::mutex> lock(g_menuMutex);
             input = g_menuInput;
             wheel = g_menuWheel;
             g_menuWheel = 0.0f;
             active = g_menuDraw != nullptr;
+            chars.swap(g_menuChars);
         }
         ImGuiIO &io = ImGui::GetIO();
         if (!active)
@@ -209,6 +391,18 @@ namespace
         key(ImGuiKey_Tab, input.keys, PCSX2GS_KEY_TAB);
         key(ImGuiMod_Shift, input.keys, PCSX2GS_KEY_SHIFT);
         key(ImGuiMod_Ctrl, input.keys, PCSX2GS_KEY_CTRL);
+        key(ImGuiKey_Backspace, input.keys, PCSX2GS_KEY_BACKSPACE);
+        key(ImGuiKey_Delete, input.keys, PCSX2GS_KEY_DELETE);
+        key(ImGuiKey_Home, input.keys, PCSX2GS_KEY_HOME);
+        key(ImGuiKey_End, input.keys, PCSX2GS_KEY_END);
+        key(ImGuiKey_PageUp, input.keys, PCSX2GS_KEY_PAGE_UP);
+        key(ImGuiKey_PageDown, input.keys, PCSX2GS_KEY_PAGE_DOWN);
+        key(ImGuiKey_A, input.keys, PCSX2GS_KEY_A);
+        key(ImGuiKey_C, input.keys, PCSX2GS_KEY_C);
+        key(ImGuiKey_V, input.keys, PCSX2GS_KEY_V);
+        key(ImGuiKey_X, input.keys, PCSX2GS_KEY_X);
+        key(ImGuiKey_Z, input.keys, PCSX2GS_KEY_Z);
+        key(ImGuiKey_Y, input.keys, PCSX2GS_KEY_Y);
         key(ImGuiKey_GamepadDpadUp, input.pad, PCSX2GS_PAD_UP);
         key(ImGuiKey_GamepadDpadDown, input.pad, PCSX2GS_PAD_DOWN);
         key(ImGuiKey_GamepadDpadLeft, input.pad, PCSX2GS_PAD_LEFT);
@@ -217,6 +411,10 @@ namespace
         key(ImGuiKey_GamepadFaceRight, input.pad, PCSX2GS_PAD_BACK);
         key(ImGuiKey_GamepadL1, input.pad, PCSX2GS_PAD_L1);
         key(ImGuiKey_GamepadR1, input.pad, PCSX2GS_PAD_R1);
+        if (active)
+            for (const uint32_t c : chars)
+                if (c >= 0x20u && c != 0x7Fu)
+                    io.AddInputCharacter(c);
     }
 }
 
@@ -234,6 +432,8 @@ void pcsx2gs::MenuInput(const Pcsx2GsMenuInput *input)
     std::lock_guard<std::mutex> lock(g_menuMutex);
     g_menuWheel += input->wheel;
     g_menuInput = *input;
+    for (uint32_t i = 0; i < std::min<uint32_t>(input->char_count, 16u) && g_menuChars.size() < 256u; ++i)
+        g_menuChars.push_back(input->chars[i]);
 }
 
 void pcsx2gs::SetOsd(const char *top, uint32_t topRgba, float topAlpha, const char *bottom)
