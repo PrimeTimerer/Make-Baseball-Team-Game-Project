@@ -28,6 +28,7 @@
 #include "urban/cheat_menu.h"
 #include "urban/staff_cheats.h"
 #include "urban/ichinen_cheats.h"
+#include "urban/stadium_cheats.h"
 #include "urban/match_script.h"
 #include "urban/scout_cheats.h"
 #include "urban/save_identity.h"
@@ -1443,6 +1444,8 @@ int main(int argc, char *argv[])
             urban::staff::install(runtime.memory().getRDRAM(), userDir);
             // イチネンモード: the shop slots by name (change, hold, buy again) and the points.
             urban::ichinen::install(runtime.memory().getRDRAM(), userDir);
+            // The stadium (level, turf, seats), its facilities by square and the practice facilities, from the club object.
+            urban::stadium::install(runtime.memory().getRDRAM());
             // The performance log: logs/perf-<time>.txt, a line a second (PS2X_PERF_LOG=0: off).
             urban::perflog::install(runtime.memory().getRDRAM(), userDir);
             // F1: the key list, in Korean (PCSX2's GS draws it with the Korean and Japanese fonts).
