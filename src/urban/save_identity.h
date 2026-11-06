@@ -14,6 +14,8 @@ namespace urban::saveid
     void install(PS2Runtime &runtime, uint8_t *rdram, const std::filesystem::path &userDir);
     std::string current();
     uint32_t generation(); // changes whenever current() does
+    // The menu: the game now running is a new game (the "new" settings); the save it was taken for keeps its own.
+    void startNew();
     // <userDir>/cheat_saves/<id>: the per-save settings files.
     std::filesystem::path folder(const std::string &id);
     // For the menus: "메모리카드 세이브 M00 (만든 때 2026-11-06 11:37)", "새 게임 (아직 저장 안 함)".

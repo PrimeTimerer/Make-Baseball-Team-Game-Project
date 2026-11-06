@@ -146,6 +146,12 @@ namespace urban::saveid
 
         // The memory card file operations that format "/%s/%s" (dir in a1): which one a load and a save use.
         constexpr uint32_t kMcFileOps[4] = {0x2E5160u, 0x2E5288u, 0x2E53C0u, 0x2E5468u};
+        // Only reading a save's data (op 2) is a load: 続きから's list reads every save's files too (ops 0 from 0x2E5FCC,
+        // 0x2E6058, 0x2E6108, 0x2E61A4 and op 2 from 0x2E6254; the system file at boot: op 2 from 0x2E628C), while the load
+        // itself reads from 0x2E7DC0 and 0x2E7E58 (hidden run 11-06). Before, the list alone made the next 初めから look
+        // like that save (the owner's new Yokohama game took M00's Lions settings).
+        constexpr int kReadOp = 2;
+        constexpr uint32_t kListReads[2] = {0x2E6254u, 0x2E628Cu};
         GuestFunction g_fileOps[4] = {};
         template <int K>
         void fileOpHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -158,8 +164,8 @@ namespace urban::saveid
             const int team = ownTeam(&object);
             if (g_debug)
                 std::fprintf(stderr, "[saveid] file op %d (0x%08x) dir %s from 0x%08x team %d obj 0x%08x\n", K, kMcFileOps[K], name, ra, team, object);
-            // A save's file opened while no game runs (the title's 続きから): the game about to start is that save.
-            if (const std::string id = idOf(name); !id.empty() && team < 0)
+            // A save's data read while no game runs (the title's 続きから, the load itself): the game about to start is that save.
+            if (const std::string id = idOf(name); !id.empty() && team < 0 && K == kReadOp && ra != kListReads[0] && ra != kListReads[1])
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 if (g_pending != id)
@@ -273,6 +279,12 @@ namespace urban::saveid
         return g_current;
     }
     uint32_t generation() { return g_generation.load(); }
+    void startNew()
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_pending.clear();
+        setCurrent("new", "the menu: this game is a new game");
+    }
     std::filesystem::path folder(const std::string &id) { return g_root / id; }
     std::string describe(const std::string &id)
     {

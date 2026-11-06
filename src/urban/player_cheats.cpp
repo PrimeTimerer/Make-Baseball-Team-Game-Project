@@ -3377,7 +3377,7 @@ namespace urban::players
                 mismatch = g_teamMismatch;
                 hasProfile = !g_settingsPath.empty();
             }
-            bool changed = false, freshGame = false;
+            bool changed = false;
             // Which save these settings belong to (urban::saveid): each save has its own.
             ui->text_disabled(("세이브: " + urban::saveid::describe(urban::saveid::current()) + " · 아래 설정은 이 세이브에만 저장되고 적용됩니다").c_str());
             if (!hasProfile)
@@ -3388,14 +3388,10 @@ namespace urban::players
                                                " 세이브에서 만든 것이라 이 게임(" + (team >= 0 ? kTeamNames[team] : "?") + ")에는 쓰지 않습니다.")
                                                   .c_str());
                 ui->same_line();
-                if (ui->button("비우고 이 게임용으로 새로 시작"))
-                {
-                    Settings fresh;
-                    fresh.team = team;
-                    settings = fresh;
-                    changed = true;
-                    freshGame = true;
-                }
+                if (ui->button("이 게임은 새 게임으로 (세이브 설정은 그대로)"))
+                    urban::saveid::startNew();
+                ui->tooltip("이 게임을 '새 게임' 설정으로 따로 씁니다 (처음엔 비어 있음). 원래 세이브의 설정은 지우지 않습니다. "
+                            "게임 안에서 메모리카드에 세이브하면 그 칸으로 설정이 따라갑니다.");
             }
             size_t players = 0;
             for (const std::vector<Row> &list : rows)
@@ -3471,8 +3467,7 @@ namespace urban::players
             {
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
-                    if (!freshGame)
-                        settings.camp = g_settings.camp; // changed only under the lock (the camp hook takes players out)
+                    settings.camp = g_settings.camp; // changed only under the lock (the camp hook takes players out)
                     g_settings = settings;
                 }
                 saveSettings(settings);
