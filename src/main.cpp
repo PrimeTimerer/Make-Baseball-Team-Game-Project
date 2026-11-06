@@ -29,6 +29,7 @@
 #include "urban/staff_cheats.h"
 #include "urban/ichinen_cheats.h"
 #include "urban/match_script.h"
+#include "urban/scout_cheats.h"
 #include "runtime/ps2_game_menu.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
@@ -1480,6 +1481,8 @@ int main(int argc, char *argv[])
         urban::opening::install();
         // Match scripts: forced HR / hit / strikeout / walk for chosen batters and pitchers (match_script.ini).
         urban::matchscript::install(runtime, runtime.memory().getRDRAM(), userDir);
+        // Scouting: finds a day, the wish list found at once, CPU clubs kept off protected players (scout_cheats.ini).
+        urban::scout::install(runtime, runtime.memory().getRDRAM(), userDir);
         ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)
         urban::hangdump::setRuntime(&runtime);
         urban::hangdump::installCrashReport();
