@@ -1,7 +1,10 @@
 #include "urban/player_cheats.h"
 #include "urban/change_log.h"
+#include "urban/function_hooks.h"
 #include "urban/save_identity.h"
 #include "urban/skill_table.h"
+#include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
@@ -181,6 +184,14 @@ namespace urban::players
             std::map<int, StatEdit> stats;
             bool operator==(const GroupApplied &) const = default;
         };
+        // A player queued for the camp's special practice through the game's own judgment (the camp hook below): type 0 a
+        // new pitch (param: the pitch kind), type 1 switch hitter. Kept in this save's settings until the camp's last step.
+        struct CampWish
+        {
+            uint16_t id = 0u;
+            int type = 0, param = 0;
+            std::string name;
+        };
         struct Settings
         {
             int team = -1; // the own team when these settings were first used (another team: another game's, not used)
@@ -201,6 +212,7 @@ namespace urban::players
             std::map<uint16_t, Pin> pins; // the picked players, by player ID, on any team
             std::map<uint16_t, PlayerEdit> edits; // players' locked abilities, by player ID (on top of items and pins)
             std::map<int, StatEdit> groupStats;   // locked abilities for the default target's players (kStats index)
+            std::vector<CampWish> camp;           // the camp queue (one wish a player), changed under g_mutex only
         };
         struct Row
         {
@@ -212,6 +224,7 @@ namespace urban::players
             std::array<uint16_t, kSkillSlots> skills{}; // the slots as the record has them now
             std::array<uint8_t, kBlockSize> block{};    // the ability block as it is now
             int position = 0;                           // the best position: 0 P, 1 C, 2 1B, 3 2B, 4 3B, 5 SS, 6 OF
+            int bats = 0;                               // record +0x39 bits 0-1: 0 right, 1 left, 2 both
             int value(int stat, int field = 2) const { return block[kStats[stat].offset - kBlock + static_cast<uint32_t>(field)]; }
         };
         using Slots = std::array<uint16_t, kSkillSlots>;
@@ -257,6 +270,27 @@ namespace urban::players
             int age = 0;
         };
         std::vector<OneShot> g_oneShots;
+        // Camp practice at once, for any number of players (owner 11-06: the camp's special practice takes 6): a new
+        // pitch into the first empty pitch slot, or the batting side. The batting side is record +0x39, bits 0-1 (0 right,
+        // 1 left, 2 both; own and CPU records alike, matched for all 480 players of the 11-06 camp save against their
+        // database records' u16 @0x2A >> 1). Pitch kinds as the game's list at 0x6157D0: 2 チェンジアップ ... 19 高速スライダー.
+        struct Practice
+        {
+            uint16_t id = 0u;
+            int pitch = 0; // > 0: the pitch kind to add, with value / limit / aptitude
+            int value = 50, limit = 99, apt = 2;
+            int bats = -1; // >= 0: the batting side to set
+            int age = 0;
+        };
+        std::vector<Practice> g_practices;
+        constexpr uint32_t kBats = 0x39u;
+        constexpr uint32_t kExpTable = 0x5D1320u; // u16 experience per ability value 0-100 (the game's data)
+        constexpr int kPitchKinds = 20;
+        constexpr const char *kPitchNames[kPitchKinds] = {"없음",    "직구",   "체인지업", "슬라이더", "슈트",      "커브",      "슬로 커브",
+                                                          "싱커",    "스크루", "포크",     "SFF",      "종슬라이더", "팜볼",      "너클",
+                                                          "컷볼",    "고속 슈트", "투심",   "서클 체인지업", "드롭 커브", "고속 슬라이더"};
+        constexpr const char *kBatsNames[3] = {"우타", "좌타", "양타 (스위치)"};
+        const char *pitchName(int kind) { return kind >= 0 && kind < kPitchKinds ? kPitchNames[kind] : "?"; }
         std::filesystem::file_time_type g_settingsTime{}; // player_cheats.ini as last read or written (under g_mutex)
         // The change log (under g_mutex): each read of the 12 rosters against the one before.
         urban::ChangeLog g_log;
@@ -506,6 +540,22 @@ namespace urban::players
                     settings.groupOn = value == "1";
                 else if (key == "ownonly")
                     settings.ownOnly = value != "0";
+                else if (key == "camp") // id,type,param,name
+                {
+                    std::istringstream fields(value);
+                    std::string field;
+                    int f[3] = {0, -1, 0};
+                    for (int k = 0; k < 3 && std::getline(fields, field, ','); ++k)
+                        f[k] = std::atoi(trim(field).c_str());
+                    CampWish wish;
+                    wish.id = static_cast<uint16_t>(std::clamp(f[0], 0, 0xFFFF));
+                    wish.type = f[1];
+                    wish.param = f[2];
+                    std::getline(fields, wish.name);
+                    if (wish.id != 0u && (wish.type == 1 || (wish.type == 0 && wish.param > 1 && wish.param < kPitchKinds)) &&
+                        std::none_of(settings.camp.begin(), settings.camp.end(), [&](const CampWish &w) { return w.id == wish.id; }))
+                        settings.camp.push_back(wish);
+                }
                 else if (key == "restore")
                     settings.restore = value != "0";
                 else if (key == "scope")
@@ -693,6 +743,8 @@ namespace urban::players
                  << "skills=" << skillText(settings.skills) << "\n"
                  << "restore=" << (settings.restore ? 1 : 0) << "\n"
                  << "ownonly=" << (settings.ownOnly ? 1 : 0) << "\n";
+            for (const CampWish &wish : settings.camp)
+                file << "camp=" << wish.id << "," << wish.type << "," << wish.param << "," << wish.name << "\n";
             for (const auto &[id, pin] : settings.pins)
             {
                 file << "pin=" << id << "," << (pin.on ? 1 : 0) << "," << keysOf(pin.mask) << "," << pin.name << "\n";
@@ -1082,6 +1134,290 @@ namespace urban::players
             g_seenLoads = loads;
         }
 
+        // The camp's special practice through the game's own judgment, for any number of players (owner 11-06: "더 찾아봐").
+        // Each camp step (sub_001E0948, from the calendar) packs the 6 places of the special-practice screen (camp+0xECC)
+        // into the camp record [camp+0xF18] (+0xC4 count, +0xC6 entries [roster slot][type][param][result]) and runs
+        // sub_00152E58; at the last step (+0xC2 == 5) that calls sub_001555F0, which rolls each place (slot > 0):
+        //   type 0 新球種: sub_00155D18(rec, slot, kind) is 0 when the roll wins (1 not eligible; 2, 3, 4 lost at a chance
+        //     of <= 10 %, <= 39 %, more), then sub_00155E58 writes the pitch (its value and aptitude rolled by the game);
+        //   type 1 スイッチ: sub_001565A8(rec, slot) is 0 when it wins (1 not a right-handed batter, 2 +0x10C < 55 or
+        //     +0x11D * 10 + +0x11E < 70, 3 the 80 % roll lost), then sub_00156690 sets +0x39 = 2 and lifts 3 batting values;
+        //   a win also calls sub_001410C8([rec+0x3104], 0x1C new pitch / 0x1D switch, slot, 0); result +0xC9 = 0.
+        // The chance (sub_00156820) comes from the player, the pitch and the coach, not from the number of players. The hook
+        // lets the game roll its own places first, then rolls the queued players with the same calls, one at a time (also
+        // roster slot 0, which sub_001555F0 skips).
+        constexpr uint32_t kCampProcess = 0x1555F0u, kCampPitchRoll = 0x155D18u, kCampPitchApply = 0x155E58u;
+        constexpr uint32_t kCampSwitchRoll = 0x1565A8u, kCampSwitchApply = 0x156690u, kCampBonus = 0x1410C8u;
+        constexpr uint32_t kCampCount = 0xC4u, kCampEntries = 0xC6u, kCampStep = 0xC2u, kCampBonusTarget = 0x3104u;
+        constexpr uint32_t kCampManager = 0x5DBF58u, kCampRecord = 0xF18u;
+        constexpr uint32_t kPitchSlots = 0xA2u; // own records: 10 pitch entries [kind][aptitude][value][limit][u16 exp]
+        GuestFunction g_campProcess = nullptr, g_campPitchRoll = nullptr, g_campPitchApply = nullptr;
+        GuestFunction g_campSwitchRoll = nullptr, g_campSwitchApply = nullptr, g_campBonus = nullptr;
+
+        std::string campWhat(int type, int param)
+        {
+            if (type == 0)
+                return std::string("새 구종 ") + pitchName(param);
+            return type == 1 ? "스위치 타자 전향" : type == 2 ? "컨버트" : "?";
+        }
+
+        // The EE scheduler may leave a game function at any call inside it (an EE safe point) and finish it later from its
+        // dispatcher, so the hook does not call the game and go on in C++ afterwards: it queues the calls as guest
+        // invocations of the current thread, as the runtime's HLE calls do, each one's completion queuing the next one
+        // (EeScheduler::invokeCurrent), and the hooked call returns to the game once they are all done.
+        PS2Runtime *g_campRuntime = nullptr;
+        struct CampJob
+        {
+            uint16_t id = 0u;
+            int slot = -1, type = 0, param = 0;
+            uint32_t record = 0u;
+            std::string name;
+        };
+        struct CampRun
+        {
+            uint32_t rec = 0u;
+            R5900Context base{};
+            std::vector<CampJob> jobs;
+            size_t next = 0u;
+            std::vector<std::string> lines;
+            std::set<uint16_t> done;
+        };
+        CampRun g_campRun;          // EE thread only
+        bool g_campRunning = false; // EE thread only: while set, the hook lets the game's processor through as it is
+
+        // The own team's roster (its class): the game's camp functions find a roster slot's player there.
+        uint32_t ownRoster()
+        {
+            for (int t = 0; t < kTeams; ++t)
+            {
+                const uint32_t object = read32(kTeamTable + 4u * static_cast<uint32_t>(t));
+                if (!valid(object, kTeamRoster + 4u))
+                    continue;
+                const uint32_t roster = read32(object + kTeamRoster);
+                if (valid(roster, kRosterPlayers + 4u * kSlots) && read32(roster + kRosterClass) == kOwnTeamClass)
+                    return roster;
+            }
+            return 0u;
+        }
+
+        uint32_t campRecordAt(uint32_t roster, int slot)
+        {
+            if (roster == 0u || slot < 0 || slot >= kSlots)
+                return 0u;
+            const uint32_t record = read32(roster + kRosterPlayers + 4u * static_cast<uint32_t>(slot));
+            return valid(record, kRecordSize) && read16(record) != 0u ? record : 0u;
+        }
+
+        std::string campBats(uint32_t record)
+        {
+            return kBatsNames[std::min(g_rdram[record + kBats] & 3u, 2u)];
+        }
+
+        // A 32-bit value into a register as the EE keeps it (sign-extended to 64 bits).
+        void campReg(R5900Context &context, int reg, uint32_t value)
+        {
+            context.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(value)));
+        }
+
+        // A game function as an invocation from the hooked call's context: a0-a2 in; `then` gets its context at the end.
+        GuestInvocation campCall(uint32_t function, uint32_t a0, uint32_t a1, uint32_t a2, void (*then)(const R5900Context &))
+        {
+            GuestInvocation call{};
+            call.kind = GuestInvocationKind::HleCall;
+            call.context = g_campRun.base;
+            call.context.pc = function;
+            campReg(call.context, 4, a0);
+            campReg(call.context, 5, a1);
+            campReg(call.context, 6, a2);
+            campReg(call.context, 7, 0u);
+            campReg(call.context, 29, 0u); // the scheduler's invocation stack
+            campReg(call.context, 31, 0u); // back to the dispatcher
+            call.onComplete = [then](const R5900Context &done, R5900Context &) { then(done); };
+            return call;
+        }
+
+        // All done: the change log, and the tried players out of the queue.
+        void campFinish()
+        {
+            g_campRunning = false;
+            const std::vector<std::string> lines = std::move(g_campRun.lines);
+            const std::set<uint16_t> done = std::move(g_campRun.done);
+            g_campRun = CampRun{};
+            for (const std::string &line : lines)
+                std::fprintf(stderr, "[players] %s\n", line.c_str());
+            Settings copy;
+            bool save = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for (const std::string &line : lines)
+                    g_log.add(line, "players");
+                if (!done.empty())
+                {
+                    std::vector<CampWish> &camp = g_settings.camp;
+                    camp.erase(std::remove_if(camp.begin(), camp.end(), [&](const CampWish &w) { return done.count(w.id) != 0u; }), camp.end());
+                    copy = g_settings;
+                    save = true;
+                }
+            }
+            if (save)
+                saveSettings(copy);
+        }
+
+        void campNext();
+
+        void campBonusDone(const R5900Context &)
+        {
+            const CampJob &job = g_campRun.jobs[g_campRun.next];
+            std::string got = " · " + campWhat(job.type, job.param) + " (메모리에서 못 찾음)";
+            if (job.type == 0)
+            {
+                for (int s = 0; s < 10; ++s)
+                {
+                    const uint32_t entry = job.record + kPitchSlots + 6u * static_cast<uint32_t>(s);
+                    if (g_rdram[entry] == job.param)
+                        got = " · 변화구 " + std::to_string(s + 1) + " = " + pitchName(g_rdram[entry]) + " " + std::to_string(g_rdram[entry + 2u]) + " (상한 " +
+                              std::to_string(g_rdram[entry + 3u]) + ", 득의도 " + std::to_string(g_rdram[entry + 1u]) + ") — 메모리에서 다시 읽은 값";
+                }
+            }
+            else
+                got = " · 타석 → " + campBats(job.record) + " — 메모리에서 다시 읽은 값";
+            g_campRun.lines.push_back("캠프 판정 성공: " + job.name + got);
+            g_campRun.done.insert(job.id);
+            ++g_campRun.next;
+            campNext();
+        }
+
+        void campApplied(const R5900Context &)
+        {
+            const CampJob &job = g_campRun.jobs[g_campRun.next];
+            g_campRuntime->eeScheduler().invokeCurrent(campCall(kCampBonus, read32(g_campRun.rec + kCampBonusTarget), job.type == 0 ? 0x1Cu : 0x1Du,
+                                                                static_cast<uint32_t>(job.slot), &campBonusDone));
+        }
+
+        void campRolled(const R5900Context &done)
+        {
+            const uint32_t code = getRegU32(&done, 2);
+            const CampJob &job = g_campRun.jobs[g_campRun.next];
+            if (code == 0u) // won: the game writes it
+                g_campRuntime->eeScheduler().invokeCurrent(campCall(job.type == 0 ? kCampPitchApply : kCampSwitchApply, g_campRun.rec,
+                                                                    static_cast<uint32_t>(job.slot), static_cast<uint32_t>(job.param), &campApplied));
+            std::string why;
+            if (job.type == 0)
+                why = code == 1u ? " (게임 조건상 대상이 아님)" : code == 2u ? " (성공 확률 10% 이하)" : code == 3u ? " (성공 확률 10~39%)" : " (성공 확률 40% 이상이었지만 실패)";
+            else
+                why = code == 1u ? " (우타자만 전향 가능 — 지금 " + campBats(job.record) + ")" : code == 2u ? std::string(" (게임 기준 능력 미달)") : std::string(" (80% 판정에서 실패)");
+            g_campRun.lines.push_back("캠프 판정 실패: " + job.name + " · " + campWhat(job.type, job.param) + why);
+            g_campRun.done.insert(job.id);
+            ++g_campRun.next;
+            campNext();
+        }
+
+        // The next queued player's roll, or the end.
+        void campNext()
+        {
+            if (g_campRun.next >= g_campRun.jobs.size())
+            {
+                campFinish();
+                return;
+            }
+            const CampJob &job = g_campRun.jobs[g_campRun.next];
+            g_campRuntime->eeScheduler().invokeCurrent(campCall(job.type == 0 ? kCampPitchRoll : kCampSwitchRoll, g_campRun.rec, static_cast<uint32_t>(job.slot),
+                                                                static_cast<uint32_t>(job.param), &campRolled));
+        }
+
+        // The game's own places are done: their results first, then the queue.
+        void campGameDone(const R5900Context &)
+        {
+            const uint32_t rec = g_campRun.rec, roster = ownRoster();
+            std::vector<std::string> game;
+            const int count = std::clamp<int>(static_cast<int16_t>(read16(rec + kCampCount)), 0, 6);
+            for (int i = 0; i < count; ++i)
+            {
+                const uint32_t entry = rec + kCampEntries + 4u * static_cast<uint32_t>(i);
+                const int slot = static_cast<int8_t>(g_rdram[entry]);
+                if (const uint32_t record = campRecordAt(roster, slot); record != 0u)
+                    game.push_back("캠프 특수 연습 (게임 6칸): " + nameOf(record) + " · " + campWhat(g_rdram[entry + 1u], g_rdram[entry + 2u]) +
+                                   (slot == 0 ? " — 게임이 로스터 0번 선수는 판정하지 않음" : g_rdram[entry + 3u] == 0u ? " 성공" : " 실패"));
+            }
+            g_campRun.lines.insert(g_campRun.lines.begin(), game.begin(), game.end());
+            campNext();
+        }
+
+        void campHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (g_campRunning) // the camp run's own call of the game's processor
+            {
+                g_campProcess(rdram, ctx, runtime);
+                return;
+            }
+            const uint32_t rec = getRegU32(ctx, 4);
+            std::vector<CampWish> wishes;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (g_team >= 0 && !g_teamMismatch && !g_settingsPath.empty())
+                    wishes = g_settings.camp;
+            }
+            const uint32_t roster = ownRoster();
+            if (wishes.empty() || roster == 0u || !valid(rec, kCampBonusTarget + 4u))
+            {
+                g_campProcess(rdram, ctx, runtime); // as always: the game's own places only
+                return;
+            }
+            CampRun run;
+            run.rec = rec;
+            run.base = *ctx;
+            std::set<uint16_t> inGame; // the game's own places
+            const int count = std::clamp<int>(static_cast<int16_t>(read16(rec + kCampCount)), 0, 6);
+            for (int i = 0; i < count; ++i)
+                if (const uint32_t record = campRecordAt(roster, static_cast<int8_t>(g_rdram[rec + kCampEntries + 4u * static_cast<uint32_t>(i)])); record != 0u)
+                    inGame.insert(read16(record));
+            for (const CampWish &wish : wishes)
+            {
+                CampJob job;
+                job.id = wish.id;
+                job.type = wish.type;
+                job.param = wish.param;
+                for (int k = 0; k < kSlots && job.slot < 0; ++k)
+                    if (const uint32_t at = campRecordAt(roster, k); at != 0u && read16(at) == wish.id)
+                    {
+                        job.slot = k;
+                        job.record = at;
+                    }
+                job.name = job.record != 0u ? nameOf(job.record) : wish.name.empty() ? "선수 " + std::to_string(wish.id) : wish.name;
+                const std::string what = campWhat(wish.type, wish.param);
+                std::string skip;
+                if (job.record == 0u)
+                    skip = "캠프 판정 못함: " + job.name + " · " + what + " (내 구단 로스터에 없음)";
+                else if (inGame.count(wish.id) != 0u)
+                    skip = "캠프 판정 건너뜀: " + job.name + " · " + what + " (게임 6칸에서 이미 판정함)";
+                else if (wish.type == 0)
+                {
+                    int empty = -1;
+                    bool has = false;
+                    for (int k = 0; k < 10; ++k)
+                    {
+                        const int kind = g_rdram[job.record + kPitchSlots + 6u * static_cast<uint32_t>(k)];
+                        has = has || kind == wish.param;
+                        if (empty < 0 && kind == 0)
+                            empty = k;
+                    }
+                    if (has || empty < 0)
+                        skip = "캠프 판정 안 함: " + job.name + " · " + what + (has ? " (이미 던지는 구종)" : " (변화구 칸 10개가 다 참)");
+                }
+                if (!skip.empty())
+                {
+                    run.lines.push_back(skip);
+                    run.done.insert(wish.id);
+                }
+                else
+                    run.jobs.push_back(job);
+            }
+            g_campRun = std::move(run);
+            g_campRunning = true;
+            ctx->pc = getRegU32(ctx, 31); // the hooked call returns to the game once the invocations are done
+            runtime->eeScheduler().invokeCurrent(campCall(kCampProcess, rec, 0u, 0u, &campGameDone)); // the game's own places first
+        }
+
         // EE thread, at every vblank after the .pnach patches: find the 12 rosters (the own team by its class) and write
         // the chosen items and skills into the targeted players.
         // Another save (urban::saveid): its own settings file, cheat_saves/<id>/player_cheats.ini. g_mutex held.
@@ -1174,9 +1510,11 @@ namespace urban::players
                 g_teamMismatch = g_settings.team != team;
             }
             const bool apply = team >= 0 && g_settings.enabled && !g_teamMismatch && !g_settingsPath.empty();
-            if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty() && g_lockBackups.empty() && g_oneShots.empty())
+            if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty() && g_lockBackups.empty() && g_oneShots.empty() &&
+                g_practices.empty())
                 return;
             std::map<uint16_t, uint32_t> blocks; // where the one-time edits go (only while there are some)
+            std::map<uint16_t, std::pair<uint32_t, uint32_t>> places; // record and ability block, for the camp practice
             for (int t = 0; t < kTeams; ++t)
             {
                 if (rosters[t] == 0u)
@@ -1214,10 +1552,13 @@ namespace urban::players
                                     best = stat;
                             row.position = best - sPosP;
                         }
+                        row.bats = g_rdram[record + kBats] & 3u;
                         g_rows[static_cast<size_t>(t)].push_back(std::move(row));
                     }
                     if (!g_oneShots.empty())
                         blocks[id] = block;
+                    if (!g_practices.empty())
+                        places[id] = {record, block};
                     uint32_t mask = 0u;
                     const std::vector<uint16_t> *skills = nullptr;
                     const std::array<int, kSkillSlots> *slots = nullptr;
@@ -1283,6 +1624,127 @@ namespace urban::players
                               std::to_string(g_rdram[entry + 3u]) + ", 득의도 " + std::to_string(g_rdram[entry + 1u]) + ") — 메모리에서 다시 읽은 값",
                           "players");
                 it = g_oneShots.erase(it);
+            }
+            // Tests: URBAN_TEST_PRACTICE="<id>,<pitch>,<value>,<limit>,<apt>,<bats>;..." queued once a game runs.
+            static bool testQueued = false;
+            if (!testQueued && team >= 0)
+            {
+                testQueued = true;
+                if (const char *test = std::getenv("URBAN_TEST_PRACTICE"); test && *test)
+                {
+                    std::istringstream items(test);
+                    std::string item;
+                    while (std::getline(items, item, ';'))
+                    {
+                        int f[6] = {0, 0, 50, 99, 2, -1};
+                        std::istringstream fields(item);
+                        std::string field;
+                        for (int k = 0; k < 6 && std::getline(fields, field, ','); ++k)
+                            f[k] = std::atoi(field.c_str());
+                        if (f[0] > 0)
+                            g_practices.push_back(Practice{static_cast<uint16_t>(f[0]), f[1], f[2], f[3], f[4], f[5], 0});
+                    }
+                }
+            }
+            // Tests: URBAN_TEST_CAMP_STEP=<n>: once the camp has run its first step (its start sets the step to 0), the camp
+            // record's step jumps to n, so that the next step is the one that rolls the special practice.
+            static bool testStepDone = false;
+            if (const char *step = testStepDone ? nullptr : std::getenv("URBAN_TEST_CAMP_STEP"); step && *step)
+            {
+                const uint32_t camp = read32(kCampManager);
+                const uint32_t rec = valid(camp, kCampRecord + 4u) ? read32(camp + kCampRecord) : 0u;
+                const int now = valid(rec, kCampBonusTarget + 4u) ? static_cast<int16_t>(read16(rec + kCampStep)) : -1;
+                if (now >= 1 && now < std::atoi(step))
+                {
+                    testStepDone = true;
+                    const uint16_t value = static_cast<uint16_t>(std::atoi(step));
+                    std::memcpy(g_rdram + rec + kCampStep, &value, sizeof(value));
+                    std::fprintf(stderr, "[players] test: camp step %d -> %u\n", now, value);
+                }
+            }
+            // Tests: URBAN_TEST_CAMP="<id>,<type>,<param>;..." put in the camp queue once this save's settings are open.
+            static bool testCampQueued = false;
+            if (!testCampQueued && team >= 0 && !g_settingsPath.empty())
+            {
+                testCampQueued = true;
+                if (const char *test = std::getenv("URBAN_TEST_CAMP"); test && *test)
+                {
+                    std::istringstream items(test);
+                    std::string item;
+                    while (std::getline(items, item, ';'))
+                    {
+                        int f[3] = {0, 0, 0};
+                        std::istringstream fields(item);
+                        std::string field;
+                        for (int k = 0; k < 3 && std::getline(fields, field, ','); ++k)
+                            f[k] = std::atoi(field.c_str());
+                        const uint16_t id = static_cast<uint16_t>(std::clamp(f[0], 0, 0xFFFF));
+                        if (id == 0u)
+                            continue;
+                        std::vector<CampWish> &camp = g_settings.camp;
+                        camp.erase(std::remove_if(camp.begin(), camp.end(), [id](const CampWish &w) { return w.id == id; }), camp.end());
+                        camp.push_back(CampWish{id, f[1], f[2], nameOfId(id)});
+                    }
+                    saveSettings(g_settings);
+                    std::fprintf(stderr, "[players] test: camp queue %zu\n", g_settings.camp.size());
+                }
+            }
+            // Camp practice (특훈): written once where the player is now; dropped after ~10 s unfound.
+            for (auto it = g_practices.begin(); it != g_practices.end();)
+            {
+                const auto at = places.find(it->id);
+                if (at == places.end())
+                {
+                    if (++it->age > 600)
+                    {
+                        g_log.add("특훈 못함: " + nameOfId(it->id) + " (10초 동안 로스터에서 못 찾음)", "players");
+                        it = g_practices.erase(it);
+                    }
+                    else
+                        ++it;
+                    continue;
+                }
+                const uint32_t record = at->second.first, block = at->second.second;
+                const std::string name = nameOfId(it->id);
+                if (it->pitch > 1 && it->pitch < kPitchKinds)
+                {
+                    static const int firstPitch = statIndex("pitch1");
+                    int slot = -1;
+                    bool has = false;
+                    for (int s = 0; s < 10 && firstPitch >= 0; ++s)
+                    {
+                        const uint32_t entry = block + kStats[firstPitch + s].offset - kBlock;
+                        has = has || g_rdram[entry] == it->pitch;
+                        if (slot < 0 && g_rdram[entry] == 0u)
+                            slot = s;
+                    }
+                    if (has)
+                        g_log.add("새 구종 안 넣음: " + name + "은(는) 이미 " + pitchName(it->pitch) + "을(를) 던짐", "players");
+                    else if (slot < 0)
+                        g_log.add("새 구종 안 넣음: " + name + "의 변화구 칸 10개가 다 참", "players");
+                    else
+                    {
+                        const uint32_t entry = block + kStats[firstPitch + slot].offset - kBlock;
+                        g_rdram[entry] = static_cast<uint8_t>(it->pitch);
+                        g_rdram[entry + 1u] = static_cast<uint8_t>(std::clamp(it->apt, 0, 4));
+                        g_rdram[entry + 2u] = static_cast<uint8_t>(std::clamp(it->value, 1, 255));
+                        g_rdram[entry + 3u] = static_cast<uint8_t>(std::clamp(std::max(it->limit, it->value), 1, 255));
+                        // The experience that goes with the value: the game's table at 0x5D1320 (u16 per value 0-100;
+                        // the own players' abilities all sit in [table[v], table[v + 1])). Without it the game shows D.
+                        const uint16_t exp = read16(kExpTable + 2u * static_cast<uint32_t>(std::min<int>(g_rdram[entry + 2u], 100)));
+                        g_rdram[entry + 4u] = static_cast<uint8_t>(exp);
+                        g_rdram[entry + 5u] = static_cast<uint8_t>(exp >> 8);
+                        g_log.add("새 구종: " + name + " · 변화구 " + std::to_string(slot + 1) + " = " + pitchName(g_rdram[entry]) + " " +
+                                      std::to_string(g_rdram[entry + 2u]) + " (상한 " + std::to_string(g_rdram[entry + 3u]) + ") — 메모리에서 다시 읽은 값",
+                                  "players");
+                    }
+                }
+                if (it->bats >= 0 && it->bats <= 2)
+                {
+                    g_rdram[record + kBats] = static_cast<uint8_t>((g_rdram[record + kBats] & ~3u) | static_cast<unsigned>(it->bats));
+                    g_log.add("타석: " + name + " → " + kBatsNames[g_rdram[record + kBats] & 3u] + " — 메모리에서 다시 읽은 값", "players");
+                }
+                it = g_practices.erase(it);
             }
             if (rebuild)
                 logRosterChanges(team, manual);
@@ -1704,10 +2166,12 @@ namespace urban::players
                 if (lock)
                     ui->table_row_color(kLockedRow);
                 ui->table_next_column();
+                // A pitch row says which pitch it is (the game's list: 2 체인지업 ... 19 고속 슬라이더).
+                const std::string label = group == kPitches ? std::string(kStats[stat].label) + " · " + pitchName(row.value(stat, 0)) : kStats[stat].label;
                 if (draftChanged(draft, row, stat))
-                    ui->text_colored(kChangedText, kStats[stat].label);
+                    ui->text_colored(kChangedText, label.c_str());
                 else
-                    ui->text(kStats[stat].label);
+                    ui->text(label.c_str());
                 if (group == kPitches)
                 {
                     char kind[48];
@@ -1892,6 +2356,152 @@ namespace urban::players
             }
         }
 
+        // 특훈: the camp's special practice done at once for any number of players (a new pitch for pitchers, the batting
+        // side for anyone), written once (적용) by the frame hook where the players are now.
+        int g_practicePitch = 17; // index in the choices below (고속 슬라이더)
+        int g_practiceValue = 50, g_practiceLimit = 99, g_practiceApt = 2, g_practiceBats = 2;
+        // The camp queue changes at once under g_mutex (the camp hook takes the tried players out on the EE thread).
+        template <typename Edit>
+        void editCamp(Edit edit)
+        {
+            Settings copy;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (g_settingsPath.empty())
+                    return;
+                edit(g_settings.camp);
+                copy = g_settings;
+            }
+            saveSettings(copy);
+        }
+
+        // Own players only; one wish a player (a new one replaces it). Switch: right-handed batters only (the game's rule).
+        void queueCamp(const std::vector<const Row *> &targets, int type, int param)
+        {
+            editCamp([&](std::vector<CampWish> &camp) {
+                int added = 0, other = 0, notRight = 0;
+                for (const Row *row : targets)
+                {
+                    if (type == 0 && !row->pitcher)
+                        continue;
+                    if (row->team != g_team)
+                    {
+                        ++other;
+                        continue;
+                    }
+                    if (type == 1 && row->bats != 0)
+                    {
+                        ++notRight;
+                        continue;
+                    }
+                    camp.erase(std::remove_if(camp.begin(), camp.end(), [row](const CampWish &w) { return w.id == row->id; }), camp.end());
+                    camp.push_back(CampWish{row->id, type, param, row->name});
+                    ++added;
+                }
+                std::string line = "캠프 판정 대기에 넣음: " + std::to_string(added) + "명 · " + campWhat(type, param);
+                if (other > 0)
+                    line += " (내 구단이 아닌 " + std::to_string(other) + "명 뺌)";
+                if (notRight > 0)
+                    line += " (우타자가 아닌 " + std::to_string(notRight) + "명 뺌: 게임은 우타자만 전향)";
+                g_log.add(line, "players");
+            });
+        }
+
+        void drawPractice(const Pcsx2GsUi *ui, const std::vector<const Row *> &targets, const std::vector<CampWish> &queue)
+        {
+            static const int firstPitch = statIndex("pitch1");
+            int pitchers = 0;
+            for (const Row *row : targets)
+                pitchers += row->pitcher ? 1 : 0;
+            ui->text_disabled("캠프 특수 연습(새 구종 습득·스위치 전향)을 인원 제한 없이 바로 적용합니다. 게임의 성공·실패 판정은 거치지 않습니다.");
+            ui->separator_text(("새 구종 추가 (투수 " + std::to_string(pitchers) + "명)").c_str());
+            if (targets.size() == 1u && targets[0]->pitcher && firstPitch >= 0)
+            {
+                std::string have;
+                for (int s = 0; s < 10; ++s)
+                    if (const int kind = targets[0]->value(firstPitch + s, 0); kind != 0)
+                        have += std::string(have.empty() ? "" : ", ") + pitchName(kind);
+                ui->text_disabled(("지금 던지는 변화구: " + (have.empty() ? std::string("없음") : have)).c_str());
+            }
+            const char *choices[kPitchKinds - 2];
+            for (int k = 2; k < kPitchKinds; ++k)
+                choices[k - 2] = kPitchNames[k];
+            ui->set_next_width(150.0f);
+            ui->combo("##ppitch", &g_practicePitch, choices, kPitchKinds - 2);
+            ui->same_line();
+            ui->text("값");
+            ui->same_line();
+            ui->set_next_width(56.0f);
+            if (ui->input_int("##pvalue", &g_practiceValue, 0))
+                g_practiceValue = std::clamp(g_practiceValue, 1, 255);
+            ui->same_line();
+            ui->text("상한");
+            ui->same_line();
+            ui->set_next_width(56.0f);
+            if (ui->input_int("##plimit", &g_practiceLimit, 0))
+                g_practiceLimit = std::clamp(g_practiceLimit, 1, 255);
+            ui->same_line();
+            ui->text("득의도");
+            ui->same_line();
+            ui->set_next_width(50.0f);
+            ui->combo("##papt", &g_practiceApt, kAptitudes, 5);
+            ui->same_line();
+            ui->begin_disabled(pitchers == 0 ? 1 : 0);
+            if (ui->button(targets.size() == 1u ? "새 구종 적용" : "고른 투수 모두에게 적용"))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for (const Row *row : targets)
+                    if (row->pitcher)
+                        g_practices.push_back(Practice{row->id, g_practicePitch + 2, g_practiceValue, g_practiceLimit, g_practiceApt, -1, 0});
+            }
+            ui->end_disabled();
+            ui->tooltip("빈 변화구 칸(10개 중)에 넣습니다. 이미 던지는 구종이거나 칸이 다 찼으면 넣지 않고 '최근 변화'에 남깁니다.");
+            ui->separator_text("타석 바꾸기 (스위치 타자 전향)");
+            if (targets.size() == 1u)
+                ui->text_disabled((std::string("지금: ") + kBatsNames[std::clamp(targets[0]->bats, 0, 2)]).c_str());
+            ui->set_next_width(150.0f);
+            ui->combo("##pbats", &g_practiceBats, kBatsNames, 3);
+            ui->same_line();
+            if (ui->button(targets.size() == 1u ? "타석 적용" : "고른 선수 모두에게 적용##bats"))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for (const Row *row : targets)
+                    g_practices.push_back(Practice{row->id, 0, 0, 0, 0, g_practiceBats, 0});
+            }
+            ui->tooltip("투수도 타석이 있습니다. 결과는 위 '최근 변화'에 메모리에서 다시 읽은 값으로 남습니다.");
+            ui->separator_text("캠프에서 게임 판정으로 (6명 제한 없이)");
+            ui->text_disabled("캠프 특수 연습 결과가 나올 때(캠프 마지막 단계) 게임의 6칸을 먼저 판정한 뒤, 이 대기열 선수도 게임의 성공·실패 판정을 그대로 거칩니다.");
+            ui->text_disabled("새 구종의 값·상한·득의도는 게임이 정합니다 (위 칸의 값은 안 씀). 결과는 '최근 변화'에 남고, 판정한 선수는 대기열에서 빠집니다.");
+            ui->begin_disabled(pitchers == 0 ? 1 : 0);
+            if (ui->button(("새 구종 '" + std::string(kPitchNames[g_practicePitch + 2]) + "' 캠프 판정 대기에 넣기").c_str()))
+                queueCamp(targets, 0, g_practicePitch + 2);
+            ui->end_disabled();
+            ui->tooltip("고른 선수 중 내 구단 투수만 넣습니다. 구종은 위 '새 구종 추가'에서 고른 것. 한 선수는 하나만: 다시 넣으면 바뀝니다.");
+            ui->same_line();
+            if (ui->button("스위치 전향 캠프 판정 대기에 넣기"))
+                queueCamp(targets, 1, 0);
+            ui->tooltip("게임 기준: 우타자만, 능력 조건(게임이 정한 값)을 채우면 80% 확률. 조건이 안 되면 실패로 남습니다.");
+            if (queue.empty())
+                ui->text_disabled("캠프 판정 대기열: 비어 있음");
+            else
+            {
+                ui->text(("캠프 판정 대기열 " + std::to_string(queue.size()) + "명").c_str());
+                for (const CampWish &wish : queue)
+                {
+                    ui->push_id(static_cast<int>(wish.id));
+                    if (ui->small_button("빼기"))
+                        editCamp([id = wish.id](std::vector<CampWish> &camp) {
+                            camp.erase(std::remove_if(camp.begin(), camp.end(), [id](const CampWish &w) { return w.id == id; }), camp.end());
+                        });
+                    ui->pop_id();
+                    ui->same_line();
+                    ui->text(((wish.name.empty() ? "선수 " + std::to_string(wish.id) : wish.name) + " · " + campWhat(wish.type, wish.param)).c_str());
+                }
+                if (ui->button("대기열 모두 빼기"))
+                    editCamp([](std::vector<CampWish> &camp) { camp.clear(); });
+            }
+        }
+
         void drawPlayerCard(const Pcsx2GsUi *ui, Settings &settings, const Row &row, int own, bool &changed)
         {
             resetDrafts(row.id);
@@ -2000,6 +2610,11 @@ namespace urban::players
             if (ui->begin_tab("S+ 항목 · 스킬"))
             {
                 drawPinTab(ui, settings, row, own, false, changed);
+                ui->end_tab();
+            }
+            if (ui->begin_tab("특훈 (구종·타석)"))
+            {
+                drawPractice(ui, {&row}, settings.camp);
                 ui->end_tab();
             }
             if (ui->begin_tab("스킬 슬롯"))
@@ -2215,6 +2830,11 @@ namespace urban::players
                         changed = true;
                     }
                 }
+                ui->end_tab();
+            }
+            if (ui->begin_tab("특훈 (구종·타석)"))
+            {
+                drawPractice(ui, targets, settings.camp);
                 ui->end_tab();
             }
             ui->end_tab_bar();
@@ -2757,7 +3377,7 @@ namespace urban::players
                 mismatch = g_teamMismatch;
                 hasProfile = !g_settingsPath.empty();
             }
-            bool changed = false;
+            bool changed = false, freshGame = false;
             // Which save these settings belong to (urban::saveid): each save has its own.
             ui->text_disabled(("세이브: " + urban::saveid::describe(urban::saveid::current()) + " · 아래 설정은 이 세이브에만 저장되고 적용됩니다").c_str());
             if (!hasProfile)
@@ -2774,6 +3394,7 @@ namespace urban::players
                     fresh.team = team;
                     settings = fresh;
                     changed = true;
+                    freshGame = true;
                 }
             }
             size_t players = 0;
@@ -2850,6 +3471,8 @@ namespace urban::players
             {
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
+                    if (!freshGame)
+                        settings.camp = g_settings.camp; // changed only under the lock (the camp hook takes players out)
                     g_settings = settings;
                 }
                 saveSettings(settings);
@@ -2883,5 +3506,28 @@ namespace urban::players
 #endif
         if (!g_safeMode && !g_items.empty())
             ps2x::pnach::addFrameHook(frame);
+    }
+
+    void installCamp(PS2Runtime &runtime)
+    {
+        if (!g_rdram || g_safeMode || g_items.empty())
+            return;
+        for (const uint32_t address : {kCampProcess, kCampPitchRoll, kCampPitchApply, kCampSwitchRoll, kCampSwitchApply, kCampBonus})
+            if (!runtime.hasFunction(address))
+            {
+                std::fprintf(stderr, "[players] camp hook: no function at 0x%X\n", address);
+                return;
+            }
+        g_campPitchRoll = runtime.lookupFunction(kCampPitchRoll);
+        g_campPitchApply = runtime.lookupFunction(kCampPitchApply);
+        g_campSwitchRoll = runtime.lookupFunction(kCampSwitchRoll);
+        g_campSwitchApply = runtime.lookupFunction(kCampSwitchApply);
+        g_campBonus = runtime.lookupFunction(kCampBonus);
+        g_campRuntime = &runtime;
+        FunctionHooks &hooks = FunctionHooks::instance();
+        hooks.replace(kCampProcess, "camp_special_practice", &campHook, ReplacementStatus::Native, "player cheats: camp queue");
+        g_campProcess = hooks.original(kCampProcess);
+        if (!g_campProcess || !g_campPitchRoll || !g_campPitchApply || !g_campSwitchRoll || !g_campSwitchApply || !g_campBonus)
+            std::fprintf(stderr, "[players] camp hook not installed\n");
     }
 }

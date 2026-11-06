@@ -1484,6 +1484,8 @@ int main(int argc, char *argv[])
         urban::matchscript::install(runtime, runtime.memory().getRDRAM(), userDir);
         // Which save the game plays (the cheats keep their settings per save, cheat_saves/<id>/); a hook, so after attach.
         urban::saveid::install(runtime, runtime.memory().getRDRAM(), userDir);
+        // The camp's special practice for any number of players, through the game's own rolls (player cheats' camp queue).
+        urban::players::installCamp(runtime);
         // Scouting: finds a day, the wish list found at once, CPU clubs kept off protected players (scout_cheats.ini).
         urban::scout::install(runtime, runtime.memory().getRDRAM(), userDir);
         ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)

@@ -11,7 +11,11 @@
 // items and skills, found by their player ID wherever they are. Items taken off get the bytes they overwrote back (restore=1,
 // kept from this run's first write). Chosen skills are added to the player's own; taken off
 // again, the slots go back to what they held in this run. Settings: player_cheats.ini in the user folder (written by the tab).
+class PS2Runtime;
+
 namespace urban::players
 {
     void install(uint8_t *rdram, const std::filesystem::path &userDir, const std::filesystem::path &exeDir);
+    // The camp queue (special practice through the game's own judgment, beyond its 6 places): a hook, so after attach.
+    void installCamp(PS2Runtime &runtime);
 }
