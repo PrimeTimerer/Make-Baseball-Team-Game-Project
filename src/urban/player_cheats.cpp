@@ -1,8 +1,11 @@
 #include "urban/player_cheats.h"
+#include "urban/change_log.h"
+#include "urban/save_identity.h"
 #include "urban/skill_table.h"
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
+#include "runtime/ps2_save_state.h"
 
 #if __has_include("pcsx2gs_api.h")
 #include "pcsx2gs_api.h"
@@ -21,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cctype>
 #include <cstdio>
@@ -147,12 +151,18 @@ namespace urban::players
         };
         struct Pin
         {
-            bool on = true;
+            bool on = true; // locked: the applied items, skills and slots are written at every frame
+            // What the menu edits (a draft: nothing is written before 적용 및 고정, owner 11-06) ...
             uint32_t mask = 0u;
             std::vector<uint16_t> skills;
             // Slot by slot (the 8 skill slots): -1 as it is, 0 empty, else that skill; written after the added skills.
             std::array<int, kSkillSlots> slots{-1, -1, -1, -1, -1, -1, -1, -1};
+            // ... and what 적용 및 고정 took from it, which the frame hook writes.
+            uint32_t appliedMask = 0u;
+            std::vector<uint16_t> appliedSkills;
+            std::array<int, kSkillSlots> appliedSlots{-1, -1, -1, -1, -1, -1, -1, -1};
             std::string name;
+            bool pending() const { return mask != appliedMask || skills != appliedSkills || slots != appliedSlots; }
         };
         enum Scope
         {
@@ -160,11 +170,30 @@ namespace urban::players
             kScopeTeams = 1, // the players of the chosen teams
             kScopeAll = 2    // every team's players
         };
+        // The default target's settings as 단체 적용 및 고정 took them (the menu edits a draft of them in Settings).
+        struct GroupApplied
+        {
+            bool all = true;
+            int scope = kScopeOwn;
+            uint32_t teams = kOwnBit;
+            uint32_t mask = 0u;
+            std::vector<uint16_t> skills;
+            std::map<int, StatEdit> stats;
+            bool operator==(const GroupApplied &) const = default;
+        };
         struct Settings
         {
+            int team = -1; // the own team when these settings were first used (another team: another game's, not used)
+            GroupApplied applied;
             bool enabled = false;
             bool restore = true; // an item taken off gets the player's own bytes back (kept from this run's first write)
+            // A player's own locks and items (고정, 따로 정한 선수) only while he is on the own team: one traded or
+            // released to a CPU club is left alone (owner, 11-06). Files before it lack the key: on.
+            bool ownOnly = true;
             bool all = true; // the default items for the players of the scope without a pin (off: only the picked players)
+            // The default target's items, skills and ability locks are written only after the owner turns this on in
+            // 단체 적용 (owner, 11-06: nothing may change in bulk before it is asked for; files before it lack the key: off).
+            bool groupOn = false;
             int scope = kScopeOwn;
             uint32_t teams = kOwnBit; // kScopeTeams: bit t = team t, kOwnBit = the own team
             uint32_t mask = 0u;       // the default items (bit i = g_items[i])
@@ -194,7 +223,11 @@ namespace urban::players
 
         uint8_t *g_rdram = nullptr;
         std::vector<Item> g_items; // read once at start
-        std::filesystem::path g_itemsPath, g_settingsPath;
+        std::filesystem::path g_itemsPath, g_settingsPath; // g_settingsPath: this save's file (empty before a game)
+        std::filesystem::path g_legacySettingsPath;        // <userDir>/player_cheats.ini from before settings were per save
+        std::string g_profile;                             // the save (urban::saveid)
+        uint32_t g_profileGen = ~0u;
+        bool g_teamMismatch = false; // the settings were made for another team: not used
         bool g_safeMode = false;
         std::mutex g_mutex; // the settings and the rosters: the menu (GS thread) and the frame hook (EE thread)
         Settings g_settings;
@@ -225,6 +258,12 @@ namespace urban::players
         };
         std::vector<OneShot> g_oneShots;
         std::filesystem::file_time_type g_settingsTime{}; // player_cheats.ini as last read or written (under g_mutex)
+        // The change log (under g_mutex): each read of the 12 rosters against the one before.
+        urban::ChangeLog g_log;
+        std::map<uint16_t, std::pair<int, std::string>> g_seen; // the last read: player id -> team, name (empty: baseline next)
+        int g_seenTeam = -1;
+        uint32_t g_seenLoads = 0u; // save states loaded at that read
+        std::atomic<bool> g_refreshNow{false};
 
         std::string trim(std::string text)
         {
@@ -424,6 +463,13 @@ namespace urban::players
             settings.mask = allItems();
             std::map<uint16_t, std::vector<uint16_t>> pinSkills;
             std::map<uint16_t, std::array<int, kSkillSlots>> pinSlots;
+            struct AppliedPin
+            {
+                uint32_t mask = 0u;
+                std::vector<uint16_t> skills;
+                std::array<int, kSkillSlots> slots{-1, -1, -1, -1, -1, -1, -1, -1};
+            };
+            std::map<uint16_t, AppliedPin> appliedPins;
             std::ifstream file(path, std::ios::binary);
             std::string line;
             while (std::getline(file, line))
@@ -433,18 +479,9 @@ namespace urban::players
                 if (line.empty() || line[0] == '#' || equals == std::string::npos)
                     continue;
                 const std::string key = trim(line.substr(0, equals)), value = trim(line.substr(equals + 1));
-                if (key == "enabled")
-                    settings.enabled = value == "1";
-                else if (key == "all")
-                    settings.all = value == "1";
-                else if (key == "restore")
-                    settings.restore = value != "0";
-                else if (key == "scope")
-                    settings.scope = value == "all" ? kScopeAll : value == "teams" ? kScopeTeams : kScopeOwn;
-                else if (key == "teams")
-                {
-                    settings.teams = 0u;
-                    std::istringstream list(value);
+                const auto teamsOf = [&](const std::string &text) {
+                    uint32_t teams = 0u;
+                    std::istringstream list(text);
                     std::string team;
                     while (std::getline(list, team, '+'))
                     {
@@ -452,9 +489,78 @@ namespace urban::players
                         char *end = nullptr;
                         const unsigned long t = std::strtoul(team.c_str(), &end, 10);
                         if (team == "own")
-                            settings.teams |= kOwnBit;
+                            teams |= kOwnBit;
                         else if (!team.empty() && *end == '\0' && t < static_cast<unsigned long>(kTeams))
-                            settings.teams |= 1u << t;
+                            teams |= 1u << t;
+                    }
+                    return teams;
+                };
+                const auto scopeOf = [](const std::string &text) { return text == "all" ? kScopeAll : text == "teams" ? kScopeTeams : kScopeOwn; };
+                if (key == "enabled")
+                    settings.enabled = value == "1";
+                else if (key == "team")
+                    settings.team = std::atoi(value.c_str());
+                else if (key == "all")
+                    settings.all = value == "1";
+                else if (key == "groupon")
+                    settings.groupOn = value == "1";
+                else if (key == "ownonly")
+                    settings.ownOnly = value != "0";
+                else if (key == "restore")
+                    settings.restore = value != "0";
+                else if (key == "scope")
+                    settings.scope = scopeOf(value);
+                else if (key == "teams")
+                    settings.teams = teamsOf(value);
+                // What 단체 적용 및 고정 took (a_*): the frame hook writes these, not the draft above.
+                else if (key == "a_all")
+                    settings.applied.all = value == "1";
+                else if (key == "a_scope")
+                    settings.applied.scope = scopeOf(value);
+                else if (key == "a_teams")
+                    settings.applied.teams = teamsOf(value);
+                else if (key == "a_items")
+                    settings.applied.mask = maskOf(value);
+                else if (key == "a_skills")
+                    settings.applied.skills = skillsOf(value);
+                else if (key == "a_glock")
+                {
+                    std::istringstream fields(value);
+                    std::string stat;
+                    std::getline(fields, stat, ',');
+                    const int index = statIndex(trim(stat));
+                    if (index >= 0)
+                        settings.applied.stats[index] = editOf(fields);
+                }
+                else if (key == "apin" || key == "apinskills" || key == "apinslots")
+                {
+                    std::istringstream fields(value);
+                    std::string id, rest;
+                    if (!std::getline(fields, id, ','))
+                        continue;
+                    const unsigned long number = std::strtoul(trim(id).c_str(), nullptr, 10);
+                    if (number == 0u || number > 0xFFFFu)
+                        continue;
+                    AppliedPin &applied = appliedPins[static_cast<uint16_t>(number)];
+                    if (key == "apin")
+                    {
+                        std::getline(fields, rest);
+                        applied.mask = maskOf(rest);
+                    }
+                    else if (key == "apinskills")
+                    {
+                        std::getline(fields, rest);
+                        applied.skills = skillsOf(rest);
+                    }
+                    else
+                    {
+                        std::string slot;
+                        for (int k = 0; k < kSkillSlots && std::getline(fields, slot, ','); ++k)
+                        {
+                            const int skill = std::atoi(trim(slot).c_str());
+                            applied.slots[static_cast<size_t>(k)] =
+                                skill <= 0 || urban::skills::find(static_cast<uint16_t>(skill), false) ? std::max(skill, -1) : -1;
+                        }
                     }
                 }
                 else if (key == "items")
@@ -538,20 +644,55 @@ namespace urban::players
             for (const auto &[id, slots] : pinSlots)
                 if (auto pin = settings.pins.find(id); pin != settings.pins.end())
                     pin->second.slots = slots;
+            for (const auto &[id, applied] : appliedPins)
+                if (auto pin = settings.pins.find(id); pin != settings.pins.end())
+                {
+                    pin->second.appliedMask = applied.mask;
+                    pin->second.appliedSkills = applied.skills;
+                    pin->second.appliedSlots = applied.slots;
+                }
             return settings;
         }
 
         void saveSettings(const Settings &settings)
         {
+            if (g_settingsPath.empty())
+                return; // no game yet: nothing to keep
+            std::error_code made;
+            std::filesystem::create_directories(g_settingsPath.parent_path(), made);
             std::ofstream file(g_settingsPath, std::ios::binary | std::ios::trunc);
-            file << "# 선수 치트 설정: 게임 메뉴(F2)의 \"선수 치트\" 탭이 씁니다\n"
-                 << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
+            const auto scopeText = [](int scope) { return scope == kScopeAll ? "all" : scope == kScopeTeams ? "teams" : "own"; };
+            file << "# 선수 치트 설정: 게임 메뉴(F2)의 \"선수 치트\" 탭이 씁니다 (이 세이브의 설정)\n"
+                 << "team=" << settings.team << "\n"
+                 << "a_all=" << (settings.applied.all ? 1 : 0) << "\n"
+                 << "a_scope=" << scopeText(settings.applied.scope) << "\n"
+                 << "a_teams=" << teamsText(settings.applied.teams) << "\n"
+                 << "a_items=" << keysOf(settings.applied.mask) << "\n"
+                 << "a_skills=" << skillText(settings.applied.skills) << "\n";
+            for (const auto &[stat, edit] : settings.applied.stats)
+                file << "a_glock=" << kStats[stat].key << "," << edit.value << "," << edit.limit << "," << edit.apt << "\n";
+            for (const auto &[id, pin] : settings.pins)
+            {
+                file << "apin=" << id << "," << keysOf(pin.appliedMask) << "\n";
+                if (!pin.appliedSkills.empty())
+                    file << "apinskills=" << id << "," << skillText(pin.appliedSkills) << "\n";
+                if (std::any_of(pin.appliedSlots.begin(), pin.appliedSlots.end(), [](int s) { return s >= 0; }))
+                {
+                    file << "apinslots=" << id;
+                    for (int s : pin.appliedSlots)
+                        file << "," << s;
+                    file << "\n";
+                }
+            }
+            file << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
                  << "all=" << (settings.all ? 1 : 0) << "\n"
+                 << "groupon=" << (settings.groupOn ? 1 : 0) << "\n"
                  << "scope=" << (settings.scope == kScopeAll ? "all" : settings.scope == kScopeTeams ? "teams" : "own") << "\n"
                  << "teams=" << teamsText(settings.teams) << "\n"
                  << "items=" << keysOf(settings.mask) << "\n"
                  << "skills=" << skillText(settings.skills) << "\n"
-                 << "restore=" << (settings.restore ? 1 : 0) << "\n";
+                 << "restore=" << (settings.restore ? 1 : 0) << "\n"
+                 << "ownonly=" << (settings.ownOnly ? 1 : 0) << "\n";
             for (const auto &[id, pin] : settings.pins)
             {
                 file << "pin=" << id << "," << (pin.on ? 1 : 0) << "," << keysOf(pin.mask) << "," << pin.name << "\n";
@@ -611,16 +752,36 @@ namespace urban::players
 #endif
         }
 
-        // Whether the default items reach team t's players without a pin.
-        bool inScope(const Settings &settings, int t, int own)
+        // Whether a target (all, scope, teams) reaches team t's players without a pin.
+        bool inScopeOf(bool all, int scope, uint32_t teams, int t, int own)
         {
-            if (!settings.all)
+            if (!all)
                 return false;
-            if (settings.scope == kScopeAll)
+            if (scope == kScopeAll)
                 return true;
-            if (settings.scope == kScopeTeams)
-                return ((settings.teams >> t) & 1u) != 0u || ((settings.teams & kOwnBit) != 0u && t == own);
+            if (scope == kScopeTeams)
+                return ((teams >> t) & 1u) != 0u || ((teams & kOwnBit) != 0u && t == own);
             return t == own;
+        }
+        // The draft target (what the 단체 적용 tab shows).
+        bool inScope(const Settings &settings, int t, int own) { return inScopeOf(settings.all, settings.scope, settings.teams, t, own); }
+        // Whether the frame hook writes the group settings to team t's players now: only what 단체 적용 및 고정 took,
+        // while it is on.
+        bool groupApplies(const Settings &settings, int t, int own)
+        {
+            return settings.groupOn && inScopeOf(settings.applied.all, settings.applied.scope, settings.applied.teams, t, own);
+        }
+        // The draft of the group settings (what 단체 적용 및 고정 would take).
+        GroupApplied groupDraft(const Settings &settings)
+        {
+            GroupApplied draft;
+            draft.all = settings.all;
+            draft.scope = settings.scope;
+            draft.teams = settings.teams;
+            draft.mask = settings.mask;
+            draft.skills = settings.skills;
+            draft.stats = settings.groupStats;
+            return draft;
         }
 
         // Where an item's run goes in a record whose ability block is `block` (own team: record + 0x6C); 0 when a CPU
@@ -846,15 +1007,128 @@ namespace urban::players
                     write(stat, edit);
         }
 
+        std::string nameOfId(uint16_t id)
+        {
+            for (const std::vector<Row> &rows : g_rows)
+                for (const Row &row : rows)
+                    if (row.id == id)
+                        return row.name;
+            const auto seen = g_seen.find(id);
+            return seen == g_seen.end() ? "선수 " + std::to_string(id) : seen->second.second;
+        }
+
+        // The change log: this read of the 12 rosters against the one before (g_mutex held). After a save state is loaded
+        // or another save is opened, the read is the new baseline instead.
+        void logRosterChanges(int team, bool manual)
+        {
+            if (team < 0)
+            {
+                g_seen.clear();
+                return;
+            }
+            g_log.read(g_rdram);
+            std::map<uint16_t, std::pair<int, std::string>> now;
+            size_t all = 0u, own = 0u;
+            for (int t = 0; t < kTeams; ++t)
+                for (const Row &row : g_rows[static_cast<size_t>(t)])
+                {
+                    now[row.id] = {t, row.name.empty() ? std::string("?") : row.name};
+                    ++all;
+                    own += t == team ? 1u : 0u;
+                }
+            const uint32_t loads = ps2x::savestate::loadCount();
+            int added = 0;
+            const auto add = [&](const std::string &text) {
+                g_log.add(text, "players");
+                ++added;
+            };
+            const std::string counts = "12개 구단 " + std::to_string(all) + "명 · 내 구단 " + std::to_string(own) + "명";
+            if (g_seen.empty() || team != g_seenTeam || loads != g_seenLoads)
+                add(std::string(loads != g_seenLoads && !g_seen.empty() && team == g_seenTeam ? "상태를 불러와서 다시 읽음: " : "선수 목록 읽음: ") +
+                    counts);
+            else
+            {
+                std::vector<std::string> cpuIn, cpuOut;
+                for (const auto &[id, at] : now)
+                {
+                    const auto old = g_seen.find(id);
+                    const int was = old == g_seen.end() ? -1 : old->second.first;
+                    if (was == at.first)
+                        continue;
+                    if (at.first == team)
+                        add("우리 구단 입단: " + at.second + (was >= 0 ? std::string(" (") + kTeamNames[was] + "에서)" : std::string()));
+                    else if (was == team)
+                        add("우리 구단에서 " + std::string(kTeamNames[at.first]) + "(으)로: " + at.second);
+                    else
+                        cpuIn.push_back(at.second + " → " + kTeamNames[at.first]);
+                }
+                for (const auto &[id, was] : g_seen)
+                    if (!now.count(id))
+                    {
+                        if (was.first == team)
+                            add("우리 구단에서 빠짐: " + was.second);
+                        else
+                            cpuOut.push_back(was.second + " (" + kTeamNames[was.first] + ")");
+                    }
+                if (!cpuIn.empty())
+                    add("CPU 구단 입단 · 이적 " + std::to_string(cpuIn.size()) + "명: " + urban::joinNames(cpuIn));
+                if (!cpuOut.empty())
+                    add("CPU 구단에서 빠짐 " + std::to_string(cpuOut.size()) + "명: " + urban::joinNames(cpuOut));
+                if (manual && added == 0)
+                    add("새로고침: 바뀐 것 없음 (" + counts + ")");
+            }
+            g_seen = std::move(now);
+            g_seenTeam = team;
+            g_seenLoads = loads;
+        }
+
         // EE thread, at every vblank after the .pnach patches: find the 12 rosters (the own team by its class) and write
         // the chosen items and skills into the targeted players.
+        // Another save (urban::saveid): its own settings file, cheat_saves/<id>/player_cheats.ini. g_mutex held.
+        void switchProfile(const std::string &id)
+        {
+            g_profile = id;
+            // Another game is in RAM: this run's backups were taken from the old one, their addresses mean nothing now.
+            g_skillBackups.clear();
+            g_statBackups.clear();
+            g_lockBackups.clear();
+            g_oneShots.clear();
+            g_seen.clear();
+            g_teamMismatch = false;
+            std::error_code error;
+            if (id.empty())
+                g_settingsPath.clear();
+            else
+            {
+                g_settingsPath = urban::saveid::folder(id) / "player_cheats.ini";
+                // Once: the settings from before they were per save were made on the owner's main save, M00.
+                if (id == "M00" && !std::filesystem::exists(g_settingsPath, error) && std::filesystem::exists(g_legacySettingsPath, error))
+                {
+                    std::filesystem::create_directories(g_settingsPath.parent_path(), error);
+                    std::filesystem::copy_file(g_legacySettingsPath, g_settingsPath, error);
+                    std::fprintf(stderr, "[players] the old player_cheats.ini now belongs to save M00\n");
+                }
+            }
+            g_settings = g_settingsPath.empty() ? Settings{} : loadSettings(g_settingsPath); // no file: the defaults (off)
+            g_settingsTime = g_settingsPath.empty() ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(g_settingsPath, error);
+            g_log.add("세이브: " + urban::saveid::describe(id) + " — 이 세이브의 선수 치트 설정 (고정 선수 " + std::to_string(g_settings.edits.size()) +
+                          "명 · 따로 정한 선수 " + std::to_string(g_settings.pins.size()) + "명 · 단체 고정 " + (g_settings.groupOn ? "켜짐" : "꺼짐") + ")",
+                      "players");
+        }
+
         void frame()
         {
             static unsigned tick = 0u;
-            const bool refresh = (++tick % 30u) == 0u;
+            const bool manual = g_refreshNow.exchange(false); // the menu's 새로고침: read the rosters now
+            const bool refresh = (++tick % 30u) == 0u || manual;
             std::lock_guard<std::mutex> lock(g_mutex);
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_profileGen)
+            {
+                g_profileGen = generation;
+                switchProfile(urban::saveid::current());
+            }
             // player_cheats.ini changed outside the tab (an editor, a test, a launcher): read it again (about once a second).
-            if (tick % 60u == 0u)
+            if (tick % 60u == 0u && !g_settingsPath.empty())
             {
                 std::error_code error;
                 const auto time = std::filesystem::last_write_time(g_settingsPath, error);
@@ -889,7 +1163,17 @@ namespace urban::players
             if (rebuild)
                 for (std::vector<Row> &rows : g_rows)
                     rows.clear();
-            const bool apply = team >= 0 && g_settings.enabled;
+            // The settings belong to one game: the own team they were first used with (another team: another game's).
+            if (team >= 0 && !g_settingsPath.empty())
+            {
+                if (g_settings.team < 0)
+                {
+                    g_settings.team = team;
+                    saveSettings(g_settings);
+                }
+                g_teamMismatch = g_settings.team != team;
+            }
+            const bool apply = team >= 0 && g_settings.enabled && !g_teamMismatch && !g_settingsPath.empty();
             if (!rebuild && !apply && g_skillBackups.empty() && g_statBackups.empty() && g_lockBackups.empty() && g_oneShots.empty())
                 return;
             std::map<uint16_t, uint32_t> blocks; // where the one-time edits go (only while there are some)
@@ -898,7 +1182,8 @@ namespace urban::players
                 if (rosters[t] == 0u)
                     continue;
                 const bool own = t == team;
-                const bool scoped = inScope(g_settings, t, team);
+                const bool scoped = groupApplies(g_settings, t, team);
+                const bool personal = own || !g_settings.ownOnly; // a player's own locks and items reach this team
                 for (int k = 0; k < kSlots; ++k)
                 {
                     const uint32_t record = read32(rosters[t] + kRosterPlayers + 4u * static_cast<uint32_t>(k));
@@ -941,17 +1226,17 @@ namespace urban::players
                         const auto pin = g_settings.pins.find(id);
                         if (pin != g_settings.pins.end())
                         {
-                            if (pin->second.on)
+                            if (pin->second.on && personal)
                             {
-                                mask = pin->second.mask;
-                                skills = &pin->second.skills;
-                                slots = &pin->second.slots;
+                                mask = pin->second.appliedMask; // what 이 선수 적용 및 고정 took, not the draft
+                                skills = &pin->second.appliedSkills;
+                                slots = &pin->second.appliedSlots;
                             }
                         }
                         else if (scoped)
                         {
-                            mask = g_settings.mask;
-                            skills = &g_settings.skills;
+                            mask = g_settings.applied.mask; // what 단체 적용 및 고정 took
+                            skills = &g_settings.applied.skills;
                         }
                     }
                     if (mask != 0u || !g_statBackups.empty())
@@ -964,10 +1249,10 @@ namespace urban::players
                     if (apply)
                     {
                         const auto pin = g_settings.pins.find(id);
-                        if (scoped && !g_settings.groupStats.empty() && (pin == g_settings.pins.end() || pin->second.on))
-                            groupLocks = &g_settings.groupStats;
+                        if (scoped && !g_settings.applied.stats.empty() && (pin == g_settings.pins.end() || pin->second.on))
+                            groupLocks = &g_settings.applied.stats; // what 단체 적용 및 고정 took
                         const auto edit = g_settings.edits.find(id);
-                        if (edit != g_settings.edits.end() && edit->second.on && !edit->second.stats.empty())
+                        if (edit != g_settings.edits.end() && edit->second.on && !edit->second.stats.empty() && personal)
                             ownLocks = &edit->second.stats;
                     }
                     if (groupLocks || ownLocks || !g_lockBackups.empty())
@@ -983,6 +1268,7 @@ namespace urban::players
                     if (++it->age > 600)
                     {
                         std::fprintf(stderr, "[players] edit for %u dropped: not on a roster\n", it->id);
+                        g_log.add("적용 못함: " + nameOfId(it->id) + " · " + kStats[it->stat].label + " (10초 동안 로스터에서 못 찾음)", "players");
                         it = g_oneShots.erase(it);
                     }
                     else
@@ -993,8 +1279,13 @@ namespace urban::players
                 writeStat(entry, it->edit);
                 std::fprintf(stderr, "[players] edit %u %s: %d / %d / %d\n", it->id, kStats[it->stat].key, g_rdram[entry + 2u],
                              g_rdram[entry + 3u], g_rdram[entry + 1u]);
+                g_log.add("적용됨: " + nameOfId(it->id) + " · " + kStats[it->stat].label + " " + std::to_string(g_rdram[entry + 2u]) + " (상한 " +
+                              std::to_string(g_rdram[entry + 3u]) + ", 득의도 " + std::to_string(g_rdram[entry + 1u]) + ") — 메모리에서 다시 읽은 값",
+                          "players");
                 it = g_oneShots.erase(it);
             }
+            if (rebuild)
+                logRosterChanges(team, manual);
         }
 
 #if defined(URBAN_PLAYER_MENU)
@@ -1265,8 +1556,8 @@ namespace urban::players
                 return 0u;
             const auto pin = settings.pins.find(row.id);
             if (pin != settings.pins.end())
-                return pin->second.on ? pin->second.mask : 0u;
-            return inScope(settings, row.team, own) ? settings.mask : 0u;
+                return pin->second.on && (row.team == own || !settings.ownOnly) ? pin->second.appliedMask : 0u;
+            return groupApplies(settings, row.team, own) ? settings.applied.mask : 0u;
         }
 
         // The items that write ability `stat`'s aptitude, value or limit (they win over a one-time edit, not over a lock).
@@ -1462,6 +1753,7 @@ namespace urban::players
                     typed = true;
                 ui->tooltip("득의도(得意度): 연습으로 오르는 빠르기 S > A > B > C > D");
                 ui->table_next_column();
+                (void)typed; // a typed value is a draft: nothing changes before 적용 / 고정 (owner, 11-06)
                 int locked = lock ? 1 : 0;
                 if (ui->checkbox("##lock", &locked))
                 {
@@ -1469,20 +1761,26 @@ namespace urban::players
                     setLock(settings, row.id, row.name, stat, locked ? &edit : nullptr);
                     changed = true;
                 }
-                else if (typed && lock)
-                {
-                    const StatEdit edit = editFrom(draft, &row, stat);
-                    if (!(edit == *lock))
-                    {
-                        setLock(settings, row.id, row.name, stat, &edit);
-                        changed = true;
-                    }
-                }
-                ui->tooltip("고정: 이 값을 매 프레임 다시 씁니다 (성장·노화·S+ 항목보다 우선). 끄면 원래 값으로 (위 설정이 켜져 있을 때).");
+                ui->tooltip("고정(적용 및 고정): 체크하면 지금 '새 값' 칸 그대로 매 프레임 다시 씁니다 (성장·노화·S+ 항목보다 우선). "
+                            "고정 중에 새 값을 바꾸면 '새 값으로 고정'을 눌러야 바뀝니다. 끄면 원래 값으로 (위 설정이 켜져 있을 때).");
                 ui->table_next_column();
                 if (ui->small_button("적용"))
                     queueEdit(row.id, stat, editFrom(draft, &row, stat));
                 ui->tooltip("한 번만 씁니다. 그 뒤로는 게임(성장·노화)이 바꿀 수 있습니다.");
+                if (lock)
+                {
+                    const StatEdit edit = editFrom(draft, &row, stat);
+                    if (!(edit == *lock))
+                    {
+                        ui->same_line();
+                        if (ui->small_button("새 값으로 고정"))
+                        {
+                            setLock(settings, row.id, row.name, stat, &edit);
+                            changed = true;
+                        }
+                        ui->tooltip(("지금 고정 값 " + editText(*lock) + "과 새 값이 다릅니다. 눌러야 새 값으로 고정됩니다.").c_str());
+                    }
+                }
                 if (!lock && (items & coverMask(stat)) != 0u)
                 {
                     ui->same_line();
@@ -1507,31 +1805,55 @@ namespace urban::players
             const auto pin = settings.pins.find(row.id);
             if (pin == settings.pins.end())
             {
-                const bool scoped = inScope(settings, row.team, own);
-                ui->text_wrapped(scoped ? ("단체 설정을 받는 중: S+ 항목 " + std::to_string(std::popcount(settings.mask)) + "개 · 스킬 " +
+                const bool scoped = groupApplies(settings, row.team, own);
+                ui->text_wrapped(scoped ? ("단체 고정을 받는 중: S+ 항목 " + std::to_string(std::popcount(settings.mask)) + "개 · 스킬 " +
                                            std::to_string(settings.skills.size()) + "개 ('단체 적용' 탭에서 바꿈).")
                                               .c_str()
-                                        : "단체 설정 대상이 아닙니다: 이 선수에게 S+ 항목·스킬을 쓰지 않습니다.");
+                                        : "단체 고정을 받지 않습니다: 이 선수에게 S+ 항목·스킬을 쓰지 않습니다 (따로 정하면 이 선수에게만).");
                 if (ui->button("이 선수만 따로 정하기"))
                 {
                     Pin added;
+                    added.on = false; // nothing is written until '이 선수에게 고정' (owner, 11-06)
                     added.mask = settings.mask;
                     added.skills = settings.skills;
                     added.name = row.name;
                     settings.pins[row.id] = std::move(added);
                     changed = true;
                 }
-                ui->text_disabled("따로 정하면 단체 S+ 항목·스킬 대신 이 선수만의 항목·스킬·슬롯을 씁니다 (지금 단체 항목을 복사해서 시작).");
+                ui->text_disabled("따로 정하면 이 선수만의 항목·스킬·슬롯을 고릅니다 (지금 단체 항목을 복사해서 시작). '이 선수에게 고정'을 켜기 전에는 아무것도 쓰지 않습니다.");
                 ui->text_disabled("능력치 수치·등급 고정은 이것과 상관없이 늘 맨 위에 씁니다.");
                 return;
             }
-            int on = pin->second.on ? 1 : 0;
-            if (ui->checkbox("이 선수에게 적용", &on))
+            // Edit freely below; nothing is written before 이 선수 적용 및 고정 (owner, 11-06).
+            const bool pending = pin->second.pending();
+            if (ui->button_colored(pin->second.on && !pending ? "이 선수 적용 및 고정 (지금 그대로)" : "이 선수 적용 및 고정",
+                                   pending || !pin->second.on ? 0xFF3A6AD0u : 0u, 0.0f))
             {
-                pin->second.on = on != 0;
+                pin->second.appliedMask = pin->second.mask;
+                pin->second.appliedSkills = pin->second.skills;
+                pin->second.appliedSlots = pin->second.slots;
+                pin->second.on = true;
                 changed = true;
             }
-            ui->tooltip("끄면 이 선수는 S+ 항목·스킬도, 단체 능력치 고정도 받지 않습니다 (개별 고정은 그대로).");
+            ui->tooltip("아래에서 고른 S+ 항목·스킬·슬롯을 그대로 받아 이 선수에게 매 프레임 씁니다. 누르기 전에는 아무것도 바뀌지 않습니다.");
+            if (pin->second.on)
+            {
+                ui->same_line();
+                if (ui->button("이 선수 고정 끄기"))
+                {
+                    pin->second.on = false;
+                    changed = true;
+                }
+                ui->tooltip("이 선수에게 쓰기를 멈춥니다 (단체 능력치 고정도 받지 않음, 능력치 카드의 개별 고정은 그대로).");
+            }
+            ui->text_colored(pin->second.on ? 0xFF5050FFu : 0xFF968C8Cu,
+                             pin->second.on ? ("고정 중: S+ 항목 " + std::to_string(std::popcount(pin->second.appliedMask)) + "개 · 스킬 " +
+                                               std::to_string(pin->second.appliedSkills.size()) + "개를 쓰는 중")
+                                                  .c_str()
+                                            : "고정 꺼짐: 이 선수에게 S+ 항목·스킬을 쓰지 않습니다.");
+            if (pending && pin->second.on)
+                ui->text_colored(kChangedText, "아래에서 바꾼 내용은 아직 적용 안 됨: '이 선수 적용 및 고정'을 눌러야 씁니다.");
+            const int on = 1; // the draft below is always editable
             ui->same_line();
             if (ui->small_button("따로 정하기 해제 (단체 설정으로)"))
             {
@@ -1579,7 +1901,7 @@ namespace urban::players
             const uint32_t items = itemsFor(settings, row, own);
             const auto pin = settings.pins.find(row.id);
             const bool excluded = pin != settings.pins.end() && !pin->second.on;
-            const bool groupLocked = settings.enabled && inScope(settings, row.team, own) && !excluded;
+            const bool groupLocked = settings.enabled && groupApplies(settings, row.team, own) && !excluded;
             std::snprintf(head, sizeof(head), "%s · %s · %d세 · ID %u", kTeamNames[row.team], row.pitcher ? "투수" : kPositions[row.position],
                           row.age, row.id);
             ui->text_disabled(head);
@@ -1587,10 +1909,14 @@ namespace urban::players
             std::string state = !settings.enabled ? "선수 치트 꺼짐: 켜야 고정·S+ 항목이 써집니다 ('적용'은 바로 씀)"
                                 : pin != settings.pins.end() ? (pin->second.on ? "S+ 항목·스킬: 이 선수만 따로 (" + std::to_string(std::popcount(items)) + "항목)"
                                                                                : std::string("이 선수 적용 끔 (S+ 항목·단체 고정 안 받음)"))
-                                : items != 0u ? "S+ 항목·스킬: 단체 설정 (" + std::to_string(std::popcount(items)) + "항목)"
-                                              : std::string("S+ 항목: 대상 아님");
+                                : items != 0u ? "S+ 항목·스킬: 단체 고정 (" + std::to_string(std::popcount(items)) + "항목)"
+                                : !settings.groupOn && inScope(settings, row.team, own)
+                                    ? std::string("단체 고정 꺼짐: 이 선수에게는 '적용'·'고정'한 것만 씁니다")
+                                    : std::string("S+ 항목: 대상 아님");
             if (settings.enabled)
                 state += " · 개별 고정 " + std::to_string(locks) + "개" + (groupLocked && !settings.groupStats.empty() ? " · 단체 고정 " + std::to_string(settings.groupStats.size()) + "개" : "");
+            if (settings.ownOnly && row.team != own && (locks > 0 || pin != settings.pins.end()))
+                state += " · 내 구단 선수가 아니라 개별 고정·따로 정한 항목은 멈춤";
             ui->text_colored(kChangedText, state.c_str());
             const auto edit = settings.edits.find(row.id);
             if (edit != settings.edits.end())
@@ -2038,7 +2364,7 @@ namespace urban::players
                         state = "고정 " + std::to_string(locks);
                     if (pinned)
                         state += std::string(state.empty() ? "" : " · ") + (settings.pins.at(row.id).on ? "따로" : "끔");
-                    else if (settings.enabled && inScope(settings, row.team, own))
+                    else if (settings.enabled && groupApplies(settings, row.team, own))
                         state += std::string(state.empty() ? "" : " · ") + "단체";
                     ui->text_disabled(state.c_str());
                     ui->pop_id();
@@ -2146,6 +2472,35 @@ namespace urban::players
         // Who gets the default items, the items and skills, and the group's ability locks.
         void drawGroupTab(const Pcsx2GsUi *ui, Settings &settings, int team, bool &changed)
         {
+            // Edit freely below; nothing is written before 단체 적용 및 고정 (owner, 11-06).
+            const GroupApplied draft = groupDraft(settings);
+            const bool pending = !(draft == settings.applied);
+            if (ui->button_colored(settings.groupOn && !pending ? "단체 적용 및 고정 (지금 그대로)" : "단체 적용 및 고정", pending || !settings.groupOn ? 0xFF3A6AD0u : 0u, 0.0f))
+            {
+                settings.applied = draft;
+                settings.groupOn = true;
+                changed = true;
+            }
+            ui->tooltip("아래에서 고른 대상·S+ 항목·스킬·능력 고정을 그대로 받아 대상 전원에게 매 프레임 씁니다. 누르기 전에는 아무것도 바뀌지 않습니다.");
+            if (settings.groupOn)
+            {
+                ui->same_line();
+                if (ui->button("단체 고정 끄기"))
+                {
+                    settings.groupOn = false;
+                    changed = true;
+                }
+                ui->tooltip("대상 전원에게 쓰기를 멈춥니다. '끄거나 빼면 원래 능력치로'를 켜 두면 이번 실행에서 처음 쓰기 전 값으로 돌아갑니다.");
+            }
+            if (settings.groupOn)
+                ui->text_colored(0xFF5050FFu, ("단체 고정 켜짐: 적용한 대상 전원에게 S+ 항목 " + std::to_string(std::popcount(settings.applied.mask)) +
+                                               "개 · 스킬 " + std::to_string(settings.applied.skills.size()) + "개 · 능력 고정 " +
+                                               std::to_string(settings.applied.stats.size()) + "개를 쓰는 중")
+                                                  .c_str());
+            else
+                ui->text_disabled("단체 고정 꺼짐: 선수 카드에서 한 명씩 '적용'·'고정'한 것만 씁니다.");
+            if (pending && settings.groupOn)
+                ui->text_colored(kChangedText, "아래에서 바꾼 내용은 아직 적용 안 됨: '단체 적용 및 고정'을 눌러야 씁니다.");
             ui->separator_text("대상 고르기: 단체 설정을 받을 선수");
             const int mode = settings.all ? settings.scope : 3;
             const char *modes[4] = {"내 구단 전원", "고른 구단 전원", "모든 구단 모든 선수", "따로 정한 선수만"};
@@ -2391,13 +2746,36 @@ namespace urban::players
             Settings settings;
             int team;
             std::array<std::vector<Row>, kTeams> rows;
+            urban::ChangeLog log;
+            bool mismatch = false, hasProfile = false;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 settings = g_settings;
                 team = g_team;
                 rows = g_rows;
+                log = g_log;
+                mismatch = g_teamMismatch;
+                hasProfile = !g_settingsPath.empty();
             }
             bool changed = false;
+            // Which save these settings belong to (urban::saveid): each save has its own.
+            ui->text_disabled(("세이브: " + urban::saveid::describe(urban::saveid::current()) + " · 아래 설정은 이 세이브에만 저장되고 적용됩니다").c_str());
+            if (!hasProfile)
+                ui->text_disabled("게임이 시작되면 그 세이브의 설정을 엽니다. 지금은 아무것도 쓰지 않습니다.");
+            if (mismatch)
+            {
+                ui->text_colored(0xFF5050FFu, (std::string("이 설정은 ") + kTeamNames[std::clamp(settings.team, 0, kTeams - 1)] +
+                                               " 세이브에서 만든 것이라 이 게임(" + (team >= 0 ? kTeamNames[team] : "?") + ")에는 쓰지 않습니다.")
+                                                  .c_str());
+                ui->same_line();
+                if (ui->button("비우고 이 게임용으로 새로 시작"))
+                {
+                    Settings fresh;
+                    fresh.team = team;
+                    settings = fresh;
+                    changed = true;
+                }
+            }
             size_t players = 0;
             for (const std::vector<Row> &list : rows)
                 players += list.size();
@@ -2427,10 +2805,26 @@ namespace urban::players
                 changed = true;
             }
             ui->tooltip("S+ 항목·고정을 끄거나 대상에서 빼면, 이번 실행에서 처음 쓰기 전 값으로 되돌립니다.");
+            ui->same_line();
+            int ownOnly = settings.ownOnly ? 1 : 0;
+            if (ui->checkbox("개별 고정은 내 구단 선수에게만", &ownOnly))
+            {
+                settings.ownOnly = ownOnly != 0;
+                changed = true;
+            }
+            ui->tooltip("켜면(기본) 선수별 고정·'따로 정한 선수'의 S+ 항목은 그 선수가 내 구단에 있을 때만 씁니다. 트레이드·방출로 CPU 구단에 가면 멈추고, "
+                        "다시 오면 이어서 씁니다. 끄면 어느 구단에 있든 그 선수를 따라가서 씁니다 (CPU 구단 선수를 일부러 고정할 때). 단체 고정은 '단체 적용' 탭의 대상대로.");
             if (ichinen)
             {
                 ui->text_colored(0xFF5050FFu, "이치넨 모드: 드래프트가 끝나기 전에는 '내 구단' 자리에 원래 구단 선수들이 있습니다.");
                 ui->text_colored(0xFF5050FFu, "단체 대상을 '따로 정한 선수만'으로 두고, 드래프트 뒤 내 선수를 고르세요.");
+            }
+            if (urban::drawRefresh(ui, log, "선수 목록"))
+                g_refreshNow = true;
+            if (urban::drawChanges(ui, log, "playerchanges", 150.0f))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_log.lines.clear();
             }
             if (ui->begin_tab_bar("playertabs"))
             {
@@ -2476,9 +2870,11 @@ namespace urban::players
         if (!std::filesystem::exists(g_itemsPath, error) && userDir != exeDir)
             g_itemsPath = exeDir / "player_cheat_items.txt";
         g_items = loadItems(g_itemsPath);
-        g_settingsPath = userDir / "player_cheats.ini";
-        g_settings = loadSettings(g_settingsPath);
-        g_settingsTime = std::filesystem::last_write_time(g_settingsPath, error);
+        // The settings are per save (cheat_saves/<id>/player_cheats.ini, chosen by the frame hook once a game runs); the
+        // old file is kept for the owner's main save M00.
+        g_legacySettingsPath = userDir / "player_cheats.ini";
+        g_settingsPath.clear();
+        g_settings = Settings{};
         std::fprintf(stderr, "[players] %zu items (%s), %td skills; player cheats %s, %zu picked, scope %d%s\n", g_items.size(),
                      utf8(g_itemsPath).c_str(), urban::skills::end() - urban::skills::begin(), g_settings.enabled ? "on" : "off", g_settings.pins.size(),
                      g_settings.all ? g_settings.scope : 3, g_safeMode ? "; safe start: off" : "");

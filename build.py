@@ -36,10 +36,27 @@ def run(cmd, **kwargs):
 
 
 def in_vs(*cmd):
-    """Runs a command inside the Visual Studio x64 environment (tools/win/vsenv.cmd); on Linux, as it is."""
+    """Runs a command inside the Visual Studio x64 environment (tools/win/vsenv.cmd); on Linux, as it is.
+
+    Windows: under the system's OEM code page, put back afterwards. cl writes its /showIncludes notes ("참고: 포함 파일:"
+    on a Korean Visual Studio) in the console's code page, and ninja matches them byte for byte against the prefix CMake
+    found at configure time. From a UTF-8 console (65001) they did not match, so ninja kept no header dependencies and a
+    changed header rebuilt nothing that includes it."""
     if not WINDOWS:
         return run(list(cmd))
-    return run(["cmd", "/c", VSENV, *cmd])
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    old_out, old_in, oem = kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP(), kernel32.GetOEMCP()
+    switch = old_out not in (0, oem)  # 0: no console
+    if switch:
+        kernel32.SetConsoleOutputCP(oem)
+        kernel32.SetConsoleCP(oem)
+    try:
+        return run(["cmd", "/c", VSENV, *cmd])
+    finally:
+        if switch:
+            kernel32.SetConsoleOutputCP(old_out)
+            kernel32.SetConsoleCP(old_in)
 
 
 def game_running():

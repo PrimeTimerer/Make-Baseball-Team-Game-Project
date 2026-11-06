@@ -56,6 +56,7 @@ set(URBAN_HOST_SOURCES
     urban/ichinen_cheats.cpp
     urban/match_script.cpp
     urban/scout_cheats.cpp
+    urban/save_identity.cpp
     urban/cheat_menu.cpp
     urban/sha256.cpp
     urban/thread_policy.cpp

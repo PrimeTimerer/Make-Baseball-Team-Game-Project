@@ -1,9 +1,12 @@
 #include "urban/scout_cheats.h"
+#include "urban/change_log.h"
 #include "urban/function_hooks.h"
+#include "urban/save_identity.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
+#include "runtime/ps2_save_state.h"
 
 #if __has_include("pcsx2gs_api.h")
 #include "pcsx2gs_api.h"
@@ -54,6 +57,15 @@ namespace urban::scout
         // +0x62: on the list to draft or sign now (国内新人 / 外国人 of 報告リスト). The overseas builder sets 1; the yearly
         // domestic build (sub_00177C78) sets it for this year's candidates only, so the others wait for next season.
         constexpr uint32_t kListed = 0x62u;
+        // +0x78: the own club's deal with the candidate: 1 交渉成立, 2 drafted / joining (sub_00194328 moves 1 to 2); 0 none.
+        // Drafted and signed players stay in the pools (also the CPU clubs' picks, who are on their rosters); the game takes
+        // a domestic one off 国内新人 (+0x62 = 0) when drafted. Owner's save, 11-06: Cy Young's model 6001 signed, own
+        // roster, 78 = 1; 3314 drafted, 78 = 2, then on the roster; 王貞治 after 交渉, 78 = 1.
+        constexpr uint32_t kDeal = 0x78u;
+        // +0x1B: the position (the record's u16 @0x7E >> 12): 0 投手, 1 捕手, 2 一塁, 3 二塁, 4 三塁, 5 遊撃, 6 外野 (it matched
+        // the player notes for all 414 candidates of the owner's save, 11-06).
+        constexpr uint32_t kPosition = 0x1Bu;
+        constexpr const char *kPositions[7] = {"투수", "포수", "1루수", "2루수", "3루수", "유격수", "외야수"};
         // The database record's uniform name (背ネーム, from +0x1A): 5-bit letters, A = 1 ... Z = 26, 0 ends.
         constexpr uint32_t kBackName = 0x1Au;
         // The database ([0x5D1270]: +0 the records, +0xC their count): 0xA6-byte records sorted by id.
@@ -82,9 +94,10 @@ namespace urban::scout
             bool listNow = true;    // wished / inserted domestic players on this year's 国内新人 list (+0x62 = 1)
             std::set<uint16_t> want; // found at once
             std::set<uint16_t> keep; // protected without being on the wish list
+            int team = -1;           // the own team when these settings were first used (another team: another game)
         };
-        // insert=<id>,<overseas 0/1>,<group>[,<from overseas 0/1>,<from index>] lines: done once when the file changes
-        // while the game runs (not at start), dropped by the next save. For tests and power users.
+        // insert=<id>,<overseas 0/1>,<group>[,<from overseas 0/1>,<from index>[,<slot to replace>]] lines: done once when
+        // the file changes while the game runs (not at start), dropped by the next save. For tests and power users.
         struct FileInsert
         {
             uint16_t id = 0u;
@@ -92,6 +105,7 @@ namespace urban::scout
             int group = 0;
             bool fromForeign = false;
             int from = -1;
+            int target = -1;
         };
         std::vector<FileInsert> g_fileInserts;
         struct Row
@@ -101,6 +115,9 @@ namespace urban::scout
             int index = 0; // in its pool: domestic area * 39 + kind * 13 + n, overseas league * 18 + n
             std::string name, back;
             int age = 0, state = 0, status = 0, cpu = 0; // status: the rank, 0 S ... 4 D (as the game's ランク)
+            int club = -1, deal = 0;                     // the club whose roster has him; the own club's deal (+0x78)
+            int position = 0;                            // +0x1B, kPositions
+            bool taken() const { return club >= 0 || deal == 1 || deal == 2; }
         };
         struct Write
         {
@@ -108,7 +125,8 @@ namespace urban::scout
             int index = 0, state = 0;
         };
         // Put database player `id` into an empty slot of `group` (domestic: area * 3 + kind, 0-17; overseas: league
-        // 0-9), as found; `from` >= 0: the entry moved there (that slot is emptied).
+        // 0-9), as found; `from` >= 0: the entry moved there (that slot is emptied); `target` >= 0: in place of the
+        // candidate in that slot of the pool, picked in the menu (1:1).
         struct Insert
         {
             uint16_t id = 0u;
@@ -116,16 +134,21 @@ namespace urban::scout
             int group = 0;
             bool fromForeign = false;
             int from = -1;
+            int target = -1;
         };
         struct DbRow
         {
             uint16_t id = 0u;
             std::string name, back;
-            int age = 0, rank = 0;
+            int age = 0, rank = 0, position = 0;
         };
 
         uint8_t *g_rdram = nullptr;
-        std::filesystem::path g_path;
+        std::filesystem::path g_path;       // this save's scout_cheats.ini (cheat_saves/<id>/), empty before a game
+        std::filesystem::path g_legacyPath; // <userDir>/scout_cheats.ini from before the settings were per save
+        std::string g_profile;              // the save (urban::saveid)
+        uint32_t g_profileGen = ~0u;
+        bool g_teamMismatch = false;        // the settings were made for another team: not used
         std::mutex g_mutex; // settings, rows, writes: the menu (GS thread) and the frame hook (EE thread)
         Settings g_settings;
         std::filesystem::file_time_type g_time{};
@@ -145,6 +168,17 @@ namespace urban::scout
         uint32_t g_dbBase = 0u;
         std::string g_message;           // the last insert's result, for the menu
         int g_team = -1;
+        // The change log (under g_mutex): each read of the pools is compared with the one before.
+        struct Seen
+        {
+            bool foreign = false;
+            int state = 0, club = -1, deal = 0;
+            std::string name;
+        };
+        urban::ChangeLog g_log;
+        std::map<uint16_t, Seen> g_seen; // the last read, by id (empty: the next read is the new baseline)
+        uint32_t g_seenLoads = 0u;       // save states loaded at that read
+        std::atomic<bool> g_refreshNow{false};
         std::atomic<bool> g_on{false};
         std::atomic<int> g_perDay{0};
         GuestFunction g_rng = nullptr;
@@ -228,19 +262,22 @@ namespace urban::scout
                     settings.guardFound = value != "0";
                 else if (key == "listnow")
                     settings.listNow = value != "0";
+                else if (key == "team")
+                    settings.team = std::atoi(value.c_str());
                 else if (key == "want")
                     settings.want = idsOf(value);
                 else if (key == "keep")
                     settings.keep = idsOf(value);
                 else if (key == "insert")
                 {
-                    int fields[5] = {0, 0, 0, 0, -1};
+                    int fields[6] = {0, 0, 0, 0, -1, -1};
                     std::istringstream list(value);
                     std::string item;
-                    for (int k = 0; k < 5 && std::getline(list, item, ','); ++k)
+                    for (int k = 0; k < 6 && std::getline(list, item, ','); ++k)
                         fields[k] = std::atoi(trim(item).c_str());
                     if (fields[0] > 0 && fields[0] <= 0xFFFF)
-                        g_fileInserts.push_back(FileInsert{static_cast<uint16_t>(fields[0]), fields[1] != 0, fields[2], fields[3] != 0, fields[4]});
+                        g_fileInserts.push_back(
+                            FileInsert{static_cast<uint16_t>(fields[0]), fields[1] != 0, fields[2], fields[3] != 0, fields[4], fields[5]});
                 }
             }
             return settings;
@@ -248,9 +285,14 @@ namespace urban::scout
 
         void saveSettings(const Settings &settings)
         {
+            if (g_path.empty())
+                return; // no game yet: nothing to keep
             {
+                std::error_code made;
+                std::filesystem::create_directories(g_path.parent_path(), made);
                 std::ofstream file(g_path, std::ios::binary | std::ios::trunc);
-                file << "# 스카우트 치트: 게임 메뉴(F2)의 \"스카우트\" 탭이 씁니다\n"
+                file << "# 스카우트 치트: 게임 메뉴(F2)의 \"스카우트\" 탭이 씁니다 (이 세이브의 설정)\n"
+                     << "team=" << settings.team << "\n"
                      << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
                      << "perday=" << settings.perDay << "\n"
                      << "guard=" << (settings.guard ? 1 : 0) << "\n"
@@ -407,6 +449,123 @@ namespace urban::scout
             std::memcpy(e + kRecord, &record, 4);
         }
 
+        std::string namesOf(const std::vector<std::string> &names) { return urban::joinNames(names); }
+
+        // The change log: this read of the pools against the one before (g_mutex held). After a save state is loaded or
+        // a save is opened, the read is the new baseline instead.
+        void logChanges(int team, bool manual)
+        {
+            g_log.read(g_rdram);
+            if (g_rows.empty())
+            {
+                g_seen.clear(); // no candidates yet (before the season): nothing to compare, nothing to log
+                return;
+            }
+            std::map<uint16_t, Seen> now;
+            size_t domestic = 0u, foreign = 0u, taken = 0u;
+            for (const Row &row : g_rows)
+            {
+                now[row.id] = Seen{row.foreign, row.state, row.club, row.deal, row.name.empty() ? std::string("?") : row.name};
+                ++(row.foreign ? foreign : domestic);
+                taken += row.taken() ? 1u : 0u;
+            }
+            const uint32_t loads = ps2x::savestate::loadCount();
+            int added = 0;
+            const auto add = [&](const std::string &text) {
+                g_log.add(text, "scout");
+                ++added;
+            };
+            const std::string counts = "국내 " + std::to_string(domestic) + "명 · 해외 " + std::to_string(foreign) + "명";
+            if (g_seen.empty() || loads != g_seenLoads)
+                add(std::string(g_seen.empty() ? "후보 목록 읽음: " : "상태를 불러와서 다시 읽음: ") + counts + " · 영입·지명 끝난 " +
+                    std::to_string(taken) + "명");
+            else
+            {
+                std::vector<std::string> found, lost, cpu;
+                int newDomestic = 0, newForeign = 0, goneDomestic = 0, goneForeign = 0;
+                for (const auto &[id, seen] : now)
+                {
+                    const auto old = g_seen.find(id);
+                    if (old == g_seen.end())
+                    {
+                        ++(seen.foreign ? newForeign : newDomestic);
+                        continue;
+                    }
+                    const Seen &was = old->second;
+                    const std::string where = seen.foreign ? " (해외 후보)" : " (국내 후보)";
+                    if (seen.deal != was.deal && seen.deal == 1)
+                        add("교섭 성공: " + seen.name + where);
+                    else if (seen.deal != was.deal && seen.deal == 2)
+                        add("지명 · 입단 확정: " + seen.name + where);
+                    if (seen.club != was.club)
+                    {
+                        if (seen.club == team)
+                            add("우리 구단 입단: " + seen.name + where);
+                        else if (seen.club >= 0 && seen.club < kTeams)
+                            cpu.push_back(seen.name + " → " + kTeamNames[seen.club]);
+                        else if (was.club == team)
+                            add("우리 구단 로스터에서 빠짐: " + seen.name + where);
+                    }
+                    if (seen.state >= 3 && was.state < 3)
+                        found.push_back(seen.name);
+                    else if (seen.state < 3 && was.state >= 3)
+                        lost.push_back(seen.name);
+                }
+                for (const auto &[id, was] : g_seen)
+                    if (!now.count(id))
+                        ++(was.foreign ? goneForeign : goneDomestic);
+                if (!found.empty())
+                    add("발굴 " + std::to_string(found.size()) + "명: " + namesOf(found));
+                if (!lost.empty())
+                    add("발굴 취소 " + std::to_string(lost.size()) + "명: " + namesOf(lost));
+                if (!cpu.empty())
+                    add("CPU 구단 지명 · 영입 " + std::to_string(cpu.size()) + "명: " + namesOf(cpu));
+                if (newDomestic > 0 || goneDomestic > 0)
+                    add("국내 후보 칸 바뀜: 새로 " + std::to_string(newDomestic) + "명, 빠짐 " + std::to_string(goneDomestic) + "명");
+                if (newForeign > 0 || goneForeign > 0)
+                    add("해외 후보 칸 바뀜: 새로 " + std::to_string(newForeign) + "명, 빠짐 " + std::to_string(goneForeign) + "명");
+                if (manual && added == 0)
+                    add("새로고침: 바뀐 것 없음 (" + counts + ")");
+            }
+            g_seen = std::move(now);
+            g_seenLoads = loads;
+        }
+
+        // Another save (urban::saveid): its own settings file, cheat_saves/<id>/scout_cheats.ini (none: nothing active).
+        // g_mutex held.
+        void switchProfile(const std::string &id)
+        {
+            g_profile = id;
+            g_fileInserts.clear();
+            g_inserts.clear();
+            g_writes.clear();
+            g_seen.clear();
+            g_teamMismatch = false;
+            std::error_code error;
+            if (id.empty())
+            {
+                g_path.clear();
+                g_settings = Settings{};
+            }
+            else
+            {
+                g_path = urban::saveid::folder(id) / "scout_cheats.ini";
+                // Once: the settings from before they were per save were made on the owner's main save, M00.
+                if (id == "M00" && !std::filesystem::exists(g_path, error) && std::filesystem::exists(g_legacyPath, error))
+                {
+                    std::filesystem::create_directories(g_path.parent_path(), error);
+                    std::filesystem::copy_file(g_legacyPath, g_path, error);
+                    std::fprintf(stderr, "[scout] the old scout_cheats.ini now belongs to save M00\n");
+                }
+                g_settings = std::filesystem::exists(g_path, error) ? loadSettings() : Settings{};
+                g_fileInserts.clear(); // insert= lines are not replayed when a save is opened
+            }
+            g_time = g_path.empty() ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(g_path, error);
+            g_on = false; // until the own team is checked against the settings' team
+            g_perDay = g_settings.perDay;
+            g_log.add("세이브: " + urban::saveid::describe(id) + " — 이 세이브의 스카우트 설정 (찜 " + std::to_string(g_settings.want.size()) + "명)", "scout");
+        }
+
         // EE thread, at every vblank: the own team's scouting object, the wish list and the protection.
         void frame()
         {
@@ -414,7 +573,12 @@ namespace urban::scout
             if (++tick % 10u != 0u)
                 return;
             std::lock_guard<std::mutex> lock(g_mutex);
-            if (tick % 60u == 0u)
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_profileGen)
+            {
+                g_profileGen = generation;
+                switchProfile(urban::saveid::current());
+            }
+            if (tick % 60u == 0u && !g_path.empty())
             {
                 std::error_code error;
                 const auto time = std::filesystem::last_write_time(g_path, error);
@@ -426,12 +590,15 @@ namespace urban::scout
                     g_on = g_settings.enabled;
                     g_perDay = g_settings.perDay;
                     for (const FileInsert &insert : g_fileInserts)
-                        g_inserts.push_back(Insert{insert.id, insert.foreign, insert.group, insert.fromForeign, insert.from});
+                        g_inserts.push_back(Insert{insert.id, insert.foreign, insert.group, insert.fromForeign, insert.from, insert.target});
                     g_fileInserts.clear();
                     std::fprintf(stderr, "[scout] settings reloaded: %s, %d a day, %zu wanted\n", g_settings.enabled ? "on" : "off",
                                  g_settings.perDay, g_settings.want.size());
                 }
             }
+            const bool manual = g_refreshNow.exchange(false); // the menu's 새로고침: read everything now
+            if (manual)
+                g_dbBase = 0u;
             int team = -1;
             uint32_t scouting = 0u;
             for (int t = 0; t < kTeams && team < 0; ++t)
@@ -452,11 +619,21 @@ namespace urban::scout
                 g_team = -1;
                 g_rows.clear();
                 g_writes.clear();
+                g_seen.clear();
                 return;
             }
             if (team != g_team)
                 std::fprintf(stderr, "[scout] own team %d, scouting at 0x%08x\n", team, scouting);
             g_team = team;
+            // The settings belong to one game: the own team they were first used with (another team: another game's).
+            if (g_settings.team < 0 && !g_path.empty())
+            {
+                g_settings.team = team;
+                saveSettings(g_settings);
+            }
+            g_teamMismatch = g_settings.team >= 0 && g_settings.team != team;
+            const bool active = g_settings.enabled && !g_teamMismatch && !g_path.empty();
+            g_on = active;
             const auto entryOf = [&](bool overseas, int index) {
                 return overseas ? foreign + 0xCu + kEntry * static_cast<uint32_t>(index) : domestic + kEntry * static_cast<uint32_t>(index);
             };
@@ -477,14 +654,42 @@ namespace urban::scout
                 if (record == 0u || first < 0 || first + size > (insert.foreign ? kForeign : kDomestic))
                 {
                     g_message = "DB에 없는 선수 ID입니다: " + std::to_string(insert.id);
+                    g_log.add(g_message, "scout");
                     continue;
                 }
-                // An empty slot; none: the first candidate there the own team has not found, wished or kept (taken out).
+                // The slot: the one picked in the menu (1:1), else an empty one, else a candidate the newcomer may replace
+                // (owner, 11-06): any C or D; at the newcomer's own position also one of a lower rank than his (an A
+                // newcomer: a B there; an S one: an A or B there). Never a kept one or one with a deal. In turn one the own
+                // team has not found, a memo one, a found but unwished one, then a wished one; in each, the lowest rank first.
+                const int newRank = (read16(record + 0x4Eu) >> 2) & 0xF, newPosition = (read16(record + 0x7Eu) >> 12) & 7;
+                const auto rankPosition = [&](uint32_t at) {
+                    return std::string(1, "SABCD"[std::min<int>(g_rdram[at + kStatus], 4)]) + "급·" +
+                           kPositions[std::min<int>(g_rdram[at + kPosition], 6)];
+                };
+                const std::string newcomer = std::string(1, "SABCD"[std::min(newRank, 4)]) + "급·" + kPositions[std::min(newPosition, 6)];
                 int slot = -1;
+                std::string replaced;
+                if (insert.target >= 0)
+                {
+                    const uint32_t other = entryOf(insert.foreign, std::clamp(insert.target, 0, (insert.foreign ? kForeign : kDomestic) - 1));
+                    const bool deal = g_rdram[other + kDeal] == 1u || g_rdram[other + kDeal] == 2u;
+                    if (insert.target < first || insert.target >= first + size || deal)
+                    {
+                        g_message = deal ? "1:1 교체: " + nameAt(other + kName) + "은(는) 교섭·지명이 진행 중이라 바꾸지 않았습니다"
+                                         : std::string("1:1 교체: 고른 칸이 넣을 곳에 없습니다");
+                        g_log.add(g_message, "scout");
+                        continue;
+                    }
+                    slot = insert.target;
+                    if (read16(other) != 0u)
+                    {
+                        replaced = nameAt(other + kName) + "(" + rankPosition(other) + ")";
+                        g_settings.want.erase(read16(other));
+                    }
+                }
                 for (int k = 0; k < size && slot < 0; ++k)
                     if (read16(entryOf(insert.foreign, first + k)) == 0u)
                         slot = first + k;
-                std::string replaced;
                 for (int pass = 0; pass < 4 && slot < 0; ++pass)
                 {
                     int worst = -1;
@@ -495,19 +700,18 @@ namespace urban::scout
                         const uint16_t otherId = read16(other);
                         const uint8_t otherState = g_rdram[stateOf(insert.foreign, index)];
                         const bool wanted = g_settings.want.count(otherId) != 0u;
-                        if (g_settings.keep.count(otherId) || (insert.from >= 0 && insert.fromForeign == insert.foreign && insert.from == index))
+                        const bool deal = g_rdram[other + kDeal] == 1u || g_rdram[other + kDeal] == 2u; // never lose a deal
+                        if (deal || g_settings.keep.count(otherId) || (insert.from >= 0 && insert.fromForeign == insert.foreign && insert.from == index))
                             continue;
+                        const int rank = g_rdram[other + kStatus];
+                        if (rank < 3 && !(rank > newRank && g_rdram[other + kPosition] == newPosition))
+                            continue; // S, A, B: only below the newcomer's rank, at his position
                         const bool fits = pass == 0   ? otherState == 0u && !wanted
                                           : pass == 1 ? otherState < 3u && !wanted
                                           : pass == 2 ? !wanted
                                                       : true;
                         if (!fits)
                             continue;
-                        if (pass < 3)
-                        {
-                            worst = index;
-                            break;
-                        }
                         if (worst < 0 || g_rdram[other + kStatus] > g_rdram[entryOf(insert.foreign, worst) + kStatus])
                             worst = index; // the lowest rank (D) first
                     }
@@ -515,13 +719,16 @@ namespace urban::scout
                     {
                         slot = worst;
                         const uint32_t other = entryOf(insert.foreign, slot);
-                        replaced = nameAt(other + kName);
+                        replaced = nameAt(other + kName) + "(" + rankPosition(other) + ")";
                         g_settings.want.erase(read16(other));
                     }
                 }
                 if (slot < 0)
                 {
-                    g_message = "그곳의 13칸·18칸이 모두 독점 선수라 넣을 자리가 없습니다";
+                    g_message = std::string("그곳 ") + (insert.foreign ? "18칸" : "13칸") + "에 바꿔도 되는 후보가 없어 넣지 않았습니다. 넣는 선수(" +
+                                newcomer + ")로는 C·D급, 또는 같은 포지션의 더 낮은 등급만 바꿉니다 (독점·교섭한 선수는 빼고). "
+                                           "'1:1 교체'로 바꿀 선수를 직접 고를 수 있습니다.";
+                    g_log.add(g_message, "scout");
                     continue;
                 }
                 const uint32_t entry = entryOf(insert.foreign, slot);
@@ -539,7 +746,9 @@ namespace urban::scout
                 g_message = nameAt(entry + kName) + (insert.from >= 0 ? " 옮김: " : " 넣음: ") +
                             (insert.foreign ? std::string(kLeagues[insert.group])
                                             : std::string(kAreas[insert.group / 3]) + " · " + kKinds[insert.group % 3]) +
-                            " (발굴 상태)" + (replaced.empty() ? std::string() : ", 빈 칸이 없어 " + replaced + " 대신");
+                            " (" + newcomer + ", 발굴 상태)" +
+                            (replaced.empty() ? std::string() : (insert.target >= 0 ? ", 1:1 교체로 " : ", 빈 칸이 없어 ") + replaced + " 대신");
+                g_log.add(g_message, "scout");
                 std::fprintf(stderr, "[scout] %u %s %s slot %d%s\n", insert.id, insert.from >= 0 ? "moved to" : "put in",
                              insert.foreign ? "overseas" : "domestic", slot, insert.from >= 0 ? " (old slot emptied)" : "");
             }
@@ -558,29 +767,34 @@ namespace urban::scout
                         row.name = nameAt(record + 2u);
                         row.age = g_rdram[record + 0x15u];
                         row.rank = (read16(record + 0x4Eu) >> 2) & 0xFu;
+                        row.position = (read16(record + 0x7Eu) >> 12) & 7u;
                         row.back = backNameOf(record);
                         g_db.push_back(std::move(row));
                     }
                 g_dbBase = base;
             }
-            const bool rebuild = tick % 30u == 0u;
+            const bool rebuild = tick % 30u == 0u || manual;
+            // Who is on a club now (the 12 rosters): drafted and signed players stay in the pools.
+            std::map<uint16_t, int> clubOf;
+            for (int t = 0; t < kTeams; ++t)
+            {
+                const uint32_t object = read32(kTeamTable + 4u * static_cast<uint32_t>(t));
+                const uint32_t roster = valid(object, kTeamRoster + 4u) ? read32(object + kTeamRoster) : 0u;
+                if (!valid(roster, 8u + 4u * 40u))
+                    continue;
+                for (uint32_t k = 0; k < 40u; ++k)
+                {
+                    const uint32_t record = read32(roster + 8u + 4u * k);
+                    if (valid(record, 2u) && read16(record) != 0u)
+                        clubOf.emplace(read16(record), t);
+                }
+            }
             if (rebuild)
             {
                 g_rows.clear();
                 g_onRoster.clear();
-                for (int t = 0; t < kTeams; ++t)
-                {
-                    const uint32_t object = read32(kTeamTable + 4u * static_cast<uint32_t>(t));
-                    const uint32_t roster = valid(object, kTeamRoster + 4u) ? read32(object + kTeamRoster) : 0u;
-                    if (!valid(roster, 8u + 4u * 40u))
-                        continue;
-                    for (uint32_t k = 0; k < 40u; ++k)
-                    {
-                        const uint32_t record = read32(roster + 8u + 4u * k);
-                        if (valid(record, 2u) && read16(record) != 0u)
-                            g_onRoster.insert(read16(record));
-                    }
-                }
+                for (const auto &member : clubOf)
+                    g_onRoster.insert(member.first);
             }
             for (int pass = 0; pass < 2; ++pass)
             {
@@ -592,7 +806,21 @@ namespace urban::scout
                     if (id == 0u)
                         continue;
                     uint8_t &state = g_rdram[stateOf(overseas, index)];
-                    if (g_settings.enabled)
+                    const auto club = clubOf.find(id);
+                    const uint8_t deal = g_rdram[entry + kDeal];
+                    const bool taken = club != clubOf.end() || deal == 1u || deal == 2u;
+                    if (active && taken)
+                    {
+                        // Drafted or signed: the wish list and the protection leave him alone. A domestic one goes back
+                        // off 国内新人 as the game takes him off at the draft (listnow had put him back on).
+                        if (!overseas && (club != clubOf.end() || deal == 2u) && g_rdram[entry + kListed] != 0u)
+                        {
+                            g_rdram[entry + kListed] = 0u;
+                            std::fprintf(stderr, "[scout] %u taken (club %d, deal %u): off the list\n", id,
+                                         club != clubOf.end() ? club->second : -1, deal);
+                        }
+                    }
+                    else if (active)
                     {
                         // The wish list: found now, everything shown (as a find does: state 3, +0x63 = 0x0C).
                         if (!overseas && g_settings.listNow && g_settings.want.count(id) && g_rdram[entry + kListed] == 0u)
@@ -625,6 +853,9 @@ namespace urban::scout
                         row.age = g_rdram[entry + kAge];
                         row.state = state;
                         row.status = g_rdram[entry + kStatus];
+                        row.position = g_rdram[entry + kPosition];
+                        row.club = club != clubOf.end() ? club->second : -1;
+                        row.deal = deal;
                         for (int t = 0; t < kTeams; ++t)
                             if (t != team && g_rdram[entry + kInterest + static_cast<uint32_t>(t)] >= 2u)
                                 ++row.cpu;
@@ -632,15 +863,34 @@ namespace urban::scout
                     }
                 }
             }
+            if (rebuild)
+            {
+                static size_t lastTaken = ~size_t{0};
+                const size_t taken = static_cast<size_t>(std::count_if(g_rows.begin(), g_rows.end(), [](const Row &row) { return row.taken(); }));
+                if (taken != lastTaken)
+                {
+                    lastTaken = taken;
+                    std::string own;
+                    for (const Row &row : g_rows)
+                        if (row.club == team || ((row.deal == 1 || row.deal == 2) && row.club < 0))
+                            own += " " + std::to_string(row.id) + (row.club == team ? "(roster)" : "(deal " + std::to_string(row.deal) + ")");
+                    std::fprintf(stderr, "[scout] %zu of %zu candidates drafted or signed (hidden in the menu); own club:%s\n", taken,
+                                 g_rows.size(), own.c_str());
+                }
+                logChanges(team, manual);
+            }
         }
 
 #if defined(URBAN_SCOUT_MENU)
         char g_search[64] = "";
         int g_place = 0;  // 0 all, else area / league + 1
         int g_show = 0;   // 0 all, 1 found, 2 not found, 3 wanted or kept
+        int g_showTaken = 0; // also the drafted / signed players (hidden by default)
         int g_tab = 0;
         int g_toArea = 0, g_toKind = 0, g_toLeague = 0; // where 선수 넣기 / 옮기기 put a player
         char g_dbSearch[64] = "";
+        uint16_t g_pick = 0u; // the database player for a 1:1 swap (0: none)
+        int g_pickWhere = 0;  // 0 the domestic lists, 1 the overseas ones
 
         // "이름 (모델: …)" when the notes know a real model (OB / 現役 / 架空: the name is the player himself or made up).
         std::string displayName(uint16_t id, const std::string &name)
@@ -755,7 +1005,19 @@ namespace urban::scout
             return std::string(kAreas[std::clamp(row.index / 39, 0, 5)]) + " · " + kKinds[std::clamp(row.index % 39 / 13, 0, 2)];
         }
 
-        void drawPool(const Pcsx2GsUi *ui, Settings &settings, const std::vector<Row> &rows, bool overseas, bool &changed)
+        // The deal column: on whose roster, or the own club's deal before he joins.
+        void dealCell(const Pcsx2GsUi *ui, const Row &row, int team)
+        {
+            if (row.club >= 0 && row.club == team)
+                ui->text_colored(0xFF78C878u, "우리 구단 입단");
+            else if (row.club >= 0)
+                ui->text_colored(0xFF5050FFu, (std::string(kTeamNames[std::clamp(row.club, 0, kTeams - 1)]) + " 소속").c_str());
+            else
+                ui->text_colored(0xFF78C878u, row.deal == 2 ? "지명 (입단 전)" : "교섭 성공 (입단 전)");
+            ui->tooltip("영입·지명이 끝난 선수: 찜·독점 치트가 더는 건드리지 않습니다 (목록에서는 기본으로 숨김).");
+        }
+
+        void drawPool(const Pcsx2GsUi *ui, Settings &settings, const std::vector<Row> &rows, bool overseas, int team, bool &changed)
         {
             ui->set_next_width(200.0f);
             ui->input_text("##search", "이름 · 영문 · 실존 모델 · ID", g_search, sizeof(g_search));
@@ -781,12 +1043,21 @@ namespace urban::scout
             const char *ranks[4] = {"모든 랭크", "S만", "A 이상", "B 이상"};
             ui->set_next_width(100.0f);
             ui->combo("##rank", &g_rankFilter, ranks, 4);
+            ui->same_line();
+            ui->checkbox("영입·지명 끝난 선수도 보기", &g_showTaken);
+            ui->tooltip("우리 구단이 교섭에 성공했거나 지명한 선수, 이미 어느 구단에 들어간 선수(CPU 지명·영입 포함)는 기본으로 숨깁니다.");
             std::string query = trim(g_search);
             std::vector<const Row *> shown;
+            int hidden = 0;
             for (const Row &row : rows)
             {
                 if (row.foreign != overseas)
                     continue;
+                if (row.taken() && !g_showTaken)
+                {
+                    ++hidden;
+                    continue;
+                }
                 if (g_place > 0 && (overseas ? row.index / 18 : row.index / 39) != g_place - 1)
                     continue;
                 const bool wanted = settings.want.count(row.id) || settings.keep.count(row.id);
@@ -802,8 +1073,10 @@ namespace urban::scout
             ui->same_line();
             drawTarget(ui, !overseas);
             ui->same_line();
-            ui->text_disabled("(줄의 '옮기기' = 그곳 빈 칸에 발굴 상태로, 원래 칸은 비움)");
-            ui->text_disabled(("보이는 후보 " + std::to_string(shown.size()) + "명").c_str());
+            ui->text_disabled("(줄의 '옮기기' = 그곳 빈 칸에 발굴 상태로, 원래 칸은 비움. 빈 칸이 없으면 C·D급이나 같은 포지션의 더 낮은 등급과만 바꿈)");
+            ui->text_disabled(("보이는 후보 " + std::to_string(shown.size()) + "명" +
+                               (hidden > 0 ? " · 영입·지명 끝난 " + std::to_string(hidden) + "명 숨김" : std::string()))
+                                  .c_str());
             ui->same_line();
             if (ui->small_button("보이는 후보 모두 찜 (바로 발굴)"))
             {
@@ -914,16 +1187,24 @@ namespace urban::scout
                     ui->table_next_column();
                     ui->text(placeText(row).c_str());
                     ui->table_next_column();
-                    if (row.state >= 3)
+                    if (row.taken())
+                        dealCell(ui, row, team);
+                    else if (row.state >= 3)
                         ui->text_colored(0xFF66CCFFu, stateText(row.state));
                     else
                         ui->text_disabled(stateText(row.state));
                     ui->table_next_column();
-                    if (row.cpu > 0)
+                    if (row.cpu > 0 && !row.taken())
                         ui->text_colored(0xFF5050FFu, (std::to_string(row.cpu) + "구단").c_str());
                     else
                         ui->text_disabled("-");
                     ui->table_next_column();
+                    if (row.taken())
+                    {
+                        ui->text_disabled("-");
+                        ui->pop_id();
+                        continue;
+                    }
                     if (ui->small_button(overseas ? "국내로 옮기기" : "해외로 옮기기"))
                         request(Insert{row.id, !overseas, overseas ? g_toArea * 3 + g_toKind : g_toLeague, row.foreign, row.index});
                     if (row.state >= 3)
@@ -942,11 +1223,94 @@ namespace urban::scout
             ui->end_table();
         }
 
+        // 1:1: the picked database player in place of a candidate chosen in the list of one domestic area and kind or
+        // one overseas league (any candidate but one with a deal).
+        void drawPick(const Pcsx2GsUi *ui, const std::vector<DbRow> &db, const std::vector<Row> &rows)
+        {
+            const auto picked = std::find_if(db.begin(), db.end(), [](const DbRow &row) { return row.id == g_pick; });
+            if (picked == db.end())
+            {
+                g_pick = 0u;
+                return;
+            }
+            ui->separator_text("1:1 교체: 바꿀 후보를 직접 고르기");
+            ui->text(("넣을 선수: " + displayName(picked->id, picked->name) + " (" + kRanks[std::clamp(picked->rank, 0, 4)] + "급 · " +
+                      kPositions[std::clamp(picked->position, 0, 6)] + ")")
+                         .c_str());
+            ui->same_line();
+            if (ui->small_button("닫기##pick"))
+            {
+                g_pick = 0u;
+                return;
+            }
+            const char *wheres[2] = {"국내 신인 목록", "해외 리그 목록"};
+            ui->set_next_width(150.0f);
+            ui->combo("##pickwhere", &g_pickWhere, wheres, 2);
+            ui->same_line();
+            const bool overseas = g_pickWhere == 1;
+            drawTarget(ui, overseas);
+            const int group = overseas ? g_toLeague : g_toArea * 3 + g_toKind;
+            const int first = overseas ? group * 18 : group * 13, size = overseas ? 18 : 13;
+            std::vector<const Row *> slots;
+            for (const Row &row : rows)
+                if (row.foreign == overseas && row.index >= first && row.index < first + size)
+                    slots.push_back(&row);
+            std::sort(slots.begin(), slots.end(), [](const Row *a, const Row *b) { return a->index < b->index; });
+            if (static_cast<int>(slots.size()) < size)
+                ui->text_disabled(("빈 칸 " + std::to_string(size - static_cast<int>(slots.size())) +
+                                   "개: 아래 표의 '국내에 넣기' · '해외에 넣기'가 빈 칸부터 씁니다.")
+                                      .c_str());
+            if (!ui->begin_table("pick", 6, PCSX2GS_TABLE_SCROLL | PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 260.0f))
+                return;
+            ui->table_freeze(1, 1);
+            ui->table_column("이름", 0, 300.0f);
+            ui->table_column("랭크", 0, 40.0f);
+            ui->table_column("포지션", 0, 60.0f);
+            ui->table_column("나이", 0, 36.0f);
+            ui->table_column("상태", 0, 130.0f);
+            ui->table_column("", 0, 150.0f);
+            ui->table_headers();
+            for (const Row *row : slots)
+            {
+                ui->table_next_row();
+                ui->push_id(300000 + row->index);
+                ui->table_next_column();
+                ui->text(displayName(row->id, row->name).c_str());
+                ui->table_next_column();
+                rankCell(ui, row->status);
+                ui->table_next_column();
+                ui->text(kPositions[std::clamp(row->position, 0, 6)]);
+                ui->table_next_column();
+                ui->text(std::to_string(row->age).c_str());
+                ui->table_next_column();
+                const bool deal = row->deal == 1 || row->deal == 2;
+                if (deal)
+                    ui->text_colored(0xFF78C878u, row->deal == 2 ? "지명 (입단 전)" : "교섭 성공 (입단 전)");
+                else if (row->club >= 0)
+                    ui->text_colored(0xFF5050FFu, (std::string(kTeamNames[std::clamp(row->club, 0, kTeams - 1)]) + " 소속").c_str());
+                else
+                    ui->text_disabled(stateText(row->state));
+                ui->table_next_column();
+                if (deal)
+                    ui->text_disabled("교섭 중이라 못 바꿈");
+                else if (ui->small_button("이 선수와 바꾸기"))
+                {
+                    request(Insert{g_pick, overseas, group, false, -1, row->index});
+                    g_pick = 0u;
+                }
+                ui->pop_id();
+            }
+            ui->end_table();
+            ui->separator();
+        }
+
         // Any database player into an empty slot of a domestic area and kind or an overseas league, found.
         void drawDatabase(const Pcsx2GsUi *ui, const std::vector<DbRow> &db, const std::vector<Row> &rows,
                           const std::set<uint16_t> &onRoster, const std::string &message)
         {
             ui->text_wrapped("게임 DB의 선수(현역·OB·아마추어·외국인 모두)를 올해 국내 신인 목록이나 해외 리그 목록의 빈 칸에 발굴 상태로 넣습니다. "
+                             "빈 칸이 없으면 그곳의 C·D급 후보(D급 먼저)나, 넣는 선수보다 낮은 등급의 같은 포지션 선수(A급이면 B급, S급이면 A·B급)만 "
+                             "바꾸고 독점·교섭한 선수는 바꾸지 않습니다. '1:1 교체…'로는 바꿀 선수를 직접 고릅니다. "
                              "항목은 게임이 후보를 만들 때와 같은 방식으로 DB에서 만듭니다.");
             ui->text("국내에 넣을 곳:");
             ui->same_line();
@@ -957,6 +1321,8 @@ namespace urban::scout
             drawTarget(ui, true);
             if (!message.empty())
                 ui->text_colored(0xFF66CCFFu, message.c_str());
+            if (g_pick != 0u)
+                drawPick(ui, db, rows);
             ui->set_next_width(220.0f);
             ui->input_text("##dbsearch", "이름 · 영문 · 실존 모델 · ID로 찾기", g_dbSearch, sizeof(g_dbSearch));
             ui->tooltip("게임 이름, 등 이름(영문), 실존 모델 이름(가타카나·영어·한국어, 예: 랜디 존슨, randy johnson), 선수 ID로 찾습니다.");
@@ -992,7 +1358,7 @@ namespace urban::scout
             ui->table_column("포지션", 0, 80.0f);
             ui->table_column("능력 (상한)", 0, 270.0f);
             ui->table_column("지금", 0, 110.0f);
-            ui->table_column("", 0, 190.0f);
+            ui->table_column("", 0, 290.0f);
             ui->table_headers();
             ui->clipper_begin(static_cast<int>(shown.size()));
             int first = 0, end = 0;
@@ -1033,6 +1399,13 @@ namespace urban::scout
                         request(Insert{row.id, true, g_toLeague, false, -1});
                     if (onRoster.count(row.id) || pool != pooled.end())
                         ui->tooltip("이미 구단이나 후보 목록에 있는 선수입니다. 넣으면 같은 선수가 두 곳에 생깁니다.");
+                    ui->same_line();
+                    if (ui->small_button("1:1 교체…"))
+                    {
+                        g_pick = row.id;
+                        g_pickWhere = pool != pooled.end() && pool->second->foreign ? 1 : g_pickWhere;
+                    }
+                    ui->tooltip("넣을 곳의 후보 목록을 열어 바꿀 선수를 직접 고릅니다 (등급·포지션 제한 없이, 교섭 중인 선수만 빼고).");
                     ui->pop_id();
                 }
             ui->end_table();
@@ -1051,6 +1424,7 @@ namespace urban::scout
             std::set<uint16_t> onRoster;
             std::string message;
             int team;
+            urban::ChangeLog log;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 settings = g_settings;
@@ -1059,6 +1433,7 @@ namespace urban::scout
                 db = g_db;
                 onRoster = g_onRoster;
                 message = g_message;
+                log = g_log;
             }
             bool changed = false;
             int enabled = settings.enabled ? 1 : 0;
@@ -1108,6 +1483,13 @@ namespace urban::scout
             ui->text_disabled(("찜 " + std::to_string(settings.want.size()) + "명 · 독점 " + std::to_string(settings.keep.size()) +
                                "명. 찜한 선수는 '선수 치트 켜기'처럼 이 탭이 켜져 있을 때 바로 발굴됩니다.")
                                   .c_str());
+            if (urban::drawRefresh(ui, log, "후보 목록"))
+                g_refreshNow = true;
+            if (urban::drawChanges(ui, log, "scoutchanges", 150.0f))
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_log.lines.clear();
+            }
             if (ui->begin_tab_bar("scouttabs"))
             {
                 if (ui->begin_tab("국내 신인"))
@@ -1115,7 +1497,7 @@ namespace urban::scout
                     if (g_tab != 0)
                         g_place = 0;
                     g_tab = 0;
-                    drawPool(ui, settings, rows, false, changed);
+                    drawPool(ui, settings, rows, false, team, changed);
                     ui->end_tab();
                 }
                 if (ui->begin_tab("외국인"))
@@ -1123,7 +1505,7 @@ namespace urban::scout
                     if (g_tab != 1)
                         g_place = 0;
                     g_tab = 1;
-                    drawPool(ui, settings, rows, true, changed);
+                    drawPool(ui, settings, rows, true, team, changed);
                     ui->end_tab();
                 }
                 if (ui->begin_tab("DB에서 넣기"))
@@ -1153,8 +1535,11 @@ namespace urban::scout
         if (mods && std::strcmp(mods, ";") == 0) // the launcher's safe start
             return;
         g_rdram = rdram;
-        g_path = userDir / "scout_cheats.ini";
-        g_settings = loadSettings();
+        // The settings are per save (cheat_saves/<id>/scout_cheats.ini, chosen by the frame hook once a game runs); the
+        // old file is kept for the owner's main save M00.
+        g_legacyPath = userDir / "scout_cheats.ini";
+        g_path.clear();
+        g_settings = Settings{};
         g_fileInserts.clear(); // not at start
         for (const std::filesystem::path &file : {userDir / "scout_models.tsv", std::filesystem::path("scout_models.tsv")})
         {
@@ -1194,10 +1579,8 @@ namespace urban::scout
             if (!g_models.empty() || !g_notes.empty())
                 break;
         }
-        std::error_code error;
-        g_time = std::filesystem::last_write_time(g_path, error);
-        g_on = g_settings.enabled;
-        g_perDay = g_settings.perDay;
+        g_on = false;
+        g_perDay = 0;
         FunctionHooks &hooks = FunctionHooks::instance();
         hooks.replace(kRng, "scout_roll", &rngHook, ReplacementStatus::Native, "scout cheats: finds a day");
         g_rng = hooks.original(kRng);

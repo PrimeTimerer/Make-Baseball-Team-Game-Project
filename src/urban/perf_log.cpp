@@ -1,4 +1,5 @@
 #include "urban/perf_log.h"
+#include "urban/change_log.h"
 
 #include "runtime/ps2_perf_stats.h"
 #include "runtime/ps2_pnach.h"
@@ -61,12 +62,8 @@ namespace urban::perflog
 
         std::string dateText()
         {
-            uint32_t club = 0u;
-            std::memcpy(&club, g_rdram + kClubPointer, sizeof(club));
-            if (club < 0x100000u || club >= kRamSize - 0x200u || (club & 3u) != 0u)
-                return "날짜 -";
-            const int year = g_rdram[club + 0x13Du], month = g_rdram[club + 0x13Fu], week = g_rdram[club + 0x140u];
-            if (year < 1 || year > 99 || month < 1 || month > 12 || week < 1 || week > 5)
+            int year = 0, month = 0, week = 0; // the off-season's months counted right (urban/change_log.h)
+            if (!urban::gameDate(g_rdram, year, month, week))
                 return "날짜 -";
             char text[40];
             std::snprintf(text, sizeof(text), "%d년차 %2d월 %d주", year, month, week);
