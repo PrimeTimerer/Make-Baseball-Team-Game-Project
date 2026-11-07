@@ -63,14 +63,32 @@ namespace urban::matchscript
         };
         constexpr const char *kActionKeys[] = {"", "hr", "hit", "k", "bb"};
 
+        // When a rule or a stack works (owner 11-07: "경기의 상황과 스코어에 따라서"): the match situation as the subject's
+        // club sees it (a batter rule or batter stat: the batting club; a pitcher rule or pitcher stat: the fielding club).
+        // From the simgame match [0x5E783C]: +0x14 inning (0-based), +0x18 the batting club (0 top, 1 bottom), +0xD0
+        // outs, +0x5874 the runners (3 bytes apart: 1B, 2B, 3B; 0xFF empty), +0x5880 + 4 x club the runs. Checked in hidden
+        // runs from a mid-match state: forced HRs moved +0x5880 0 -> 4 -> 5 (scoreboard 4-0) and emptied the bases,
+        // forced strikeouts moved +0xD0 1 -> 2 (the HUD's O dots).
+        struct Condition
+        {
+            int innFrom = 0, innTo = 0;   // innings from 1 (0: from the first / to the last, extra innings too)
+            int score = 0;                // 0 any, 1 ahead, 2 behind, 3 tied, 4 ahead or tied, 5 behind or tied
+            int diffMin = 0, diffMax = 0; // the run difference, either way (0: no bound)
+            int runners = 0;              // 0 any, 1 none on, 2 someone on, 3 scoring position (2B or 3B), 4 loaded
+            int outs = 0;                 // 0 any, else 1 + the outs (0-2)
+            bool any() const { return innFrom || innTo || score || diffMin || diffMax || runners || outs; }
+            bool operator==(const Condition &) const = default;
+        };
+
         struct Rule
         {
             int target = 0; // >= 0: global player ID; -1 own team, -2 opponents, -3 everyone
             bool pitcher = false;
             Action action = Action::None;
+            Condition when;
             bool operator==(const Rule &other) const
             {
-                return target == other.target && pitcher == other.pitcher && action == other.action;
+                return target == other.target && pitcher == other.pitcher && action == other.action && when == other.when;
             }
         };
 
@@ -105,6 +123,7 @@ namespace urban::matchscript
             int stat = 0;   // index into kStats
             int percent = 100; // the multiplier, in percent
             int add = 0;       // added after the multiplier (any value; the result is kept within 0..9999)
+            Condition when;
         };
 
         struct Settings
@@ -174,6 +193,32 @@ namespace urban::matchscript
             return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
         }
 
+        // The condition's seven fields after a rule's or a boost's own (none: always).
+        Condition conditionOf(const std::vector<std::string> &parts, size_t first)
+        {
+            Condition when;
+            if (parts.size() < first + 7u)
+                return when;
+            int f[7];
+            for (size_t k = 0; k < 7u; ++k)
+                f[k] = std::atoi(parts[first + k].c_str());
+            when.innFrom = std::clamp(f[0], 0, 30);
+            when.innTo = std::clamp(f[1], 0, 30);
+            when.score = std::clamp(f[2], 0, 5);
+            when.diffMin = std::clamp(f[3], 0, 99);
+            when.diffMax = std::clamp(f[4], 0, 99);
+            when.runners = std::clamp(f[5], 0, 4);
+            when.outs = std::clamp(f[6], 0, 3);
+            return when;
+        }
+
+        std::string conditionText(const Condition &when)
+        {
+            return "," + std::to_string(when.innFrom) + "," + std::to_string(when.innTo) + "," + std::to_string(when.score) + "," +
+                   std::to_string(when.diffMin) + "," + std::to_string(when.diffMax) + "," + std::to_string(when.runners) + "," +
+                   std::to_string(when.outs);
+        }
+
         // match_script.ini: enabled=0|1, steal=0|1, rule=<own|opp|all|ID>,<bat|pit>,<hr|hit|k|bb> (one line per rule)
         Settings load(const std::filesystem::path &path)
         {
@@ -211,6 +256,7 @@ namespace urban::matchscript
                     for (int a = 1; a < 5; ++a)
                         if (parts[2] == kActionKeys[a])
                             rule.action = static_cast<Action>(a);
+                    rule.when = conditionOf(parts, 3);
                     if (rule.action != Action::None && rule.target >= -3)
                         settings.rules.push_back(rule);
                 }
@@ -224,6 +270,7 @@ namespace urban::matchscript
                             boost.stat = s;
                     boost.percent = std::atoi(parts[2].c_str());
                     boost.add = parts.size() >= 4 ? std::atoi(parts[3].c_str()) : 0;
+                    boost.when = conditionOf(parts, 4);
                     if (boost.stat >= 0 && boost.target >= -3 && boost.percent > 0)
                         settings.boosts.push_back(boost);
                 }
@@ -239,6 +286,7 @@ namespace urban::matchscript
                 file << "# 경기 스크립트 (게임 메뉴 F2 > 경기 스크립트 탭이 씀)\r\n";
                 file << "# rule=<own|opp|all|선수 ID>,<bat|pit>,<hr|hit|k|bb>  steal=1: 내 구단 도루 무조건 성공\r\n";
                 file << "# limit=한 이닝에 강제하는 홈런·안타·볼넷 수  boost=<own|opp|all|선수 ID>,<능력치>,<배율 %>,<더하는 값>\r\n";
+                file << "# 끝의 7칸 = 조건: 이닝부터,이닝까지,점수(1 이김 2 짐 3 동점 4 이기거나 동점 5 지거나 동점),점수차 최소,최대,주자(1 없음 2 있음 3 득점권 4 만루),아웃(1+아웃 수)\r\n";
                 file << "enabled=" << (settings.enabled ? 1 : 0) << "\r\n";
                 file << "steal=" << (settings.steal ? 1 : 0) << "\r\n";
                 file << "limit=" << settings.limit << "\r\n";
@@ -247,10 +295,10 @@ namespace urban::matchscript
                 };
                 for (const Rule &rule : settings.rules)
                     file << "rule=" << targetKey(rule.target) << ',' << (rule.pitcher ? "pit" : "bat") << ','
-                         << kActionKeys[static_cast<int>(rule.action)] << "\r\n";
+                         << kActionKeys[static_cast<int>(rule.action)] << (rule.when.any() ? conditionText(rule.when) : std::string()) << "\r\n";
                 for (const Boost &boost : settings.boosts)
                     file << "boost=" << targetKey(boost.target) << ',' << kStats[boost.stat].key << ',' << boost.percent << ','
-                         << boost.add << "\r\n";
+                         << boost.add << (boost.when.any() ? conditionText(boost.when) : std::string()) << "\r\n";
             }
             std::error_code error;
             std::filesystem::rename(temp, g_path, error); // whole file at once: the game thread reads it when it changes
@@ -332,20 +380,78 @@ namespace urban::matchscript
             return target == -3 || (target == -1 && selfOwn) || (target == -2 && !selfOwn && otherOwn);
         }
 
+        // The pitch's situation (read once per pitch by the swing hook).
+        struct Situation
+        {
+            bool valid = false;
+            int inning = 0;  // from 1
+            int batting = 0; // the batting club: 0 top, 1 bottom
+            int outs = 0;
+            int runs[2] = {0, 0};
+            bool base[3] = {false, false, false}; // 1B, 2B, 3B
+        };
+        Situation g_situation;
+
+        Situation readSituation()
+        {
+            Situation situation;
+            const uint32_t match = r32(kMatchPtr);
+            if (!valid(match))
+                return situation;
+            situation.valid = true;
+            situation.inning = static_cast<int>(r32(match + 0x14u)) + 1;
+            situation.batting = r32(match + 0x18u) != 0u ? 1 : 0;
+            situation.outs = static_cast<int>(r32(match + 0xD0u));
+            for (uint32_t b = 0; b < 3u; ++b)
+                situation.base[b] = r8(match + 0x5874u + 3u * b) != 0xFFu;
+            situation.runs[0] = static_cast<int>(r32(match + 0x5880u));
+            situation.runs[1] = static_cast<int>(r32(match + 0x5884u));
+            return situation;
+        }
+
+        // Whether the pitch's situation meets a condition, as the subject's club sees it (pitcherSide: the fielding club).
+        bool holds(const Condition &when, bool pitcherSide)
+        {
+            if (!when.any())
+                return true;
+            const Situation &now = g_situation;
+            if (!now.valid)
+                return false;
+            if ((when.innFrom > 0 && now.inning < when.innFrom) || (when.innTo > 0 && now.inning > when.innTo))
+                return false;
+            const int self = pitcherSide ? 1 - now.batting : now.batting;
+            const int lead = now.runs[self] - now.runs[1 - self];
+            if ((when.score == 1 && lead <= 0) || (when.score == 2 && lead >= 0) || (when.score == 3 && lead != 0) ||
+                (when.score == 4 && lead < 0) || (when.score == 5 && lead > 0))
+                return false;
+            const int gap = lead < 0 ? -lead : lead;
+            if ((when.diffMin > 0 && gap < when.diffMin) || (when.diffMax > 0 && gap > when.diffMax))
+                return false;
+            const int on = (now.base[0] ? 1 : 0) + (now.base[1] ? 1 : 0) + (now.base[2] ? 1 : 0);
+            if ((when.runners == 1 && on != 0) || (when.runners == 2 && on == 0) || (when.runners == 3 && !now.base[1] && !now.base[2]) ||
+                (when.runners == 4 && on != 3))
+                return false;
+            return when.outs == 0 || now.outs == when.outs - 1;
+        }
+
         Action pick(uint16_t batter, uint16_t pitcher)
         {
             const std::vector<Rule> &rules = g_settings.rules;
+            // A rule with a condition before one without (the same target and role): the conditional one wins when it holds.
             auto byId = [&rules](uint16_t id, bool pitcherRule) {
-                for (const Rule &rule : rules)
-                    if (rule.pitcher == pitcherRule && rule.target == id)
-                        return rule.action;
+                for (const bool conditional : {true, false})
+                    for (const Rule &rule : rules)
+                        if (rule.pitcher == pitcherRule && rule.target == id && rule.when.any() == conditional && holds(rule.when, pitcherRule))
+                            return rule.action;
                 return Action::None;
             };
             auto byGroup = [&rules](bool pitcherRule) {
                 const bool self = pitcherRule ? g_pitcherOwn : g_batterOwn, other = pitcherRule ? g_batterOwn : g_pitcherOwn;
-                for (const Rule &rule : rules)
-                    if (rule.pitcher == pitcherRule && rule.target < 0 && groupMatches(rule.target, self, other))
-                        return rule.action;
+                for (const bool conditional : {true, false})
+                    for (const Rule &rule : rules)
+                        if (rule.pitcher == pitcherRule && rule.target < 0 && groupMatches(rule.target, self, other) &&
+                            rule.when.any() == conditional && holds(rule.when, pitcherRule))
+                            return rule.action;
                 return Action::None;
             };
             // A picked player's rule first, the batter before the pitcher; then the group rules.
@@ -391,13 +497,16 @@ namespace urban::matchscript
 
         Factor boostFor(uint16_t id, int stat, bool pitcherSide)
         {
-            for (const Boost &boost : g_settings.boosts)
-                if (boost.stat == stat && boost.target == id)
-                    return Factor{boost.percent, boost.add};
+            for (const bool conditional : {true, false})
+                for (const Boost &boost : g_settings.boosts)
+                    if (boost.stat == stat && boost.target == id && boost.when.any() == conditional && holds(boost.when, pitcherSide))
+                        return Factor{boost.percent, boost.add};
             const bool self = pitcherSide ? g_pitcherOwn : g_batterOwn, other = pitcherSide ? g_batterOwn : g_pitcherOwn;
-            for (const Boost &boost : g_settings.boosts)
-                if (boost.stat == stat && boost.target < 0 && groupMatches(boost.target, self, other))
-                    return Factor{boost.percent, boost.add};
+            for (const bool conditional : {true, false})
+                for (const Boost &boost : g_settings.boosts)
+                    if (boost.stat == stat && boost.target < 0 && groupMatches(boost.target, self, other) && boost.when.any() == conditional &&
+                        holds(boost.when, pitcherSide))
+                        return Factor{boost.percent, boost.add};
             return Factor{};
         }
 
@@ -578,6 +687,7 @@ namespace urban::matchscript
                         g_forcedInHalf = 0;
                     }
                 }
+                g_situation = readSituation(); // the conditions of rules and stacks look at this pitch's situation
                 applyBoosts(ctx, rg);
                 // URBAN_SCRIPT_STATS=1: one line per plate appearance ("pa <batter>") and per ball in play ("play <batter>
                 // <detail>", HR = 0x15 / 0x1A / 0x1F), to count a player's results over simulated games.
@@ -695,6 +805,37 @@ namespace urban::matchscript
         int g_pickTeam = 0, g_pickKind = 0, g_groupTarget = 0, g_groupRole = 0, g_groupAction = 0;
         std::set<uint16_t> g_selected; // the checked players (global IDs), menu thread
         int g_boostTarget = 0, g_boostStat = 0;
+        Condition g_when; // the condition the next rule or stack gets
+        constexpr const char *kScoreModes[] = {"점수 상관없음", "이기고 있을 때", "지고 있을 때", "동점일 때", "이기거나 동점", "지거나 동점"};
+        constexpr const char *kRunnerModes[] = {"주자 상관없음", "주자 없을 때", "주자 있을 때", "득점권 (2·3루)", "만루"};
+        constexpr const char *kOutModes[] = {"아웃 상관없음", "0아웃", "1아웃", "2아웃"};
+
+        std::string conditionLabel(const Condition &when)
+        {
+            if (!when.any())
+                return "조건 없음 (항상)";
+            std::string text;
+            auto add = [&text](const std::string &part) { text += (text.empty() ? "" : " · ") + part; };
+            if (when.innFrom > 0 || when.innTo > 0)
+                add(when.innTo == 0 ? std::to_string(when.innFrom) + "회부터"
+                    : when.innFrom == 0 ? std::to_string(when.innTo) + "회까지"
+                    : when.innFrom == when.innTo ? std::to_string(when.innFrom) + "회"
+                                                 : std::to_string(when.innFrom) + "~" + std::to_string(when.innTo) + "회");
+            std::string score = when.score > 0 ? kScoreModes[when.score] : "";
+            if (when.diffMin > 0 || when.diffMax > 0)
+                score += std::string(score.empty() ? "점수 차 " : " ") +
+                         (when.diffMax == 0 ? std::to_string(when.diffMin) + "점 이상"
+                          : when.diffMin == 0 ? std::to_string(when.diffMax) + "점 이하"
+                          : when.diffMin == when.diffMax ? std::to_string(when.diffMin) + "점 차"
+                                                         : std::to_string(when.diffMin) + "~" + std::to_string(when.diffMax) + "점 차");
+            if (!score.empty())
+                add(score);
+            if (when.runners > 0)
+                add(kRunnerModes[when.runners]);
+            if (when.outs > 0)
+                add(kOutModes[when.outs]);
+            return text;
+        }
 
         struct Player
         {
@@ -885,8 +1026,50 @@ namespace urban::matchscript
                 ui->text_wrapped(("고른 선수 " + std::to_string(g_selected.size()) + "명: " + names).c_str());
             }
 
+            // The condition the next rule or stack gets.
+            ui->separator_text("발동 조건 (아래에서 '더하기'하는 규칙·중첩에 붙음)");
+            ui->text_disabled("점수·이닝은 그 선수 구단 기준입니다: 타자 규칙·타자 능력치는 공격하는 쪽, 투수 규칙·투수 능력치는 수비하는 쪽.");
+            ui->text("이닝");
+            ui->same_line();
+            ui->set_next_width(70.0f);
+            if (ui->input_int("##innfrom", &g_when.innFrom, 1))
+                g_when.innFrom = std::clamp(g_when.innFrom, 0, 30);
+            ui->tooltip("0 = 1회부터");
+            ui->same_line();
+            ui->text("~");
+            ui->same_line();
+            ui->set_next_width(70.0f);
+            if (ui->input_int("##innto", &g_when.innTo, 1))
+                g_when.innTo = std::clamp(g_when.innTo, 0, 30);
+            ui->tooltip("0 = 끝까지 (연장 포함)");
+            ui->same_line();
+            ui->set_next_width(130.0f);
+            ui->combo("##whenscore", &g_when.score, kScoreModes, 6);
+            ui->same_line();
+            ui->text("점수 차");
+            ui->same_line();
+            ui->set_next_width(70.0f);
+            if (ui->input_int("##diffmin", &g_when.diffMin, 1))
+                g_when.diffMin = std::clamp(g_when.diffMin, 0, 99);
+            ui->same_line();
+            ui->text("~");
+            ui->same_line();
+            ui->set_next_width(70.0f);
+            if (ui->input_int("##diffmax", &g_when.diffMax, 1))
+                g_when.diffMax = std::clamp(g_when.diffMax, 0, 99);
+            ui->tooltip("점수 차 범위 (0 = 제한 없음). 예: '지고 있을 때' + 1~3 = 1~3점 뒤질 때");
+            ui->set_next_width(150.0f);
+            ui->combo("##whenrunners", &g_when.runners, kRunnerModes, 5);
+            ui->same_line();
+            ui->set_next_width(120.0f);
+            ui->combo("##whenouts", &g_when.outs, kOutModes, 4);
+            ui->same_line();
+            if (ui->small_button("조건 없음으로"))
+                g_when = Condition{};
+            ui->text_disabled(("지금 조건: " + conditionLabel(g_when)).c_str());
+
             // Forced results
-            ui->separator_text("결과 강제 (먼저 맞는 것: 고른 선수 타자 > 고른 선수 투수 > 전체 타자 > 전체 투수)");
+            ui->separator_text("결과 강제 (먼저 맞는 것: 고른 선수 타자 > 고른 선수 투수 > 전체 타자 > 전체 투수, 조건 있는 규칙이 먼저)");
             if (settings.rules.empty())
                 ui->text_disabled("규칙이 없습니다.");
             int remove = -1;
@@ -898,7 +1081,16 @@ namespace urban::matchscript
                 if (ui->small_button("빼기"))
                     remove = static_cast<int>(i);
                 ui->same_line();
-                ui->text((nameOfTarget(rule.target) + " · " + (rule.pitcher ? "투수일 때 " : "타자일 때 ") + what).c_str());
+                ui->text((nameOfTarget(rule.target) + " · " + (rule.pitcher ? "투수일 때 " : "타자일 때 ") + what + " · " +
+                          conditionLabel(rule.when))
+                             .c_str());
+                ui->same_line();
+                if (ui->small_button("위 조건 붙이기"))
+                {
+                    settings.rules[i].when = g_when;
+                    changed = true;
+                }
+                ui->tooltip("위 '발동 조건'에 지금 정한 조건을 이 규칙에 붙입니다. '조건 없음으로'를 누른 뒤 붙이면 조건이 떨어집니다.");
                 ui->pop_id();
             }
             if (remove >= 0)
@@ -920,12 +1112,12 @@ namespace urban::matchscript
             {
                 for (const int target : targetsOf(g_groupTarget))
                 {
-                    const Rule rule{target, g_groupRole == 1, static_cast<Action>(g_groupAction + 1)};
+                    const Rule rule{target, g_groupRole == 1, static_cast<Action>(g_groupAction + 1), g_when};
                     bool replaced = false;
                     for (Rule &existing : settings.rules)
-                        if (existing.target == rule.target && existing.pitcher == rule.pitcher)
+                        if (existing.target == rule.target && existing.pitcher == rule.pitcher && existing.when == rule.when)
                         {
-                            existing.action = rule.action; // one result per target and role
+                            existing.action = rule.action; // one result per target, role and condition
                             replaced = true;
                         }
                     if (!replaced)
@@ -990,7 +1182,14 @@ namespace urban::matchscript
                     std::snprintf(factor, sizeof(factor), " 상대 교타·선구안 ÷%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, -boost.add);
                 else
                     std::snprintf(factor, sizeof(factor), " x%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, boost.add);
-                ui->text((nameOfTarget(boost.target) + " · " + kStats[boost.stat].label + factor).c_str());
+                ui->text((nameOfTarget(boost.target) + " · " + kStats[boost.stat].label + factor + " · " + conditionLabel(boost.when)).c_str());
+                ui->same_line();
+                if (ui->small_button("위 조건 붙이기##boostwhen"))
+                {
+                    boost.when = g_when;
+                    changed = true;
+                }
+                ui->tooltip("위 '발동 조건'에 지금 정한 조건을 이 중첩에 붙입니다. '조건 없음으로'를 누른 뒤 붙이면 조건이 떨어집니다.");
                 // The multiplier in steps of 0.1 and 1 (0.1 .. 100), the added value in steps of 1, 10 and 100.
                 ui->text_disabled("    배율");
                 for (const int step : {-100, -10, 10, 100})
@@ -1037,10 +1236,10 @@ namespace urban::matchscript
             {
                 for (const int target : targetsOf(g_boostTarget))
                 {
-                    const Boost boost{target, g_boostStat, 200, 0};
+                    const Boost boost{target, g_boostStat, 200, 0, g_when};
                     bool exists = false;
                     for (const Boost &existing : settings.boosts)
-                        exists = exists || (existing.target == boost.target && existing.stat == boost.stat);
+                        exists = exists || (existing.target == boost.target && existing.stat == boost.stat && existing.when == boost.when);
                     if (!exists)
                     {
                         settings.boosts.push_back(boost);
