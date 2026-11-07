@@ -7,7 +7,8 @@ What goes in (one folder; the launcher finds yktk3.exe next to it):
   README.txt, LICENSE.txt, THIRD-PARTY.txt.
 What never goes in: anything from the disc (game_data, RAM and VU1 dumps), what the game or the launcher writes while
 it runs (memcards, states, logs, cheat_saves, cheat_values, player_cheats.ini, scout_cheats.ini, match_script.ini,
-launcher.ini, profiles), debug files (.pdb, .ilk) and backups (.bak*).
+staff_cheats.ini, ichinen_cheats.ini, ability_limits.ini, ichinen_skills.bin, launcher.ini, profiles), debug files
+(.pdb, .ilk) and backups (.bak*).
 
 usage: py -3 tools/release_yktk3.py [version, default today's date]"""
 import datetime
@@ -27,7 +28,8 @@ FILES = ["yktk3.exe", "YKTK3 Launcher.exe", "cheats_native.txt", "player_cheat_i
 FOLDERS = ["resources", "shadercache_pcsx2", "mods"]
 # Never, wherever they are (checked again on the finished folder).
 FORBIDDEN_NAMES = {"memcards", "states", "logs", "game_data", "cheat_saves", "cheat_values", "player_cheats.ini",
-                   "scout_cheats.ini", "match_script.ini", "launcher.ini", "scout_models.tsv", "SLPM_658.53"}
+                   "scout_cheats.ini", "match_script.ini", "staff_cheats.ini", "ichinen_cheats.ini", "ability_limits.ini",
+                   "ichinen_skills.bin", "launcher.ini", "scout_models.tsv", "SLPM_658.53"}
 FORBIDDEN_SUFFIXES = {".pdb", ".ilk", ".iso", ".ps2", ".state", ".ram", ".exp", ".lib"}
 FORBIDDEN_PATTERNS = [re.compile(p, re.I) for p in (r"\.bak", r"^ram_.*\.bin$", r"^vu1.*\.bin$", r"^perfil_", r"^perf-")]
 
@@ -63,10 +65,11 @@ PlayStation 2 판 (SEGA 2005, SLPM-65853) 의 PC 네이티브 포트입니다. �
 알아 둘 것
 - yktk3.exe 에는 게임의 실행 코드(SEGA)를 C++ 로 변환한 코드가 들어 있습니다. 게임과 그 안의 모든 데이터·코드의 권리는
   SEGA 에 있습니다. 게임 데이터(그래픽·소리 등)는 각자의 디스크 이미지에서 읽습니다.
-- 게임 중 단축키: F1 단축키 목록, F2 게임 메뉴(선수 치트·스카우트·스태프·이치넨·경기 스크립트·치트), F5 빠른 저장,
-  F9 빠른 불러오기, F7 200%, F8 터보, F11 전체 화면.
-- F2 선수 치트·스카우트의 설정은 세이브마다 따로 cheat_saves 폴더에 저장됩니다. 값을 정한 뒤 '적용'(1회) 또는
-  '적용 및 고정'을 눌러야 씁니다.
+- 게임 중 단축키: F1 단축키 목록, F2 게임 메뉴(선수 치트·치트·스태프 치트·이치넨·구장·시설·경기 스크립트·99 제한·
+  스카우트), F5 빠른 저장, F9 빠른 불러오기, F7 200%, F8 터보, F11 전체 화면.
+- F2 메뉴의 설정은 세이브마다 따로 cheat_saves 폴더에 저장되고, 새 게임은 빈 설정으로 시작합니다(새 세이브는 '99 제한
+  풀기'·'이치넨 99 상한 풀기'·최종값 상한 교타 200이 켜진 채). 선수 치트는 값을 정한 뒤 '적용'(1회) 또는 '적용 및 고정'을
+  눌러야 씁니다. 능력치는 127까지(화면에는 S+), 그 위는 이치넨 스킬 보너스로 올립니다.
 - mods 폴더의 .pnach 치트와 player_cheat_items.txt(팀 S+ 항목)는 커뮤니티가 만든 치트를 이 포트에 맞춘 것입니다.
   런처의 치트 페이지에서 켜고 끕니다.
 - 필요한 것: Windows 10/11 64비트, DirectX 11 그래픽카드, SSE4.1 CPU.
