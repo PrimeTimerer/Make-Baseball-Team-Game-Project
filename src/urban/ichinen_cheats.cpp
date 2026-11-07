@@ -1,5 +1,6 @@
 #include "urban/ichinen_cheats.h"
 
+#include "urban/function_hooks.h"
 #include "urban/skill_table.h"
 
 #include "runtime/ps2_game_menu.h"
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +51,29 @@ namespace urban::ichinen
         constexpr uint32_t kTeamTable = 0x5D1240u;
         constexpr long long kMaxPoints = 99999;
 
+        // What an Ichinen-made skill does in a match (REA / rizin, 2026-11-07). An Ichinen run ends in a 0x4A-byte record, a
+        // skill with an ID from 500 up, kept by the own-data object [0x5D12B8] at +0xC8 (8 records; sub_0015E740 looks in the
+        // match's copy 0x19396E0 + side * 0x250 instead while [0x1939B80] holds a side). sub_00188CA8, the own club's
+        // match-copy builder, calls sub_00160BC0(object, copy, ID) for each skill ID >= 500 of the player. That adds the record's
+        // ability bytes to the copy as signed bytes and cuts every sum at 99 (movz with 99, word 0x00E3100A at 0x160C48), the 18
+        // pitch-type levels too; only the stamina maximum (copy +0x64, 体力 x 100) takes its bonus uncut. With 노캡 the hook
+        // makes the same adds with the bonus as 0..255 and stops at the byte's 255 (stamina at 32767). Batters' values above
+        // 99 go through the at-bat setup as they are (sub_002C0578 / sub_002C0AB0 cut nothing); the pitch object
+        // (sub_002B0748) cuts a pitcher's 球速 / 球威 / 制球 and pitch levels at 99 again.
+        constexpr uint32_t kBonusFunction = 0x160BC0u, kOwnData = 0x5D12B8u, kRecords = 0xC8u, kRecordSize = 0x4Au;
+        constexpr uint32_t kMatchSide = 0x1939B80u, kMatchRecords = 0x19396E0u, kMatchRecordsSize = 0x250u;
+        constexpr uint32_t kPitchTypes = 0x679AA8u; // the pitch types of the record's 18 level bonuses (+0x32..)
+        constexpr uint32_t kCopyStamina = 0x64u, kRecordStamina = 0x2Eu, kRecordPitches = 0x32u;
+        constexpr uint32_t kCopyPitches = 0x6Cu; // 10 pairs (type, level)
+        constexpr uint16_t kTestSkill = 500u;
+        constexpr uint32_t kPlayerSkills = 0x44u; // a player record's 8 skill IDs (u16)
+        // (record offset, copy offset) of the abilities in the game's order; +0x2D goes to two fields (the game's own code).
+        constexpr std::array<std::pair<uint8_t, uint8_t>, 14> kBonusFields{{{0x24, 0x85}, {0x25, 0x86}, {0x26, 0x87},
+                                                                            {0x27, 0x8B}, {0x28, 0x8E}, {0x29, 0x8F},
+                                                                            {0x2A, 0x8A}, {0x2B, 0x8C}, {0x2C, 0x8D},
+                                                                            {0x2D, 0x68}, {0x2D, 0x84}, {0x2F, 0x81},
+                                                                            {0x30, 0x82}, {0x31, 0x83}}};
+
         // A catalog entry (16 bytes): +4 type (0 batter ability, 1 pitcher ability, 2/3 skill, 4 player, 5 special
         // player, 6 condition), +8 id (s16 for 0/1, else u32), +0xA level (0/1: shown as "＋level+1"), +0xC price.
         struct Item
@@ -69,6 +94,7 @@ namespace urban::ichinen
             long long points = -1;
             bool lockPoints = false;
             bool rebuy = false; // every slot buyable again at every frame
+            bool noCap = false; // Ichinen-made skills add past the game's 99 in matches
             std::map<int, Slot> slots;
         };
         struct View
@@ -98,6 +124,11 @@ namespace urban::ichinen
         View g_view;
         std::vector<Action> g_actions;
         std::map<int, std::string> g_abilityKorean, g_conditionKorean;
+        std::atomic<bool> g_noCap{false};
+        GuestFunction g_bonusOriginal = nullptr;
+        bool g_bonusLog = false;                    // URBAN_ICHINEN_LOG=1: a line per bonus
+        int g_testPlayer = 0, g_testBonus = 0;      // URBAN_TEST_ICHINEN="<player id>,<bonus>"
+        bool g_testPlaced = false;
 
         std::string trim(std::string text)
         {
@@ -123,6 +154,11 @@ namespace urban::ichinen
         }
 
         void write32(uint32_t address, uint32_t value)
+        {
+            std::memcpy(g_rdram + address, &value, sizeof(value));
+        }
+
+        void write16(uint32_t address, uint16_t value)
         {
             std::memcpy(g_rdram + address, &value, sizeof(value));
         }
@@ -221,12 +257,130 @@ namespace urban::ichinen
                 write32(state + kPoints, static_cast<uint32_t>(std::clamp<long long>(points, 0, kMaxPoints)));
         }
 
+        // sub_0015E740 as sub_00160BC0 calls it: the record with this ID among the 8 of the object, or of the match copy of
+        // a side; 0 when none.
+        uint32_t findRecord(uint32_t object, int16_t id)
+        {
+            const int8_t side = static_cast<int8_t>(g_rdram[kMatchSide]);
+            const int64_t base = side == -1 ? static_cast<int64_t>(object & 0x1FFFFFFFu) + kRecords
+                                            : static_cast<int64_t>(kMatchRecords) + static_cast<int64_t>(side) * kMatchRecordsSize;
+            if (base < 0x100000 || base + 8 * kRecordSize > kRamSize)
+                return 0u;
+            for (uint32_t k = 0; k < 8u; ++k)
+            {
+                const uint32_t record = static_cast<uint32_t>(base) + k * kRecordSize;
+                if (static_cast<int16_t>(read16(record)) == id)
+                    return record;
+            }
+            return 0u;
+        }
+
+        // sub_00160BC0 (EE thread, while a match copy of the own club is built): the game's own adds (cut at 99), or with
+        // 노캡 the same adds up to 255. Calls no game code, so it returns to the caller itself.
+        void bonusHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t object = getRegU32(ctx, 4), copy = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+            const int16_t id = static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFFu);
+            const uint32_t record = findRecord(object, id);
+            const bool copyOk = copy >= 0x100000u && copy + 0x90u <= kRamSize;
+            if (!g_noCap.load(std::memory_order_relaxed) || record == 0u || !copyOk)
+            {
+                if (g_bonusLog && record != 0u && copyOk)
+                    std::fprintf(stderr, "[ichinen] skill %d (game, cut at 99): copy 0x%x 장타 %u + %d\n", id, copy,
+                                 rdram[copy + 0x87u], static_cast<int8_t>(rdram[record + 0x26u]));
+                g_bonusOriginal(rdram, ctx, runtime); // nothing after it: the game may continue it later
+                return;
+            }
+            const unsigned before = rdram[copy + 0x87u];
+            for (const auto &[from, to] : kBonusFields)
+                rdram[copy + to] = static_cast<uint8_t>(std::min(255u, rdram[copy + to] + static_cast<unsigned>(rdram[record + from])));
+            uint16_t stamina;
+            std::memcpy(&stamina, rdram + copy + kCopyStamina, sizeof(stamina));
+            stamina = static_cast<uint16_t>(std::min(0x7FFFu, stamina + 100u * rdram[record + kRecordStamina]));
+            std::memcpy(rdram + copy + kCopyStamina, &stamina, sizeof(stamina));
+            for (uint32_t k = 0; k < 10u; ++k)
+                for (uint32_t t = 0; t < 18u; ++t)
+                    if (rdram[copy + kCopyPitches + 2u * k] == rdram[kPitchTypes + t])
+                    {
+                        uint8_t &level = rdram[copy + kCopyPitches + 2u * k + 1u];
+                        level = static_cast<uint8_t>(std::min(255u, level + static_cast<unsigned>(rdram[record + kRecordPitches + t])));
+                    }
+            if (g_bonusLog)
+                std::fprintf(stderr, "[ichinen] skill %d (노캡): copy 0x%x 장타 %u -> %u\n", id, copy, before, rdram[copy + 0x87u]);
+            ctx->r[2] = _mm_set_epi64x(0, 0);
+            ctx->pc = getRegU32(ctx, 31);
+        }
+
+        // URBAN_TEST_ICHINEN="<player id>,<bonus>" (tests): while the own data and the player are found, an Ichinen record (ID
+        // 500, every ability byte = bonus) in its first free record and skill 500 on the player; written again when a loaded
+        // state took them away.
+        void placeTestSkill()
+        {
+            const uint32_t object = read32(kOwnData);
+            if (!valid(object, kRecords + 8u * kRecordSize))
+                return;
+            uint32_t player = 0u;
+            for (int t = 0; t < 12 && player == 0u; ++t)
+            {
+                const uint32_t team = read32(kTeamTable + 4u * static_cast<uint32_t>(t));
+                const uint32_t roster = valid(team, 0x124u) ? read32(team + 0x120u) : 0u;
+                if (!valid(roster, 8u + 4u * 40u))
+                    continue;
+                for (uint32_t k = 0; k < 40u && player == 0u; ++k)
+                {
+                    const uint32_t record = read32(roster + 8u + 4u * k);
+                    if (valid(record, kPlayerSkills + 16u) && read16(record) == static_cast<uint16_t>(g_testPlayer))
+                        player = record;
+                }
+            }
+            if (player == 0u)
+                return;
+            uint32_t record = 0u;
+            for (uint32_t k = 0; k < 8u && record == 0u; ++k)
+            {
+                const uint32_t at = object + kRecords + k * kRecordSize;
+                if (read16(at) == kTestSkill || read16(at) == 0u)
+                    record = at;
+            }
+            if (record == 0u)
+            {
+                if (!g_testPlaced)
+                    std::fprintf(stderr, "[ichinen] test: no free Ichinen record\n");
+                g_testPlaced = true;
+                return;
+            }
+            const bool recordThere = read16(record) == kTestSkill && g_rdram[record + 0x26u] == static_cast<uint8_t>(g_testBonus);
+            std::memset(g_rdram + record, 0, kRecordSize);
+            write16(record, kTestSkill);
+            for (const auto &[from, to] : kBonusFields)
+                g_rdram[record + from] = static_cast<uint8_t>(g_testBonus);
+            g_rdram[record + kRecordStamina] = static_cast<uint8_t>(g_testBonus);
+            uint32_t freeSlot = 0u;
+            bool has = false;
+            for (uint32_t k = 0; k < 8u; ++k)
+            {
+                const uint16_t skill = read16(player + kPlayerSkills + 2u * k);
+                has = has || skill == kTestSkill;
+                if (skill == 0u && freeSlot == 0u)
+                    freeSlot = player + kPlayerSkills + 2u * k;
+            }
+            if (!has && freeSlot != 0u)
+                write16(freeSlot, kTestSkill);
+            if (!has || !recordThere)
+                std::fprintf(stderr, "[ichinen] test: Ichinen skill %u (+%d) on player %d (record 0x%x, player 0x%x, %s)\n", kTestSkill,
+                             g_testBonus, g_testPlayer, record, player, has || freeSlot != 0u ? "skill set" : "no free skill slot");
+            g_testPlaced = true;
+        }
+
         // EE thread, at every vblank after the .pnach patches: the menu's one-off writes, the held ones, and every 15
         // frames what the menu shows.
         void frame()
         {
             static unsigned tick = 0u;
             std::lock_guard<std::mutex> lock(g_mutex);
+            static unsigned testTick = 0u;
+            if (g_testPlayer > 0 && (++testTick % 30u) == 0u)
+                placeTestSkill();
             const uint32_t m = manager();
             if (m == 0u)
             {
@@ -330,7 +484,7 @@ namespace urban::ichinen
             }
         }
 
-        // ichinen_cheats.ini: enabled=, points=, lockpoints=, rebuy=, slot=<slot>,<catalog number>,<lock>
+        // ichinen_cheats.ini: enabled=, points=, lockpoints=, rebuy=, nocap=, slot=<slot>,<catalog number>,<lock>
         Settings loadSettings(const std::filesystem::path &path)
         {
             Settings settings;
@@ -351,6 +505,8 @@ namespace urban::ichinen
                     settings.lockPoints = value == "1";
                 else if (key == "rebuy")
                     settings.rebuy = value == "1";
+                else if (key == "nocap")
+                    settings.noCap = value == "1";
                 else if (key == "slot")
                 {
                     int slot = -1, item = -1, held = 0;
@@ -368,7 +524,8 @@ namespace urban::ichinen
                  << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
                  << "points=" << settings.points << "\n"
                  << "lockpoints=" << (settings.lockPoints ? 1 : 0) << "\n"
-                 << "rebuy=" << (settings.rebuy ? 1 : 0) << "\n";
+                 << "rebuy=" << (settings.rebuy ? 1 : 0) << "\n"
+                 << "nocap=" << (settings.noCap ? 1 : 0) << "\n";
             for (const auto &[slot, picked] : settings.slots)
                 if (picked.item >= 0)
                     file << "slot=" << slot << "," << picked.item << "," << (picked.lock ? 1 : 0) << "\n";
@@ -462,6 +619,21 @@ namespace urban::ichinen
                 settings = g_settings;
                 view = g_view;
             }
+            // Ichinen-made skills in matches: any mode (the skills are used in the main game).
+            ui->separator_text("이치넨 스킬 (경기)");
+            int noCap = settings.noCap ? 1 : 0;
+            if (ui->checkbox("이치넨 스킬 99 상한 풀기 (99+99=198)", &noCap))
+            {
+                settings.noCap = noCap != 0;
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_settings.noCap = settings.noCap;
+                g_noCap.store(settings.noCap);
+                saveSettings(g_settings);
+            }
+            ui->tooltip("이치넨에서 만든 스킬(ID 500 이상)을 가진 선수가 경기에 나올 때 그 스킬의 능력 보너스를 더하는 방식입니다. "
+                        "게임은 -128~127로 더한 뒤 99에서 자르고(체력만 예외), 켜면 0~255로 더해 255까지 둡니다. "
+                        "타자 능력은 99를 넘은 값 그대로 타석에 쓰입니다. 투수의 구속·구위·제구·변화구는 게임이 투구 때 다시 99로 자릅니다.");
+            ui->text_disabled(settings.noCap ? "켜짐: 이치넨 스킬 보너스를 255까지 더합니다 (다음 경기부터)." : "꺼짐: 게임 그대로 (보너스를 더한 뒤 99에서 자름).");
             if (!view.active)
             {
                 ui->text_wrapped("이치넨 모드에서 상점 목록이 올라오면 여기에 나옵니다 (타이틀 > イチネンモード로 게임을 진행하세요).");
@@ -599,13 +771,37 @@ namespace urban::ichinen
         g_safeMode = mods && std::strcmp(mods, ";") == 0; // the launcher's safe start
         g_settingsPath = userDir / "ichinen_cheats.ini";
         g_settings = loadSettings(g_settingsPath);
+        g_noCap.store(g_settings.noCap);
+        if (const char *log = std::getenv("URBAN_ICHINEN_LOG"))
+            g_bonusLog = std::strcmp(log, "1") == 0;
+        if (const char *test = std::getenv("URBAN_TEST_ICHINEN"); test && *test)
+        {
+            if (std::sscanf(test, "%d,%d", &g_testPlayer, &g_testBonus) < 2)
+                g_testPlayer = 0;
+            g_bonusLog = true;
+        }
         loadKorean(userDir / "mods" / std::filesystem::path(u8"기능별") / std::filesystem::path(u8"한국어 이름.tsv"));
-        std::fprintf(stderr, "[ichinen] cheats %s, %zu slots held, %zu Korean names\n", g_settings.enabled ? "on" : "off",
-                     g_settings.slots.size(), g_abilityKorean.size() + g_conditionKorean.size());
+        std::fprintf(stderr, "[ichinen] cheats %s, %zu slots held, %zu Korean names, Ichinen skills %s\n", g_settings.enabled ? "on" : "off",
+                     g_settings.slots.size(), g_abilityKorean.size() + g_conditionKorean.size(),
+                     g_settings.noCap ? "past 99 (노캡)" : "cut at 99 (the game)");
 #if defined(URBAN_ICHINEN_MENU)
         ps2x::menu::addPanel("이치넨", [](const Pcsx2GsUi *ui) { draw(ui); });
 #endif
         if (!g_safeMode)
             ps2x::pnach::addFrameHook(frame);
+    }
+
+    void installHooks(PS2Runtime &runtime)
+    {
+        (void)runtime;
+        if (!g_rdram || g_safeMode)
+            return;
+        FunctionHooks &hooks = FunctionHooks::instance();
+        if (!hooks.replace(kBonusFunction, "ichinen_skill_bonus", &bonusHook, ReplacementStatus::Native,
+                           "ichinen cheats: Ichinen-made skills past 99 (노캡); off: the game's own"))
+            return;
+        g_bonusOriginal = hooks.original(kBonusFunction);
+        if (!g_bonusOriginal)
+            std::fprintf(stderr, "[ichinen] sub_00160BC0 has no recompiled function: Ichinen skills always past 99\n");
     }
 }

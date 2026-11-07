@@ -1,0 +1,20 @@
+// Built-in code variant (tools/cheat_code.py compiles it like a cheat's, not listed as a cheat file).
+// The pitch object (sub_002B0748) without its 99 cut after the skill modifiers: 255 instead. The "99 제한" tab of
+// the in-game menu writes these words while its switch is on and the game's words back when it is off
+// (src/urban/ability_limits.cpp, kPitchPatches: keep the two lists the same).
+// 球速 (+0x60, 0x2B09D4) keeps its 99: sub_002B1660 maps 球速 to km/h through a table that ends there and reads 100 up as 0.
+// 球威 +0x64
+patch=1,EE,002B0A40,word,28430100
+patch=1,EE,002B0A4C,word,240200FF
+// 制球 +0x68
+patch=1,EE,002B0AAC,word,28430100
+patch=1,EE,002B0AB8,word,240200FF
+// +0x6C
+patch=1,EE,002B0AF8,word,28430100
+patch=1,EE,002B0B04,word,240200FF
+// 변화구 레벨 (스킬 보정)
+patch=1,EE,002B0BF4,word,28620100
+patch=1,EE,002B0C14,word,240300FF
+// 변화구 레벨 (구종 보정)
+patch=1,EE,002B0D24,word,28620100
+patch=1,EE,002B0D44,word,240300FF

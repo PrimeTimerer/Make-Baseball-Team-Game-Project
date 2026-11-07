@@ -9,8 +9,13 @@
 // +0x16E[id]; ability items add their level to +0xCC[id], their effect). The tab shows the slots with the items' names
 // (Korean from mods/기능별/한국어 이름.tsv, the game's own names next to them), changes a slot to any catalog item once or
 // held (고정), makes slots buyable again (one, all, or at every frame), and sets or holds the points ([0x62B45C] + 8).
-// Settings: ichinen_cheats.ini in the user folder (written by the tab).
+// Settings: ichinen_cheats.ini in the user folder (written by the tab). The tab's 노캡 switch lets Ichinen-made skills (ID 500
+// and up) add their ability bonus past the game's 99 in matches (installHooks: sub_00160BC0).
+class PS2Runtime;
+
 namespace urban::ichinen
 {
     void install(uint8_t *rdram, const std::filesystem::path &userDir);
+    // The match bonus of Ichinen-made skills: a hook, so after attach (and after install).
+    void installHooks(PS2Runtime &runtime);
 }

@@ -28,6 +28,7 @@
 #include "urban/cheat_menu.h"
 #include "urban/staff_cheats.h"
 #include "urban/ichinen_cheats.h"
+#include "urban/ability_limits.h"
 #include "urban/stadium_cheats.h"
 #include "urban/match_script.h"
 #include "urban/scout_cheats.h"
@@ -1489,6 +1490,10 @@ int main(int argc, char *argv[])
         urban::saveid::install(runtime, runtime.memory().getRDRAM(), userDir);
         // The camp's special practice for any number of players, through the game's own rolls (player cheats' camp queue).
         urban::players::installCamp(runtime);
+        // Ichinen-made skills past the game's 99 in matches (the 이치넨 tab's switch): a hook, so after attach.
+        urban::ichinen::installHooks(runtime);
+        // The 99 limit of abilities in matches (the 99 제한 tab): hooks and the pitch object's code variant, so after attach.
+        urban::limits::install(runtime, runtime.memory().getRDRAM(), userDir);
         // Scouting: finds a day, the wish list found at once, CPU clubs kept off protected players (scout_cheats.ini).
         urban::scout::install(runtime, runtime.memory().getRDRAM(), userDir);
         ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)

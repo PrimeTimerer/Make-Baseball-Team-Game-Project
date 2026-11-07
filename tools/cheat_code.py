@@ -28,6 +28,9 @@ import sys
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 TEXT = (0x100000, 0x56F1B8)
+# Built-in code variants: .pnach files of instruction words the port itself switches at run time (the in-game menu writes
+# them, e.g. the 99 제한 tab), compiled like a cheat's and left out of the cheat list.
+VARIANTS = os.path.join(ROOT, "recomp", "code_variants")
 MAX_COMBINED_FILES = 6
 
 
@@ -138,6 +141,8 @@ def build(elf_path, mods, functions_csv, out_path, manifest_path=None):
     groups = os.path.join(mods, "기능별") if mods else ""
     if groups and os.path.isdir(groups):
         files += sorted("기능별/" + f for f in os.listdir(groups) if f.lower().endswith(".pnach"))
+    builtin = sorted(os.path.join(VARIANTS, f) for f in os.listdir(VARIANTS) if f.lower().endswith(".pnach")) if os.path.isdir(VARIANTS) else []
+    files += builtin  # absolute paths: os.path.join(mods, name) keeps them
     starts, bounds = set(), []
     for line in open(functions_csv, encoding="utf-8"):
         parts = line.strip().split(",")
@@ -303,12 +308,14 @@ def build(elf_path, mods, functions_csv, out_path, manifest_path=None):
         with open(manifest_path, "w", encoding="utf-8", newline="\n") as out:
             out.write("# Cheat files compiled into yktk3.exe (tools/cheat_code.py): sha256, kind, name\n")
             for name in files:
+                if name in builtin:
+                    continue
                 digest = hashlib.sha256(open(os.path.join(mods, name), "rb").read()).hexdigest()
                 out.write(f"{digest}\t{kinds[name]}\t{name}\n")
     for problem in problems:
         print("  cheat code: " + problem)
     code_files = [n for n in files if kinds[n] == "code"]
-    print(f"cheat code: {len(files)} cheat files ({len(code_files)} with code), {len(regions)} code regions, "
+    print(f"cheat code: {len(files) - len(builtin)} cheat files + {len(builtin)} built-in variants ({len(code_files)} with code), {len(regions)} code regions, "
           f"{len(cave_list)} cheat routines, {len(entries)} entry points")
     return sorted(entries)
 
