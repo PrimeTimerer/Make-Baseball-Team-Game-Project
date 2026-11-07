@@ -2,6 +2,7 @@
 
 #include "urban/function_hooks.h"
 #include "urban/skill_table.h"
+#include "urban/save_identity.h"
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
@@ -103,14 +104,17 @@ namespace urban::ichinen
             long long points = -1;
             bool lockPoints = false;
             bool rebuy = false; // every slot buyable again at every frame
-            bool noCap = false; // Ichinen-made skills add past the game's 99 in matches
+            bool noCap = true; // Ichinen-made skills add past the game's 99 in matches (default on since 11-08; nocap=0 keeps it off)
             // The editor's bonus caps, for skills made on top of ability cheats (the owner's design, 2026-11-08): 교타 +72 and
             // 변화구 +99 unless unlocked; the other bytes go to 255.
             bool capContact = true, capPitches = true;
             int contactCap = 72, pitchCap = 99;
-            // Final-value caps (2026-11-08): per player (any value > 0 wins), else the own team's default; 0 = none.
-            bool finalCaps = false;
-            std::array<int, kCapStats> capsOwn{};
+            // Final-value caps (2026-11-08): per player (any value > 0 wins), else the own team's default; 0 = none. Default
+            // (owner, 11-08: "기본적인 상한값을 설정하면 매번 손댈 필요가 없지"): on, own team 교타 200 - the sims' best
+            // balance (200 + 장타 255: TB/PA 1.11-1.27 with HRs) before the HR cliff (232: HR/PA .025). 장타 and the pitchers'
+            // abilities only got better with more; 주력·선구안·번트·주루 are untested: no cap. Below 200 without cheats anyway.
+            bool finalCaps = true;
+            std::array<int, kCapStats> capsOwn{200};
             std::map<int, std::array<int, kCapStats>> caps;
             // 스킬 발동 100% (2026-11-08): the skill checks' chance roll always passes (their conditions still apply). Scope 0 =
             // the 7 skills inside Ichinen skills (effect slots 8-14), 1 = every slot and the staff's; all = the own team, else
@@ -172,6 +176,8 @@ namespace urban::ichinen
             std::vector<std::array<int16_t, 15>> skillDefs;
         };
         void publishOwnIds(const std::vector<OwnPlayer> &players); // for the game thread's hooks (below, with the caps)
+        void publishCaps(const Settings &settings);                // below
+        Settings loadSettings(const std::filesystem::path &path);  // below
         struct SkillAction
         {
             int kind = 0; // 0 bonus byte, 1 skill, 2 create, 3 clear, 4 give to a player, 5 take from a player, 6 name,
@@ -184,7 +190,9 @@ namespace urban::ichinen
         };
 
         uint8_t *g_rdram = nullptr;
-        std::filesystem::path g_settingsPath;
+        std::filesystem::path g_settingsPath; // this save's (urban::saveid), empty before any game
+        uint32_t g_generation = ~0u;          // urban::saveid::generation() g_settings belong to (under g_mutex)
+        std::string g_profile;
         bool g_safeMode = false;
         std::mutex g_mutex;
         Settings g_settings;
@@ -870,6 +878,19 @@ namespace urban::ichinen
             static unsigned testTick = 0u;
             if (!g_testPlayers.empty() && (++testTick % 30u) == 0u)
                 placeTestSkill();
+            // Per save (owner, 11-08): cheat_saves/<save>/ichinen_cheats.ini; a new game starts with none.
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_generation)
+            {
+                g_generation = generation;
+                g_profile = urban::saveid::current();
+                g_settingsPath = urban::saveid::settingsFile(g_profile, "ichinen_cheats.ini");
+                std::error_code error;
+                g_settings = !g_settingsPath.empty() && std::filesystem::exists(g_settingsPath, error) ? loadSettings(g_settingsPath) : Settings{};
+                g_noCap.store(g_settings.noCap);
+                publishCaps(g_settings);
+                std::fprintf(stderr, "[ichinen] save %s: 노캡 %s, 최종값 상한 %s, 상시 작동 %s\n", g_profile.empty() ? "(none)" : g_profile.c_str(),
+                             g_settings.noCap ? "on" : "off", g_settings.finalCaps ? "on" : "off", g_settings.ichinenForce ? "on" : "off");
+            }
             static unsigned skillTick = 0u;
             skillFrame(++skillTick); // the own data's Ichinen skills: any mode
             const uint32_t m = manager();
@@ -1045,9 +1066,12 @@ namespace urban::ichinen
                 g_ownIdsNow.push_back(player.id);
         }
 
+        constexpr std::array<int, kCapStats> kDefaultCaps{200}; // 교타 200 (see Settings::capsOwn)
+
         Settings loadSettings(const std::filesystem::path &path)
         {
             Settings settings;
+            bool capsMarked = false; // "capsdefaults=1": the caps as saved (else, never set: the default caps)
             std::ifstream file(path, std::ios::binary);
             std::string line;
             while (std::getline(file, line))
@@ -1077,6 +1101,8 @@ namespace urban::ichinen
                     settings.pitchCap = std::clamp(std::atoi(value.c_str()), 0, 255);
                 else if (key == "finalcaps")
                     settings.finalCaps = value == "1";
+                else if (key == "capsdefaults")
+                    capsMarked = true;
                 else if (key == "capsown")
                     settings.capsOwn = capsOf(value);
                 else if (key == "alwaysskills")
@@ -1109,11 +1135,19 @@ namespace urban::ichinen
                         settings.slots[slot] = Slot{item, held != 0};
                 }
             }
+            // A file from before the default caps with none set: the defaults (written with the marker at the next save).
+            if (!capsMarked && !settings.finalCaps && capText(settings.capsOwn).empty() && settings.caps.empty())
+            {
+                settings.finalCaps = true;
+                settings.capsOwn = kDefaultCaps;
+            }
             return settings;
         }
 
         void saveSettings(const Settings &settings)
         {
+            if (g_settingsPath.empty())
+                return; // before any game: nothing to keep it for
             std::ofstream file(g_settingsPath, std::ios::binary | std::ios::trunc);
             file << "# 이치넨 치트 설정: 게임 메뉴(F2)의 \"이치넨\" 탭이 씁니다\n"
                  << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
@@ -1129,6 +1163,7 @@ namespace urban::ichinen
                 if (picked.item >= 0)
                     file << "slot=" << slot << "," << picked.item << "," << (picked.lock ? 1 : 0) << "\n";
             file << "finalcaps=" << (settings.finalCaps ? 1 : 0) << "\n"
+                 << "capsdefaults=1\n"
                  << "capsown=" << capText(settings.capsOwn) << "\n"
                  << "ichinenforce=" << (settings.ichinenForce ? 1 : 0) << "\n"
                  << "alwaysskills=" << (settings.alwaysSkills ? 1 : 0) << "\n"
@@ -1624,6 +1659,19 @@ namespace urban::ichinen
             ui->set_next_width(320.0f);
             ui->combo("대상##finalcap", &target, items.data(), static_cast<int>(items.size()));
             const OwnPlayer *player = target > 0 ? &skills.players[static_cast<size_t>(target - 1)] : nullptr;
+            if (!player)
+            {
+                ui->same_line();
+                if (ui->small_button("연구 기본값 (교타 200)"))
+                {
+                    settings.finalCaps = true;
+                    settings.capsOwn = kDefaultCaps;
+                    changed = true;
+                }
+                ui->tooltip("시뮬 결과: 교타는 200 근처가 안타와 홈런의 균형이 가장 좋았고 232에서는 홈런이 거의 사라졌습니다. 장타와 투수 능력은 "
+                            "높을수록 좋아서 상한이 없고, 주력·선구안·번트·주루는 아직 시험하지 않았습니다. 새 게임과 상한을 정한 적 없는 세이브는 이 값으로 "
+                            "시작합니다. 치트 없이는 교타가 200에 닿지 않아 평소 경기에는 영향이 없습니다.");
+            }
             std::array<int, kCapStats> &caps = player ? settings.caps[player->id] : settings.capsOwn;
             for (int s = 0; s < kCapStats; ++s)
             {
@@ -1888,14 +1936,16 @@ namespace urban::ichinen
             Settings settings;
             View view;
             SkillView skills;
-            std::string skillLog;
+            std::string skillLog, profile;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 settings = g_settings;
                 view = g_view;
                 skills = g_skillView;
                 skillLog = g_skillLog;
+                profile = g_profile;
             }
+            ui->text_disabled(("세이브: " + urban::saveid::describe(profile) + " — 이 세이브의 이치넨 설정 (만든 이치넨 스킬은 게임 데이터)").c_str());
             // Ichinen-made skills in matches: any mode (the skills are used in the main game).
             ui->separator_text("이치넨 스킬 (경기)");
             int noCap = settings.noCap ? 1 : 0;
@@ -2202,9 +2252,9 @@ namespace urban::ichinen
         g_rdram = rdram;
         const char *mods = std::getenv("URBAN_MODS");
         g_safeMode = mods && std::strcmp(mods, ";") == 0; // the launcher's safe start
-        g_settingsPath = userDir / "ichinen_cheats.ini";
-        g_settings = loadSettings(g_settingsPath);
-        g_noCap.store(g_settings.noCap);
+        g_settingsPath.clear(); // per save: cheat_saves/<save>/ichinen_cheats.ini, read in frame() when a game is there
+        g_settings = Settings{};
+        g_noCap.store(false);
         publishCaps(g_settings);
         if (const char *log = std::getenv("URBAN_ICHINEN_LOG"))
             g_bonusLog = std::strcmp(log, "1") == 0;

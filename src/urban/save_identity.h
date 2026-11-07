@@ -18,6 +18,9 @@ namespace urban::saveid
     void startNew();
     // <userDir>/cheat_saves/<id>: the per-save settings files.
     std::filesystem::path folder(const std::string &id);
+    // <userDir>/cheat_saves/<id>/<name> (the folder made), empty for "" (before any game). For "M00", once: the file from
+    // before the settings were per save (<userDir>/<name>) is copied there first (the owner's main save, as on 11-06).
+    std::filesystem::path settingsFile(const std::string &id, const std::string &name);
     // For the menus: "메모리카드 세이브 M00 (만든 때 2026-11-06 11:37)", "새 게임 (아직 저장 안 함)".
     std::string describe(const std::string &id);
 }

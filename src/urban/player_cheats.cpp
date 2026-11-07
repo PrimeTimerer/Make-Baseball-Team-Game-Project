@@ -119,12 +119,20 @@ namespace urban::players
         constexpr int kGradeCount = 10;
         constexpr const char *kGrades[kGradeCount] = {"S+", "S", "A+", "A", "B+", "B", "C+", "C", "D+", "D"};
         constexpr int kGradeLow[kGradeCount] = {90, 80, 70, 60, 55, 50, 45, 40, 35, 0};
-        constexpr int kGradeTop[kGradeCount] = {99, 89, 79, 69, 59, 54, 49, 44, 39, 34};
+        // S+ tops at 127 (owner, 11-08: "127을 최대값으로"; the game grades from the experience, so 90-127 all show S+).
+        constexpr int kGradeTop[kGradeCount] = {127, 89, 79, 69, 59, 54, 49, 44, 39, 34};
         constexpr const char *kAptitudes[5] = {"D", "C", "B", "A", "S"};
-        // The highest value the editor writes. The game's own scale ends at 99 and its screens grade a value above that D
-        // (the owner's screenshots of 11-07: 255 shown D, 99 S+, 89 S, whatever the experience), but values above 99 do
-        // count: the owner had a 75-home-run season from 198 / 255 (11-07), so the editor writes up to 255, as before.
-        constexpr int kValueMax = 255;
+        // The highest value the editor writes: 127 (owner, 11-08: the cheat goes to 127, Ichinen skills add on top). The game's
+        // screens grade from the experience (sub_001804A8 -> sub_00180298), which the editor writes as table[min(v, 99)],
+        // so 90-127 show S+ (11-07's "255 shown D" was an experience of 65535). 球速 stops at 99: the pitch object and the
+        // km/h table end there (writeStat).
+        constexpr int kValueMax = 127;
+        // The value a rank pick (or a fill) gives a stat: the rank's top, 球速 at most 99 (162 km/h, the game's last).
+        int statTop(int stat, int value)
+        {
+            return std::min(value, stat == sSpeedP ? 99 : kValueMax);
+        }
+
         int gradeOf(int value)
         {
             for (int g = 0; g < kGradeCount - 1; ++g)
@@ -1066,21 +1074,22 @@ namespace urban::players
         // with the experience for it, as the S+ codes do (their bytes end in the experience). table[99] at most: the table
         // ends with table[100] = 65535, and sub_00180238 returns 3 for an experience no entry is above (a value of 100 or
         // more once gave a 3 in matches). Above 99 the value byte itself counts only with the 99 제한 tab's switch.
-        void writeStat(uint32_t entry, const StatEdit &edit)
+        void writeStat(uint32_t entry, const StatEdit &edit, int stat)
         {
+            const int top = stat == sSpeedP ? 99 : kValueMax; // 球速 99 = 162 km/h, the end of the game's table
             if (edit.apt >= 0)
                 g_rdram[entry + 1u] = static_cast<uint8_t>(std::min(edit.apt, 4));
             if (edit.value >= 0)
             {
-                g_rdram[entry + 2u] = static_cast<uint8_t>(std::min(edit.value, kValueMax));
+                g_rdram[entry + 2u] = static_cast<uint8_t>(std::min(edit.value, top));
                 const uint16_t exp = read16(kExpTable + 2u * static_cast<uint32_t>(std::min(edit.value, 99)));
                 g_rdram[entry + 4u] = static_cast<uint8_t>(exp);
                 g_rdram[entry + 5u] = static_cast<uint8_t>(exp >> 8);
             }
             if (edit.limit >= 0)
-                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, kValueMax));
-            else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < std::min(edit.value, kValueMax))
-                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, kValueMax));
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, top));
+            else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < std::min(edit.value, top))
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, top));
         }
 
         // The locked abilities: the player's own (`own`), else the default target's (`group`); after the items, so they
@@ -1131,7 +1140,7 @@ namespace urban::players
                 if (backup->second.before.find(stat) == backup->second.before.end())
                     backup->second.before[stat] = {originalByte(id, entry + 1u), originalByte(id, entry + 2u), originalByte(id, entry + 3u),
                                                    originalByte(id, entry + 4u), originalByte(id, entry + 5u)};
-                writeStat(entry, edit);
+                writeStat(entry, edit, stat);
             };
             if (group)
                 for (const auto &[stat, edit] : *group)
@@ -1799,7 +1808,7 @@ namespace urban::players
                     continue;
                 }
                 const uint32_t entry = at->second + kStats[it->stat].offset - kBlock;
-                writeStat(entry, it->edit);
+                writeStat(entry, it->edit, it->stat);
                 std::fprintf(stderr, "[players] edit %u %s: %d / %d / %d\n", it->id, kStats[it->stat].key, g_rdram[entry + 2u],
                              g_rdram[entry + 3u], g_rdram[entry + 1u]);
                 g_log.add("적용됨: " + nameOfId(it->id) + " · " + kStats[it->stat].label + " " + std::to_string(g_rdram[entry + 2u]) + " (상한 " +
@@ -2431,16 +2440,16 @@ namespace urban::players
                     draft.value = std::clamp(draft.value, 0, kValueMax);
                     typed = true;
                 }
-                ui->tooltip("0~255. 경기는 능력을 경험치로 계산해서(최대 99), 값과 함께 그 경험치도 씁니다. 99 넘는 값은 F2 '99 제한' 탭의 스위치를 켜야 경기에서 그 값 그대로 쓰이고, 끄면 99입니다. 게임 화면에는 99까지만 등급이 나와 100 이상은 D로 보입니다.");
+                ui->tooltip("0~127 (구속은 99). 값과 함께 경험치도 써서 게임 화면에는 90~127이 모두 S+로 보입니다. 99 넘는 값은 F2 '99 제한' 탭의 스위치를 켜야 경기에서 그 값 그대로 쓰이고(끄면 99), 그 위는 이치넨 스킬 보너스로 올립니다.");
                 ui->table_next_column();
                 int rank = gradeOf(draft.value);
                 ui->set_next_width(58.0f);
                 if (ui->combo("##rank", &rank, kGrades, kGradeCount))
                 {
-                    draft.value = kGradeTop[rank];
+                    draft.value = statTop(stat, kGradeTop[rank]);
                     typed = true;
                 }
-                ui->tooltip("등급을 고르면 그 등급의 가장 높은 값 (S+ 99, S 89, A+ 79, A 69, B+ 59, B 54, C+ 49, C 44, D+ 39, D 34)");
+                ui->tooltip("등급을 고르면 그 등급의 가장 높은 값 (S+ 127, S 89, A+ 79, A 69, B+ 59, B 54, C+ 49, C 44, D+ 39, D 34; 구속 S+는 99)");
                 ui->table_next_column();
                 ui->set_next_width(52.0f);
                 if (ui->input_int("##limit", &draft.limit, 0))
@@ -2578,7 +2587,7 @@ namespace urban::players
                 if ((group >= 0 && kStats[stat].group != group) || (group < 0 && kStats[stat].group == kPitches) || !shownStat(row, stat))
                     continue;
                 if (row)
-                    cardDraft(stat, *row, lockOf(settings, id, stat)).value = value;
+                    cardDraft(stat, *row, lockOf(settings, id, stat)).value = statTop(stat, value);
                 else
                 {
                     auto it = g_drafts.find(stat);
@@ -2588,7 +2597,7 @@ namespace urban::players
                         draft.apt = -1; // as each player has it
                         it = g_drafts.emplace(stat, draft).first;
                     }
-                    it->second.value = value;
+                    it->second.value = statTop(stat, value);
                     it->second.use = true;
                 }
             }
@@ -3000,7 +3009,7 @@ namespace urban::players
                             ui->set_next_width(58.0f);
                             if (ui->combo("##rank", &rank, kGrades, kGradeCount))
                             {
-                                draft.value = kGradeTop[rank];
+                                draft.value = statTop(stat, kGradeTop[rank]);
                                 draft.use = true;
                             }
                             ui->table_next_column();
@@ -3475,7 +3484,7 @@ namespace urban::players
                             ui->set_next_width(58.0f);
                             if (ui->combo("##rank", &rank, kGrades, kGradeCount))
                             {
-                                draft.value = kGradeTop[rank];
+                                draft.value = statTop(stat, kGradeTop[rank]);
                                 typed = true;
                             }
                             ui->table_next_column();

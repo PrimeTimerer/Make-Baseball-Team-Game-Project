@@ -1,4 +1,5 @@
 #include "urban/staff_cheats.h"
+#include "urban/save_identity.h"
 
 #include "urban/skill_table.h"
 
@@ -122,7 +123,9 @@ namespace urban::staff
         };
 
         uint8_t *g_rdram = nullptr;
-        std::filesystem::path g_settingsPath;
+        std::filesystem::path g_settingsPath; // this save's (urban::saveid), empty before any game
+        uint32_t g_generation = ~0u;          // urban::saveid::generation() the settings belong to
+        std::string g_profile;
         bool g_safeMode = false;
         std::mutex g_mutex; // everything below: the menu (GS thread) and the frame hook (EE thread)
         Settings g_settings;
@@ -355,10 +358,25 @@ namespace urban::staff
 
         // EE thread, at every vblank after the .pnach patches: the menu's one-off writes and restores, then the locked
         // entries; every 15 frames the staff the menu shows.
+        Settings loadSettings(const std::filesystem::path &path); // below
+
         void frame()
         {
             static unsigned tick = 0u;
             std::lock_guard<std::mutex> lock(g_mutex);
+            // Another save, or a new game (owner, 11-06 and 11-08: settings per save, a new game starts with none).
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_generation)
+            {
+                g_generation = generation;
+                g_profile = urban::saveid::current();
+                g_settingsPath = urban::saveid::settingsFile(g_profile, "staff_cheats.ini");
+                std::error_code error;
+                g_settings = !g_settingsPath.empty() && std::filesystem::exists(g_settingsPath, error) ? loadSettings(g_settingsPath) : Settings{};
+                g_backups.clear(); // their records were the old game's
+                g_actions.clear();
+                std::fprintf(stderr, "[staff] save %s: staff cheats %s, %zu teams\n", g_profile.empty() ? "(none)" : g_profile.c_str(),
+                             g_settings.enabled ? "on" : "off", g_settings.teams.size());
+            }
             const int own = ownTeam();
             g_own = own;
             const auto teamOf = [own](int key) { return key < 0 ? own : key; };
@@ -462,9 +480,11 @@ namespace urban::staff
             return settings;
         }
 
-        void saveSettings(const Settings &settings)
+        void saveSettings(const Settings &settings, const std::filesystem::path &path)
         {
-            std::ofstream file(g_settingsPath, std::ios::binary | std::ios::trunc);
+            if (path.empty())
+                return; // before any game: nothing to keep it for
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
             file << "# 스태프 치트 설정: 게임 메뉴(F2)의 \"스태프 치트\" 탭이 씁니다\n"
                  << "# entry=<own 또는 구단 0-11>,<역할 0 감독 1 투수코치 2 야수코치 3 트레이닝코치 4·5 스카우트>,<고정>,<기질>,<용병>,"
                     "<능력 20칸: - 그대로, 0-4 = D-S>,<스킬 16진+16진>\n"
@@ -684,12 +704,15 @@ namespace urban::staff
             Settings settings;
             int own;
             std::array<std::array<View, kRoles>, kTeams> views;
+            std::string profile;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 settings = g_settings;
                 own = g_own;
                 views = g_views;
+                profile = g_profile;
             }
+            ui->text_disabled(("세이브: " + urban::saveid::describe(profile) + " — 이 세이브의 스태프 설정").c_str());
             bool changed = false;
             std::vector<Action> actions;
             int locked = 0;
@@ -745,9 +768,11 @@ namespace urban::staff
                 it = std::all_of(it->second.begin(), it->second.end(), [](const Entry &entry) { return entry.idle(); })
                          ? settings.teams.erase(it)
                          : std::next(it);
+            std::filesystem::path path;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_settings = settings;
+                path = g_settingsPath;
                 g_actions.insert(g_actions.end(), actions.begin(), actions.end());
                 if (!actions.empty())
                     for (const Action &action : actions)
@@ -755,7 +780,7 @@ namespace urban::staff
                             g_settings.teams[action.team]; // an idle entry: the write finds nothing to do
             }
             if (changed)
-                saveSettings(settings);
+                saveSettings(settings, path);
         }
 #endif
     }
@@ -767,8 +792,7 @@ namespace urban::staff
         g_rdram = rdram;
         const char *mods = std::getenv("URBAN_MODS");
         g_safeMode = mods && std::strcmp(mods, ";") == 0; // the launcher's safe start
-        g_settingsPath = userDir / "staff_cheats.ini";
-        g_settings = loadSettings(g_settingsPath);
+        (void)userDir; // the settings are per save: cheat_saves/<save>/staff_cheats.ini, read when a game is there (frame)
         size_t entries = 0;
         for (const auto &[team, list] : g_settings.teams)
             for (const Entry &entry : list)

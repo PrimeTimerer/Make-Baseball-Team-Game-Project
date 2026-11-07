@@ -286,6 +286,24 @@ namespace urban::saveid
         setCurrent("new", "the menu: this game is a new game");
     }
     std::filesystem::path folder(const std::string &id) { return g_root / id; }
+    std::filesystem::path settingsFile(const std::string &id, const std::string &name)
+    {
+        if (id.empty() || g_root.empty())
+            return {};
+        const std::filesystem::path path = g_root / id / name;
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        if (id == "M00" && !std::filesystem::exists(path, error))
+        {
+            const std::filesystem::path legacy = g_root.parent_path() / name;
+            if (std::filesystem::exists(legacy, error))
+            {
+                std::filesystem::copy_file(legacy, path, error);
+                std::fprintf(stderr, "[saveid] the old %s now belongs to save M00\n", name.c_str());
+            }
+        }
+        return path;
+    }
     std::string describe(const std::string &id)
     {
         if (id.empty())

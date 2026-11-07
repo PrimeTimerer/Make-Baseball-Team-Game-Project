@@ -1,4 +1,5 @@
 #include "urban/ability_limits.h"
+#include "urban/save_identity.h"
 
 #include "urban/function_hooks.h"
 
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 namespace urban::limits
@@ -50,7 +52,11 @@ namespace urban::limits
         };
 
         uint8_t *g_rdram = nullptr;
+        // Per save (owner, 11-08): cheat_saves/<save>/ability_limits.ini; empty before any game. g_pathMutex: frame (EE) and menu.
         std::filesystem::path g_settingsPath;
+        std::mutex g_pathMutex;
+        std::string g_profile;
+        uint32_t g_generation = ~0u;
         std::atomic<bool> g_on{false};
         GuestFunction g_ownValueOriginal = nullptr;
         bool g_log = false; // URBAN_LIMITS_LOG=1: the first values past 99 a match copy takes
@@ -164,8 +170,23 @@ namespace urban::limits
 
         // EE thread, every vblank: the pitch object's words as the switch wants them (again after a loaded state). Only
         // over one of the two known words, never over another cheat's.
+        bool loadSetting(const std::filesystem::path &path);
+
         void frame()
         {
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_generation)
+            {
+                g_generation = generation;
+                const std::string profile = urban::saveid::current();
+                const std::filesystem::path path = urban::saveid::settingsFile(profile, "ability_limits.ini");
+                {
+                    std::lock_guard<std::mutex> lock(g_pathMutex);
+                    g_settingsPath = path;
+                    g_profile = profile;
+                }
+                g_on.store(!path.empty() && loadSetting(path));
+                std::fprintf(stderr, "[limits] save %s: 99 제한 풀기 %s\n", profile.empty() ? "(none)" : profile.c_str(), g_on.load() ? "on" : "off");
+            }
             const bool on = g_on.load(std::memory_order_relaxed);
             for (const Patch &patch : kPitchPatches)
             {
@@ -181,7 +202,7 @@ namespace urban::limits
         {
             std::ifstream file(path, std::ios::binary);
             std::string line;
-            bool on = false;
+            bool on = true; // no file or no key (a new save): on (owner, 11-08: "둘 다 기본 켜줘"); nolimit=0 keeps it off
             while (std::getline(file, line))
             {
                 while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
@@ -194,7 +215,14 @@ namespace urban::limits
 
         void saveSetting(bool on)
         {
-            std::ofstream file(g_settingsPath, std::ios::binary | std::ios::trunc);
+            std::filesystem::path path;
+            {
+                std::lock_guard<std::mutex> lock(g_pathMutex);
+                path = g_settingsPath;
+            }
+            if (path.empty())
+                return; // before any game: nothing to keep it for
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
             file << "# 99 제한 설정: 게임 메뉴(F2)의 \"99 제한\" 탭이 씁니다\n"
                  << "nolimit=" << (on ? 1 : 0) << "\n";
         }
@@ -202,6 +230,14 @@ namespace urban::limits
 #if defined(URBAN_LIMITS_MENU)
         void draw(const Pcsx2GsUi *ui)
         {
+            {
+                std::string profile;
+                {
+                    std::lock_guard<std::mutex> lock(g_pathMutex);
+                    profile = g_profile;
+                }
+                ui->text_disabled(("세이브: " + urban::saveid::describe(profile) + " — 이 세이브의 설정").c_str());
+            }
             int on = g_on.load() ? 1 : 0;
             if (ui->checkbox("타자·투수 능력 99 제한 풀기", &on))
             {
@@ -232,8 +268,8 @@ namespace urban::limits
         if (mods && std::strcmp(mods, ";") == 0) // the launcher's safe start
             return;
         g_rdram = rdram;
-        g_settingsPath = userDir / "ability_limits.ini";
-        g_on.store(loadSetting(g_settingsPath));
+        (void)userDir; // per save: cheat_saves/<save>/ability_limits.ini, read in frame() when a game is there
+        g_on.store(false);
         if (const char *log = std::getenv("URBAN_LIMITS_LOG"))
             g_log = std::strcmp(log, "1") == 0;
         FunctionHooks &hooks = FunctionHooks::instance();

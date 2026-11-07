@@ -1,6 +1,7 @@
 #include "urban/match_script.h"
 #include "urban/function_hooks.h"
 #include "urban/ichinen_cheats.h"
+#include "urban/save_identity.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_game_menu.h"
@@ -279,9 +280,13 @@ namespace urban::matchscript
             return settings;
         }
 
+        std::filesystem::path g_menuPath; // the menu's file: this save's (menu thread)
+
         void save(const Settings &settings)
         {
-            const std::filesystem::path temp = g_path.string() + ".tmp";
+            if (g_menuPath.empty())
+                return; // before any game: nothing to keep it for
+            const std::filesystem::path temp = g_menuPath.string() + ".tmp";
             {
                 std::ofstream file(temp, std::ios::binary | std::ios::trunc);
                 file << "# 경기 스크립트 (게임 메뉴 F2 > 경기 스크립트 탭이 씀)\r\n";
@@ -302,11 +307,26 @@ namespace urban::matchscript
                          << boost.add << (boost.when.any() ? conditionText(boost.when) : std::string()) << "\r\n";
             }
             std::error_code error;
-            std::filesystem::rename(temp, g_path, error); // whole file at once: the game thread reads it when it changes
+            std::filesystem::rename(temp, g_menuPath, error); // whole file at once: the game thread reads it when it changes
         }
+
+        uint32_t g_generation = ~0u; // urban::saveid::generation() g_path belongs to (game thread)
 
         void reloadIfChanged()
         {
+            // The settings are per save (owner, 11-08): cheat_saves/<save>/match_script.ini; none before any game.
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_generation)
+            {
+                g_generation = generation;
+                g_path = urban::saveid::settingsFile(urban::saveid::current(), "match_script.ini");
+                g_haveStamp = false;
+            }
+            if (g_path.empty())
+            {
+                g_settings = Settings{};
+                g_haveStamp = false;
+                return;
+            }
             std::error_code error;
             const auto stamp = std::filesystem::last_write_time(g_path, error);
             if (error)
@@ -1014,8 +1034,20 @@ namespace urban::matchscript
         void draw(const Pcsx2GsUi *ui)
         {
             std::lock_guard<std::mutex> lock(g_menuMutex);
+            // Another save or a new game: that save's settings (none for a new game).
+            static uint32_t menuGeneration = ~0u;
+            static std::string menuProfile;
+            if (const uint32_t generation = urban::saveid::generation(); generation != menuGeneration)
+            {
+                menuGeneration = generation;
+                menuProfile = urban::saveid::current();
+                g_menuPath = urban::saveid::settingsFile(menuProfile, "match_script.ini");
+                std::error_code error;
+                g_menu = !g_menuPath.empty() && std::filesystem::exists(g_menuPath, error) ? load(g_menuPath) : Settings{};
+            }
             Settings &settings = g_menu;
             bool changed = false;
+            ui->text_disabled(("세이브: " + urban::saveid::describe(menuProfile) + " — 이 세이브의 경기 스크립트").c_str());
             int enabled = settings.enabled ? 1 : 0;
             if (ui->checkbox("경기 스크립트 켜기", &enabled))
             {
@@ -1349,7 +1381,7 @@ namespace urban::matchscript
         if (mods && std::strcmp(mods, ";") == 0) // the launcher's safe start
             return;
         g_rdram = rdram;
-        g_path = userDir / "match_script.ini";
+        (void)userDir; // per save: cheat_saves/<save>/match_script.ini (reloadIfChanged, the menu)
         reloadIfChanged();
         FunctionHooks &hooks = FunctionHooks::instance();
         hooks.replace(kSwing, "match_script_swing", &swingHook, ReplacementStatus::Native, "match scripts: forced results");
