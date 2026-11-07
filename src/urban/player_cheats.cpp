@@ -121,6 +121,10 @@ namespace urban::players
         constexpr int kGradeLow[kGradeCount] = {90, 80, 70, 60, 55, 50, 45, 40, 35, 0};
         constexpr int kGradeTop[kGradeCount] = {99, 89, 79, 69, 59, 54, 49, 44, 39, 34};
         constexpr const char *kAptitudes[5] = {"D", "C", "B", "A", "S"};
+        // The highest value the editor writes. The game's own scale ends at 99 and its screens grade a value above that D
+        // (the owner's screenshots of 11-07: 255 shown D, 99 S+, 89 S, whatever the experience), but values above 99 do
+        // count: the owner had a 75-home-run season from 198 / 255 (11-07), so the editor writes up to 255, as before.
+        constexpr int kValueMax = 255;
         int gradeOf(int value)
         {
             for (int g = 0; g < kGradeCount - 1; ++g)
@@ -254,11 +258,12 @@ namespace urban::players
             std::map<size_t, std::vector<std::pair<uint32_t, uint8_t>>> items;
         };
         std::map<uint16_t, StatBackup> g_statBackups; // EE thread only, by player ID
-        // A player whose abilities a lock wrote in this run: per ability the aptitude, value and limit before the first write.
+        // A player whose abilities a lock wrote in this run: per ability the aptitude, value, limit and experience (u16)
+        // before the first write.
         struct LockBackup
         {
             uint32_t record = 0u, block = 0u;
-            std::map<int, std::array<uint8_t, 3>> before;
+            std::map<int, std::array<uint8_t, 5>> before;
         };
         std::map<uint16_t, LockBackup> g_lockBackups; // EE thread only, by player ID
         // One-time edits from the menu (under g_mutex), written by the frame hook where it finds the player.
@@ -478,9 +483,9 @@ namespace urban::players
             StatEdit edit;
             std::string field;
             if (std::getline(fields, field, ','))
-                edit.value = std::clamp(std::atoi(trim(field).c_str()), -1, 255);
+                edit.value = std::clamp(std::atoi(trim(field).c_str()), -1, kValueMax);
             if (std::getline(fields, field, ','))
-                edit.limit = std::clamp(std::atoi(trim(field).c_str()), -2, 255);
+                edit.limit = std::clamp(std::atoi(trim(field).c_str()), -2, kValueMax);
             if (std::getline(fields, field, ','))
                 edit.apt = std::clamp(std::atoi(trim(field).c_str()), -1, 4);
             return edit;
@@ -989,16 +994,27 @@ namespace urban::players
                             old = value;
         }
 
+        // The match copy takes every ability from its experience, not from the value byte: sub_00188178 (the match copy
+        // builder) stores sub_00180238(entry), the value the u16 experience at entry + 4 reaches in the table at 0x5D1320,
+        // capped at 99 (REA / rizin, 2026-11-07). The value byte is what the game's screens show. So a value is written
+        // with the experience for it, as the S+ codes do (their bytes end in the experience). table[99] at most: the table
+        // ends with table[100] = 65535, and sub_00180238 returns 3 for an experience no entry is above (a value of 100 or
+        // more once gave a 3 in matches). Above 99 the value byte itself counts only with the 99 제한 tab's switch.
         void writeStat(uint32_t entry, const StatEdit &edit)
         {
             if (edit.apt >= 0)
-                g_rdram[entry + 1u] = static_cast<uint8_t>(edit.apt);
+                g_rdram[entry + 1u] = static_cast<uint8_t>(std::min(edit.apt, 4));
             if (edit.value >= 0)
-                g_rdram[entry + 2u] = static_cast<uint8_t>(std::min(edit.value, 255));
+            {
+                g_rdram[entry + 2u] = static_cast<uint8_t>(std::min(edit.value, kValueMax));
+                const uint16_t exp = read16(kExpTable + 2u * static_cast<uint32_t>(std::min(edit.value, 99)));
+                g_rdram[entry + 4u] = static_cast<uint8_t>(exp);
+                g_rdram[entry + 5u] = static_cast<uint8_t>(exp >> 8);
+            }
             if (edit.limit >= 0)
-                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, 255));
-            else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < edit.value)
-                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, 255));
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, kValueMax));
+            else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < std::min(edit.value, kValueMax))
+                g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, kValueMax));
         }
 
         // The locked abilities: the player's own (`own`), else the default target's (`group`); after the items, so they
@@ -1025,7 +1041,7 @@ namespace urban::players
                     if (g_settings.restore)
                     {
                         const uint32_t entry = block + kStats[it->first].offset - kBlock;
-                        for (uint32_t b = 0; b < 3u; ++b)
+                        for (uint32_t b = 0; b < 5u; ++b)
                         {
                             g_rdram[entry + 1u + b] = it->second[b];
                             handBack(id, entry + 1u + b, it->second[b]);
@@ -1047,7 +1063,8 @@ namespace urban::players
             {
                 const uint32_t entry = block + kStats[stat].offset - kBlock;
                 if (backup->second.before.find(stat) == backup->second.before.end())
-                    backup->second.before[stat] = {originalByte(id, entry + 1u), originalByte(id, entry + 2u), originalByte(id, entry + 3u)};
+                    backup->second.before[stat] = {originalByte(id, entry + 1u), originalByte(id, entry + 2u), originalByte(id, entry + 3u),
+                                                   originalByte(id, entry + 4u), originalByte(id, entry + 5u)};
                 writeStat(entry, edit);
             };
             if (group)
@@ -1667,6 +1684,26 @@ namespace urban::players
             if (!testCampQueued && team >= 0 && !g_settingsPath.empty())
             {
                 testCampQueued = true;
+                // URBAN_TEST_EDIT="<player id>,<ability key>,<value>;...": one-time edits, as the menu's 적용 (tests).
+                if (const char *edits = std::getenv("URBAN_TEST_EDIT"); edits && *edits)
+                {
+                    std::istringstream items(edits);
+                    std::string item;
+                    while (std::getline(items, item, ';'))
+                    {
+                        std::istringstream fields(item);
+                        std::string id, key, value;
+                        if (!std::getline(fields, id, ',') || !std::getline(fields, key, ',') || !std::getline(fields, value, ','))
+                            continue;
+                        const int stat = statIndex(trim(key));
+                        if (stat < 0)
+                            continue;
+                        StatEdit edit;
+                        edit.value = std::clamp(std::atoi(value.c_str()), 0, kValueMax);
+                        edit.limit = -2;
+                        g_oneShots.push_back(OneShot{static_cast<uint16_t>(std::atoi(id.c_str())), stat, edit, 0});
+                    }
+                }
                 if (const char *test = std::getenv("URBAN_TEST_CAMP"); test && *test)
                 {
                     std::istringstream items(test);
@@ -1727,11 +1764,11 @@ namespace urban::players
                         const uint32_t entry = block + kStats[firstPitch + slot].offset - kBlock;
                         g_rdram[entry] = static_cast<uint8_t>(it->pitch);
                         g_rdram[entry + 1u] = static_cast<uint8_t>(std::clamp(it->apt, 0, 4));
-                        g_rdram[entry + 2u] = static_cast<uint8_t>(std::clamp(it->value, 1, 255));
-                        g_rdram[entry + 3u] = static_cast<uint8_t>(std::clamp(std::max(it->limit, it->value), 1, 255));
+                        g_rdram[entry + 2u] = static_cast<uint8_t>(std::clamp(it->value, 1, kValueMax));
+                        g_rdram[entry + 3u] = static_cast<uint8_t>(std::clamp(std::max(it->limit, it->value), 1, kValueMax));
                         // The experience that goes with the value: the game's table at 0x5D1320 (u16 per value 0-100;
                         // the own players' abilities all sit in [table[v], table[v + 1])). Without it the game shows D.
-                        const uint16_t exp = read16(kExpTable + 2u * static_cast<uint32_t>(std::min<int>(g_rdram[entry + 2u], 100)));
+                        const uint16_t exp = read16(kExpTable + 2u * static_cast<uint32_t>(std::min<int>(g_rdram[entry + 2u], 99)));
                         g_rdram[entry + 4u] = static_cast<uint8_t>(exp);
                         g_rdram[entry + 5u] = static_cast<uint8_t>(exp >> 8);
                         g_log.add("새 구종: " + name + " · 변화구 " + std::to_string(slot + 1) + " = " + pitchName(g_rdram[entry]) + " " +
@@ -2044,10 +2081,10 @@ namespace urban::players
         StatEdit editFrom(const Draft &draft, const Row *row, int stat)
         {
             StatEdit edit;
-            edit.value = std::clamp(draft.value, 0, 255);
+            edit.value = std::clamp(draft.value, 0, kValueMax);
             if (row)
             {
-                edit.limit = draft.limit != row->value(stat, 3) ? std::clamp(draft.limit, 0, 255) : -2;
+                edit.limit = draft.limit != row->value(stat, 3) ? std::clamp(draft.limit, 0, kValueMax) : -2;
                 edit.apt = draft.apt != std::min(row->value(stat, 1), 4) ? std::clamp(draft.apt, 0, 4) : -1;
             }
             else
@@ -2190,10 +2227,10 @@ namespace urban::players
                 ui->set_next_width(56.0f);
                 if (ui->input_int("##value", &draft.value, 0))
                 {
-                    draft.value = std::clamp(draft.value, 0, 255);
+                    draft.value = std::clamp(draft.value, 0, kValueMax);
                     typed = true;
                 }
-                ui->tooltip("0~99 (99가 게임 최대, S+ 치트는 198·255까지 씀)");
+                ui->tooltip("0~255. 경기는 능력을 경험치로 계산해서(최대 99), 값과 함께 그 경험치도 씁니다. 99 넘는 값은 F2 '99 제한' 탭의 스위치를 켜야 경기에서 그 값 그대로 쓰이고, 끄면 99입니다. 게임 화면에는 99까지만 등급이 나와 100 이상은 D로 보입니다.");
                 ui->table_next_column();
                 int rank = gradeOf(draft.value);
                 ui->set_next_width(58.0f);
@@ -2207,7 +2244,7 @@ namespace urban::players
                 ui->set_next_width(52.0f);
                 if (ui->input_int("##limit", &draft.limit, 0))
                 {
-                    draft.limit = std::clamp(draft.limit, 0, 255);
+                    draft.limit = std::clamp(draft.limit, 0, kValueMax);
                     typed = true;
                 }
                 ui->tooltip("상한(上限): 성장으로 오를 수 있는 최대. 새 값이 더 크면 상한도 그만큼 올립니다.");
@@ -2433,13 +2470,13 @@ namespace urban::players
             ui->same_line();
             ui->set_next_width(56.0f);
             if (ui->input_int("##pvalue", &g_practiceValue, 0))
-                g_practiceValue = std::clamp(g_practiceValue, 1, 255);
+                g_practiceValue = std::clamp(g_practiceValue, 1, kValueMax);
             ui->same_line();
             ui->text("상한");
             ui->same_line();
             ui->set_next_width(56.0f);
             if (ui->input_int("##plimit", &g_practiceLimit, 0))
-                g_practiceLimit = std::clamp(g_practiceLimit, 1, 255);
+                g_practiceLimit = std::clamp(g_practiceLimit, 1, kValueMax);
             ui->same_line();
             ui->text("득의도");
             ui->same_line();
@@ -2754,7 +2791,7 @@ namespace urban::players
                             ui->set_next_width(56.0f);
                             if (ui->input_int("##value", &draft.value, 0))
                             {
-                                draft.value = std::clamp(draft.value, 0, 255);
+                                draft.value = std::clamp(draft.value, 0, kValueMax);
                                 draft.use = true;
                             }
                             ui->table_next_column();
@@ -3229,7 +3266,7 @@ namespace urban::players
                             ui->set_next_width(56.0f);
                             if (ui->input_int("##value", &draft.value, 0))
                             {
-                                draft.value = std::clamp(draft.value, 0, 255);
+                                draft.value = std::clamp(draft.value, 0, kValueMax);
                                 typed = true;
                             }
                             ui->table_next_column();
@@ -3392,6 +3429,42 @@ namespace urban::players
                     urban::saveid::startNew();
                 ui->tooltip("이 게임을 '새 게임' 설정으로 따로 씁니다 (처음엔 비어 있음). 원래 세이브의 설정은 지우지 않습니다. "
                             "게임 안에서 메모리카드에 세이브하면 그 칸으로 설정이 따라갑니다.");
+                ui->same_line();
+                const std::string here = team >= 0 && team < kTeams ? kTeamNames[team] : "?";
+                const std::string before = settings.team >= 0 && settings.team < kTeams ? kTeamNames[settings.team] : "?";
+                if (ui->button(("이 설정을 " + here + " 게임용으로 고치기").c_str()) && team >= 0)
+                {
+                    // This save is this game now (e.g. a new game saved here while the settings still were another
+                    // game's): keep what was set, drop the old team's players' own settings (that game's players).
+                    std::set<uint16_t> old;
+                    if (settings.team >= 0 && settings.team < kTeams)
+                        for (const Row &row : rows[static_cast<size_t>(settings.team)])
+                            old.insert(row.id);
+                    size_t dropped = 0;
+                    for (auto it = settings.pins.begin(); it != settings.pins.end();)
+                        if (old.count(it->first) != 0u)
+                        {
+                            it = settings.pins.erase(it);
+                            ++dropped;
+                        }
+                        else
+                            ++it;
+                    for (auto it = settings.edits.begin(); it != settings.edits.end();)
+                        if (old.count(it->first) != 0u)
+                        {
+                            it = settings.edits.erase(it);
+                            ++dropped;
+                        }
+                        else
+                            ++it;
+                    settings.team = team;
+                    changed = true;
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_log.add("설정을 " + here + " 게임용으로 고침: " + before + " 선수의 개별 설정 " + std::to_string(dropped) + "건 뺌", "players");
+                }
+                ui->tooltip(("이 세이브의 설정을 지금 구단(" + here + ") 것으로 고쳐서 씁니다. 원래 구단(" + before +
+                             ") 선수에게 걸어 둔 개별 고정·따로 정한 항목은 뺍니다. 다른 구단 선수 설정은 남습니다.")
+                                .c_str());
             }
             size_t players = 0;
             for (const std::vector<Row> &list : rows)
