@@ -1,5 +1,6 @@
 #include "urban/match_script.h"
 #include "urban/function_hooks.h"
+#include "urban/ichinen_cheats.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_game_menu.h"
@@ -495,7 +496,8 @@ namespace urban::matchscript
         {
             int percent = 100;
             int add = 0;
-            bool identity() const { return percent == 100 && add == 0; }
+            int cap = 0; // the 이치넨 tab's final-value cap (0 = none), after percent and add
+            bool identity() const { return percent == 100 && add == 0 && cap == 0; }
         };
 
         Factor boostFor(uint16_t id, int stat, bool pitcherSide)
@@ -517,7 +519,15 @@ namespace urban::matchscript
         {
             uint32_t address;
             Factor factor;
+            uint16_t player = 0; // for the cap's report
+            int stat = -1;       // urban::ichinen::CapStat
         };
+
+        // The final-value cap of a player's stat (urban::ichinen::CapStat), 0 = none.
+        int capOf(uint16_t player, int stat)
+        {
+            return player ? urban::ichinen::finalCap(player, isOwn(player), stat) : 0;
+        }
 
         // Writes base x percent + add over the fields; a field back at x1 +0 gets its base again. key is the player (and
         // object): a new one starts from the values the game set.
@@ -544,7 +554,15 @@ namespace urban::matchscript
                     continue;
                 }
                 const int64_t boosted = static_cast<int64_t>(static_cast<int32_t>(value)) * field.factor.percent / 100 + field.factor.add;
-                const uint32_t result = static_cast<uint32_t>(std::clamp<int64_t>(boosted, 0, 9999));
+                uint32_t result = static_cast<uint32_t>(std::clamp<int64_t>(boosted, 0, 9999));
+                if (field.factor.cap > 0)
+                {
+                    result = std::min(result, static_cast<uint32_t>(field.factor.cap));
+                    urban::ichinen::noteFinal(field.player, field.stat, static_cast<int>(value), static_cast<int>(result));
+                    static const bool capLog = std::getenv("URBAN_CAP_LOG") != nullptr;
+                    if (capLog && result != value)
+                        std::fprintf(stderr, "[cap] player %u stat %d %u -> %u\n", field.player, field.stat, value, result);
+                }
                 w32(field.address, result);
                 base.emplace_back(field.address, value);
                 written.emplace_back(field.address, result);
@@ -583,7 +601,8 @@ namespace urban::matchscript
         void applyBoosts(R5900Context *ctx, uint32_t rg)
         {
             g_deepChance = 0;
-            if (g_batterStack.written.empty() && g_pitcherStack.written.empty() && (!g_settings.enabled || g_settings.boosts.empty()))
+            const bool caps = urban::ichinen::finalCapsOn();
+            if (g_batterStack.written.empty() && g_pitcherStack.written.empty() && (!g_settings.enabled || g_settings.boosts.empty()) && !caps)
                 return;
             const bool on = g_settings.enabled && !g_settings.boosts.empty();
             // Batter: the at-bat fields of rg; the batter's match copy pointer tells at-bats apart.
@@ -608,8 +627,13 @@ namespace urban::matchscript
                     factor.percent = std::max(1, factor.percent * 100 / std::max(1, dominance.percent));
                     factor.add -= dominance.add;
                 }
-                fields.push_back(Field{rg + kStats[s].offset, factor});
+                if (caps)
+                    factor.cap = capOf(g_batter, s); // kStats' first ten are the cap stats
+                fields.push_back(Field{rg + kStats[s].offset, factor, g_batter, s});
             }
+            if (caps) // the batter's 精神 (+0xC8, sub_328A50 from the copy's +0x68 and skill kind 4): a cap only
+                fields.push_back(Field{rg + 0xC8u, Factor{100, 0, capOf(g_batter, urban::ichinen::kCapMental)}, g_batter,
+                                       urban::ichinen::kCapMental});
             applyStack(g_batterStack, r32(rg + 0xD4u), fields); // the batter's match copy: a new at-bat, new values
             // Pitcher: the pitch object [gp-0x7FF0] (sub_2B02D0), read by the next pitch's choice.
             const uint32_t pitch = r32(getRegU32(ctx, 28) - 0x7FF0u);
@@ -620,16 +644,22 @@ namespace urban::matchscript
             {
                 if (!kStats[s].pitcher || kStats[s].offset == kDominance)
                     continue;
-                const Factor factor = on && g_pitcher ? boostFor(g_pitcher, s, true) : Factor{};
+                Factor factor = on && g_pitcher ? boostFor(g_pitcher, s, true) : Factor{};
+                if (caps)
+                    factor.cap = capOf(g_pitcher, s);
                 if (kStats[s].offset == 0x14u)
                 {
                     for (uint32_t k = 0; k < 10; ++k)
                         if (r32(pitch + 0x10u + 8u * k) != 0u || factor.identity()) // a breaking ball's level (type at +0x10)
-                            fields.push_back(Field{pitch + 0x14u + 8u * k, factor});
+                            fields.push_back(Field{pitch + 0x14u + 8u * k, factor, g_pitcher, s});
                 }
                 else
-                    fields.push_back(Field{pitch + kStats[s].offset, factor});
+                    fields.push_back(Field{pitch + kStats[s].offset, factor, g_pitcher, s});
             }
+            // 精神 (+0x6C, sub_2B0748 from the copy's +0x84 and skill kind 4) has a cap only.
+            if (caps)
+                fields.push_back(Field{pitch + 0x6Cu, Factor{100, 0, capOf(g_pitcher, urban::ichinen::kCapMental)}, g_pitcher,
+                                       urban::ichinen::kCapMental});
             applyStack(g_pitcherStack, pitch ^ (static_cast<uint32_t>(g_pitcher) << 24), fields);
         }
 
@@ -655,6 +685,23 @@ namespace urban::matchscript
                 }
             }
             g_hitKind(rdram, ctx, runtime);
+        }
+
+        // URBAN_SCRIPT_STATS: the match phase handlers 1 (sub_2952B8) and 11 (sub_2950A0) of sub_295EA0's table 0x696430,
+        // which run the skill checks of timings 1 and 2, counted per plate appearance.
+        GuestFunction g_phase1 = nullptr, g_phase11 = nullptr;
+        unsigned g_phase1Count = 0, g_phase11Count = 0;
+
+        void phase1Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_phase1Count;
+            g_phase1(rdram, ctx, runtime);
+        }
+
+        void phase11Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_phase11Count;
+            g_phase11(rdram, ctx, runtime);
         }
 
         // Before the swing decision: a sign that makes the batter swing and hit (HR, hit), swing and miss (strikeout)
@@ -699,10 +746,23 @@ namespace urban::matchscript
                 if (stats && r32(rg + 0xD4u) != lastAtBat)
                 {
                     lastAtBat = r32(rg + 0xD4u);
-                    std::fprintf(stderr, "[stat] pa %u vs %u inn %d%s outs %d bases %d%d%d score %d-%d%s\n", g_batter, g_pitcher,
+                    std::fprintf(stderr, "[stat] pa %u vs %u inn %d%s outs %d bases %d%d%d score %d-%d%s ev %u/%u\n", g_batter, g_pitcher,
                                  g_situation.inning, g_situation.batting ? "b" : "t", g_situation.outs, g_situation.base[0] ? 1 : 0,
                                  g_situation.base[1] ? 1 : 0, g_situation.base[2] ? 1 : 0, g_situation.runs[0], g_situation.runs[1],
-                                 g_situation.valid ? "" : " (no match state)");
+                                 g_situation.valid ? "" : " (no match state)", g_phase1Count, g_phase11Count);
+                    g_phase1Count = g_phase11Count = 0;
+                    // the batter's active skills (skill object [0x5E75F8]: side 0x6132, slot rg+0xA4 x 0x35A, flags +0xF0D, IDs +0xEFE)
+                    const uint32_t skillObject = r32(0x5E75F8u), matchNow0 = r32(kMatchPtr);
+                    if (valid(skillObject) && valid(matchNow0))
+                    {
+                        const uint32_t base = skillObject + r32(matchNow0 + 0x18u) * 0x6132u + r32(rg + 0xA4u) * 0x35Au;
+                        std::string active;
+                        for (uint32_t k = 0; k < 15u; ++k)
+                            if (r8(base + 0xF0Du + k) == 1u)
+                                active += (active.empty() ? "" : ",") + std::to_string(r8(base + 0xEFEu + k)) + (k >= 8u ? "i" : "");
+                        if (!active.empty())
+                            std::fprintf(stderr, "[stat] skills %u %s\n", g_batter, active.c_str());
+                    }
                     static const bool dump = std::getenv("URBAN_SCRIPT_DUMP") != nullptr;
                     const uint32_t matchNow = r32(kMatchPtr);
                     if (dump && valid(matchNow))
@@ -791,7 +851,7 @@ namespace urban::matchscript
             }
             static const bool stats = std::getenv("URBAN_SCRIPT_STATS") != nullptr;
             if (stats)
-                std::fprintf(stderr, "[stat] play %u %x\n", batterId(rg), r32(rg + 0x161Cu));
+                std::fprintf(stderr, "[stat] play %u %x %s\n", batterId(rg), r32(rg + 0x161Cu), r32(rg + 0x1618u) == 4u ? "hit" : "out");
             g_playSetup(rdram, ctx, runtime);
         }
 
@@ -1305,6 +1365,13 @@ namespace urban::matchscript
         g_noContact = hooks.original(kNoContact);
         g_playSetup = hooks.original(kPlaySetup);
         g_stealResult = hooks.original(kStealResult);
+        if (std::getenv("URBAN_SCRIPT_STATS") && runtime.hasFunction(0x2952B8u) && runtime.hasFunction(0x2950A0u))
+        {
+            hooks.replace(0x2952B8u, "match_script_phase1", &phase1Hook, ReplacementStatus::Native, "stats: phase 1 count");
+            hooks.replace(0x2950A0u, "match_script_phase11", &phase11Hook, ReplacementStatus::Native, "stats: phase 11 count");
+            g_phase1 = hooks.original(0x2952B8u);
+            g_phase11 = hooks.original(0x2950A0u);
+        }
         if (!g_swing || !g_noContact || !g_playSetup || !g_stealResult || !g_hitKind)
         {
             std::fprintf(stderr, "[script] hooks not installed\n");

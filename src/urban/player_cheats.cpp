@@ -339,6 +339,72 @@ namespace urban::players
             return (address & 3u) == 0u && address >= 0x100000u && address < kRamSize && size <= kRamSize - address;
         }
 
+        // Ichinen-made skills (ID 500 up; the owner, 11-08: picked and held here like any skill). The own data's 8 records
+        // ([0x5D12B8] + 0xC8, 0x4A each: +0 ID, +2 Shift-JIS name of 20 bytes) define them; the match uses them for the
+        // own club's players only (sub_00188CA8 / sub_002BDDE0).
+        bool isIchinen(uint16_t id)
+        {
+            return id >= 500u && id < 1000u;
+        }
+
+        bool knownSkill(uint16_t id)
+        {
+            return isIchinen(id) || urban::skills::find(id, false) != nullptr;
+        }
+
+        std::string sjisText(uint32_t address, size_t size)
+        {
+#if defined(_WIN32)
+            std::string sjis(reinterpret_cast<const char *>(g_rdram + address), size);
+            sjis = sjis.substr(0, sjis.find('\0'));
+            while (!sjis.empty() && sjis.back() == ' ')
+                sjis.pop_back();
+            if (sjis.empty())
+                return {};
+            wchar_t wide[64];
+            const int count = MultiByteToWideChar(932, 0, sjis.data(), static_cast<int>(sjis.size()), wide, 64);
+            char utf8[256];
+            const int bytes = count > 0 ? WideCharToMultiByte(CP_UTF8, 0, wide, count, utf8, sizeof(utf8), nullptr, nullptr) : 0;
+            return std::string(utf8, static_cast<size_t>(std::max(bytes, 0)));
+#else
+            (void)address;
+            (void)size;
+            return {};
+#endif
+        }
+
+        // The own data's Ichinen skills: (ID, name), in record order.
+        std::vector<std::pair<uint16_t, std::string>> ichinenSkills()
+        {
+            std::vector<std::pair<uint16_t, std::string>> list;
+            const uint32_t own = read32(0x5D12B8u);
+            if (!valid(own, 0xC8u + 8u * 0x4Au))
+                return list;
+            for (uint32_t k = 0; k < 8u; ++k)
+            {
+                const uint32_t record = own + 0xC8u + k * 0x4Au;
+                const uint16_t id = read16(record);
+                if (isIchinen(id))
+                    list.emplace_back(id, sjisText(record + 2u, 20));
+            }
+            return list;
+        }
+
+        // A skill's name for the menu: the Korean name, or "이치넨: <its name>".
+        std::string skillName(uint16_t id)
+        {
+            if (const urban::skills::Skill *skill = urban::skills::find(id, false))
+                return skill->ko;
+            if (isIchinen(id))
+            {
+                for (const auto &[ichinen, name] : ichinenSkills())
+                    if (ichinen == id)
+                        return "이치넨: " + (name.empty() ? std::to_string(id) : name);
+                return "이치넨 스킬 " + std::to_string(id) + " (이 세이브에 없음)";
+            }
+            return "?";
+        }
+
         uint32_t allItems()
         {
             return g_items.size() >= 32u ? 0xFFFFFFFFu : (1u << g_items.size()) - 1u;
@@ -439,7 +505,7 @@ namespace urban::players
                 id = trim(id);
                 char *end = nullptr;
                 const unsigned long value = std::strtoul(id.c_str(), &end, 16);
-                if (id.empty() || *end != '\0' || value > 0xFFFFu || !urban::skills::find(static_cast<uint16_t>(value), false))
+                if (id.empty() || *end != '\0' || value > 0xFFFFu || !knownSkill(static_cast<uint16_t>(value)))
                     continue;
                 const uint16_t skill = static_cast<uint16_t>(value);
                 if (std::find(skills.begin(), skills.end(), skill) == skills.end() && skills.size() < kSkillSlots)
@@ -614,7 +680,7 @@ namespace urban::players
                         {
                             const int skill = std::atoi(trim(slot).c_str());
                             applied.slots[static_cast<size_t>(k)] =
-                                skill <= 0 || urban::skills::find(static_cast<uint16_t>(skill), false) ? std::max(skill, -1) : -1;
+                                skill <= 0 || knownSkill(static_cast<uint16_t>(skill)) ? std::max(skill, -1) : -1;
                         }
                     }
                 }
@@ -678,7 +744,7 @@ namespace urban::players
                         for (int k = 0; k < kSkillSlots && std::getline(fields, slot, ','); ++k)
                         {
                             const int skill = std::atoi(trim(slot).c_str());
-                            slots[static_cast<size_t>(k)] = skill <= 0 || urban::skills::find(static_cast<uint16_t>(skill), false) ? std::max(skill, -1) : -1;
+                            slots[static_cast<size_t>(k)] = skill <= 0 || knownSkill(static_cast<uint16_t>(skill)) ? std::max(skill, -1) : -1;
                         }
                         pinSlots[static_cast<uint16_t>(number)] = slots;
                         continue;
@@ -1086,6 +1152,102 @@ namespace urban::players
             return seen == g_seen.end() ? "선수 " + std::to_string(id) : seen->second.second;
         }
 
+        // A record by player ID on the 12 rosters (own or CPU), 0 when on none.
+        uint32_t recordOfId(uint16_t id)
+        {
+            for (int t = 0; t < kTeams; ++t)
+            {
+                const uint32_t object = read32(kTeamTable + 4u * static_cast<uint32_t>(t));
+                if (!valid(object, kTeamRoster + 4u))
+                    continue;
+                const uint32_t roster = read32(object + kTeamRoster);
+                for (uint32_t k = 0; valid(roster, kRosterPlayers + 4u * kSlots) && k < static_cast<uint32_t>(kSlots); ++k)
+                {
+                    const uint32_t record = read32(roster + kRosterPlayers + 4u * k);
+                    if (valid(record, kSkills + 16u) && read16(record) == id)
+                        return record;
+                }
+            }
+            return 0u;
+        }
+
+        bool pinHasIchinen(const Pin &pin)
+        {
+            const auto anyIn = [](const std::vector<uint16_t> &list) { return std::any_of(list.begin(), list.end(), isIchinen); };
+            const auto anySlot = [](const std::array<int, kSkillSlots> &slots) {
+                return std::any_of(slots.begin(), slots.end(), [](int s) { return s > 0 && isIchinen(static_cast<uint16_t>(s)); });
+            };
+            return anyIn(pin.skills) || anyIn(pin.appliedSkills) || anySlot(pin.slots) || anySlot(pin.appliedSlots);
+        }
+
+        // 이치넨 스킬 고정 취소 (the owner, 11-08): Ichinen-made skills belong to the own club. A player away from it for 4 reads
+        // in a row (2 s) - on another club's roster with one in his slots or his pin, or pinned with one and on no roster
+        // (retired, released) - loses them from his pin and from his record there. Back on the own club: counted again.
+        std::map<uint16_t, int> g_ichinenAway;
+
+        void dropIchinenAway(int team, const std::map<uint16_t, std::pair<int, std::string>> &now)
+        {
+            std::set<uint16_t> away;
+            for (int t = 0; t < kTeams; ++t)
+                if (t != team)
+                    for (const Row &row : g_rows[static_cast<size_t>(t)])
+                        if (std::any_of(row.skills.begin(), row.skills.end(), isIchinen))
+                            away.insert(row.id);
+            for (const auto &[id, pin] : g_settings.pins)
+            {
+                const auto at = now.find(id);
+                if (pinHasIchinen(pin) && (at == now.end() || at->second.first != team))
+                    away.insert(id);
+            }
+            for (auto it = g_ichinenAway.begin(); it != g_ichinenAway.end();)
+                it = away.count(it->first) ? std::next(it) : g_ichinenAway.erase(it);
+            bool save = false;
+            for (const uint16_t id : away)
+            {
+                if (++g_ichinenAway[id] < 4)
+                    continue;
+                g_ichinenAway.erase(id);
+                const auto at = now.find(id);
+                const std::string name = at != now.end() ? at->second.second : nameOfId(id);
+                bool fromPin = false;
+                if (auto pin = g_settings.pins.find(id); pin != g_settings.pins.end())
+                {
+                    for (std::vector<uint16_t> *list : {&pin->second.skills, &pin->second.appliedSkills})
+                    {
+                        const size_t before = list->size();
+                        list->erase(std::remove_if(list->begin(), list->end(), isIchinen), list->end());
+                        fromPin = fromPin || list->size() != before;
+                    }
+                    for (std::array<int, kSkillSlots> *slots : {&pin->second.slots, &pin->second.appliedSlots})
+                        for (int &slot : *slots)
+                            if (slot > 0 && isIchinen(static_cast<uint16_t>(slot)))
+                            {
+                                slot = -1;
+                                fromPin = true;
+                            }
+                }
+                int fromRecord = 0;
+                if (at != now.end() && at->second.first != team)
+                    if (const uint32_t record = recordOfId(id))
+                        for (uint32_t k = 0; k < static_cast<uint32_t>(kSkillSlots); ++k)
+                            if (isIchinen(read16(record + kSkills + 2u * k)))
+                            {
+                                const uint16_t none = 0u;
+                                std::memcpy(g_rdram + record + kSkills + 2u * k, &none, sizeof(none));
+                                ++fromRecord;
+                            }
+                if (!fromPin && fromRecord == 0)
+                    continue;
+                save = save || fromPin;
+                const std::string where = at != now.end() ? std::string(kTeamNames[at->second.first]) + "(으)로 감" : std::string("내 구단 선수 목록에서 빠짐 (은퇴·방출)");
+                g_log.add("이치넨 스킬 고정 취소: " + name + " — " + where + (fromRecord ? ", 그 선수에게서 " + std::to_string(fromRecord) + "개 뺌" : std::string()),
+                          "players");
+                std::fprintf(stderr, "[players] Ichinen skills off %u (%s): pin %d, record %d\n", id, where.c_str(), fromPin ? 1 : 0, fromRecord);
+            }
+            if (save)
+                saveSettings(g_settings);
+        }
+
         // The change log: this read of the 12 rosters against the one before (g_mutex held). After a save state is loaded
         // or another save is opened, the read is the new baseline instead.
         void logRosterChanges(int team, bool manual)
@@ -1112,7 +1274,10 @@ namespace urban::players
                 ++added;
             };
             const std::string counts = "12개 구단 " + std::to_string(all) + "명 · 내 구단 " + std::to_string(own) + "명";
-            if (g_seen.empty() || team != g_seenTeam || loads != g_seenLoads)
+            const bool baseline = g_seen.empty() || team != g_seenTeam || loads != g_seenLoads;
+            if (!baseline)
+                dropIchinenAway(team, now);
+            if (baseline)
                 add(std::string(loads != g_seenLoads && !g_seen.empty() && team == g_seenTeam ? "상태를 불러와서 다시 읽음: " : "선수 목록 읽음: ") +
                     counts);
             else
@@ -1684,7 +1849,7 @@ namespace urban::players
             if (!testCampQueued && team >= 0 && !g_settingsPath.empty())
             {
                 testCampQueued = true;
-                // URBAN_TEST_EDIT="<player id>,<ability key>,<value>;...": one-time edits, as the menu's 적용 (tests).
+                // URBAN_TEST_EDIT="<player id>,<ability key>,<value>[,<득의도 0-4>];...": one-time edits, as the menu's 적용 (tests).
                 if (const char *edits = std::getenv("URBAN_TEST_EDIT"); edits && *edits)
                 {
                     std::istringstream items(edits);
@@ -1701,6 +1866,8 @@ namespace urban::players
                         StatEdit edit;
                         edit.value = std::clamp(std::atoi(value.c_str()), 0, kValueMax);
                         edit.limit = -2;
+                        if (std::string aptitude; std::getline(fields, aptitude, ','))
+                            edit.apt = std::clamp(std::atoi(aptitude.c_str()), 0, 4);
                         g_oneShots.push_back(OneShot{static_cast<uint16_t>(std::atoi(id.c_str())), stat, edit, 0});
                     }
                 }
@@ -1804,11 +1971,10 @@ namespace urban::players
             }
             for (size_t i = 0; i < skills.size(); ++i)
             {
-                const urban::skills::Skill *skill = urban::skills::find(skills[i], false);
                 ui->push_id(400000 + skills[i]);
                 if (i % 4u != 0u)
                     ui->same_line();
-                const bool drop = ui->small_button((std::string(skill ? skill->ko : "?") + "  x").c_str()) != 0;
+                const bool drop = ui->small_button((skillName(skills[i]) + "  x").c_str()) != 0;
                 ui->pop_id();
                 if (drop)
                 {
@@ -1852,6 +2018,35 @@ namespace urban::players
                 ui->end_child();
                 ui->end_tab();
             }
+            if (ui->begin_tab("이치넨"))
+            {
+                const auto ichinen = ichinenSkills();
+                ui->text_disabled("이 세이브의 '내 구단 8칸' 이치넨 스킬 (F2 이치넨 탭에서 만들고 고칩니다). 고정하면 그 선수가 내 구단에 있는 동안 "
+                                  "자리를 옮겨도 유지되고, 다른 구단으로 가거나 은퇴·방출되면 2초 뒤 고정이 풀리고 그 선수에게서 빠집니다.");
+                if (ichinen.empty())
+                    ui->text_disabled("내 구단 8칸에 이치넨 스킬이 없습니다 (세이브를 불러온 뒤 F2 이치넨 탭에서 만드세요).");
+                int column = 0;
+                for (const auto &[id, name] : ichinen)
+                {
+                    const auto at = std::find(skills.begin(), skills.end(), id);
+                    int on = at != skills.end() ? 1 : 0;
+                    ui->push_id(300000 + id);
+                    if (column++ % 2 != 0)
+                        ui->same_line();
+                    ui->begin_disabled(!on && skills.size() >= static_cast<size_t>(kSkillSlots) ? 1 : 0);
+                    if (ui->checkbox((std::to_string(id) + "  " + (name.empty() ? std::string("(이름 없음)") : name)).c_str(), &on))
+                    {
+                        if (on)
+                            skills.push_back(id);
+                        else
+                            skills.erase(at);
+                        changed = true;
+                    }
+                    ui->end_disabled();
+                    ui->pop_id();
+                }
+                ui->end_tab();
+            }
             ui->end_tab_bar();
         }
 
@@ -1875,8 +2070,15 @@ namespace urban::players
                             ids.push_back(skill->id);
                         }
             }
+            std::vector<std::string> choiceLabels = labels; // the static choices, then this save's Ichinen skills
+            std::vector<int> choiceIds = ids;
+            for (const auto &[id, name] : ichinenSkills())
+            {
+                choiceLabels.push_back("[이치넨] " + std::to_string(id) + " " + name);
+                choiceIds.push_back(id);
+            }
             std::vector<const char *> pointers;
-            for (const std::string &label : labels)
+            for (const std::string &label : choiceLabels)
                 pointers.push_back(label.c_str());
             if (ui->small_button("8칸 모두 그대로"))
             {
@@ -1887,20 +2089,19 @@ namespace urban::players
             {
                 ui->push_id(800000 + k);
                 const uint16_t now = row ? row->skills[static_cast<size_t>(k)] : 0u;
-                const urban::skills::Skill *skill = now ? urban::skills::find(now, false) : nullptr;
-                char head[160];
-                std::snprintf(head, sizeof(head), "칸 %d: 지금 %s", k + 1, now == 0u ? "비어 있음" : skill ? skill->ko : "?");
+                char head[200];
+                std::snprintf(head, sizeof(head), "칸 %d: 지금 %s", k + 1, now == 0u ? "비어 있음" : skillName(now).c_str());
                 ui->text(head);
                 ui->same_line();
                 const int picked = pin.slots[static_cast<size_t>(k)];
                 int current = 0;
-                for (size_t i = 0; i < ids.size(); ++i)
-                    if (ids[i] == picked)
+                for (size_t i = 0; i < choiceIds.size(); ++i)
+                    if (choiceIds[i] == picked)
                         current = static_cast<int>(i);
                 ui->set_next_width(380.0f);
                 if (ui->combo("##slot", &current, pointers.data(), static_cast<int>(pointers.size())))
                 {
-                    pin.slots[static_cast<size_t>(k)] = ids[static_cast<size_t>(current)];
+                    pin.slots[static_cast<size_t>(k)] = choiceIds[static_cast<size_t>(current)];
                     changed = true;
                 }
                 ui->pop_id();

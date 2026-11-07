@@ -18,4 +18,17 @@ namespace urban::ichinen
     void install(uint8_t *rdram, const std::filesystem::path &userDir);
     // The match bonus of Ichinen-made skills: a hook, so after attach (and after install).
     void installHooks(PS2Runtime &runtime);
+
+    // Final-value caps (the tab's 최종값 상한): a player's match values after every skill (own, team, opponent, staff) and
+    // the match script's boosts, cut right before each pitch's rolls by match_script's at-bat hook. The stats in this order
+    // (the first ten are match_script's kStats); 0 = no cap. A player's own cap wins, else the own team's default.
+    enum CapStat : int
+    {
+        kCapContact, kCapPower, kCapSpeed, kCapRunning, kCapEye, kCapBunt, kCapVelocity, kCapStuff, kCapControl, kCapBreaking,
+        kCapMental, kCapStats
+    };
+    bool finalCapsOn();
+    int finalCap(uint16_t player, bool own, int stat);
+    // What the hook saw and wrote (shown in the tab).
+    void noteFinal(uint16_t player, int stat, int before, int after);
 }
