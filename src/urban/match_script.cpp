@@ -404,8 +404,11 @@ namespace urban::matchscript
             situation.outs = static_cast<int>(r32(match + 0xD0u));
             for (uint32_t b = 0; b < 3u; ++b)
                 situation.base[b] = r8(match + 0x5874u + 3u * b) != 0xFFu;
-            situation.runs[0] = static_cast<int>(r32(match + 0x5880u));
-            situation.runs[1] = static_cast<int>(r32(match + 0x5884u));
+            // The line score at +0x5880: a byte per half-inning (1回表, 1回裏, 2回表, ...), 16 innings; the runs are its sums
+            // (simulated games' dumps, 2026-11-08: reading +0x5880 / +0x5884 as totals was only right while all runs came
+            // in the first inning). +0x58A0 on is something else.
+            for (uint32_t k = 0; k < 32u; ++k)
+                situation.runs[k & 1u] += r8(match + 0x5880u + k);
             return situation;
         }
 
@@ -696,7 +699,25 @@ namespace urban::matchscript
                 if (stats && r32(rg + 0xD4u) != lastAtBat)
                 {
                     lastAtBat = r32(rg + 0xD4u);
-                    std::fprintf(stderr, "[stat] pa %u vs %u\n", g_batter, g_pitcher);
+                    std::fprintf(stderr, "[stat] pa %u vs %u inn %d%s outs %d bases %d%d%d score %d-%d%s\n", g_batter, g_pitcher,
+                                 g_situation.inning, g_situation.batting ? "b" : "t", g_situation.outs, g_situation.base[0] ? 1 : 0,
+                                 g_situation.base[1] ? 1 : 0, g_situation.base[2] ? 1 : 0, g_situation.runs[0], g_situation.runs[1],
+                                 g_situation.valid ? "" : " (no match state)");
+                    static const bool dump = std::getenv("URBAN_SCRIPT_DUMP") != nullptr;
+                    const uint32_t matchNow = r32(kMatchPtr);
+                    if (dump && valid(matchNow))
+                    {
+                        std::string hex;
+                        char cell[4];
+                        for (uint32_t k = 0; k < 0x40u; ++k)
+                        {
+                            std::snprintf(cell, sizeof(cell), "%02x", r8(matchNow + 0x5870u + k));
+                            hex += cell;
+                            if ((k & 3u) == 3u)
+                                hex += ' ';
+                        }
+                        std::fprintf(stderr, "[dump] +5870: %s\n", hex.c_str());
+                    }
                 }
                 if (g_settings.enabled && !g_settings.rules.empty())
                     g_action = pick(g_batter, g_pitcher);
