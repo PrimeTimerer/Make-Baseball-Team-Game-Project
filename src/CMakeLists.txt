@@ -58,6 +58,8 @@ set(URBAN_HOST_SOURCES
     urban/stadium_cheats.cpp
     urban/match_script.cpp
     urban/scout_cheats.cpp
+    urban/cheat_status.cpp
+    urban/lineup_lock.cpp
     urban/save_identity.cpp
     urban/cheat_menu.cpp
     urban/sha256.cpp

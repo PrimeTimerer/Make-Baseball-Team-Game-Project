@@ -1,5 +1,6 @@
 #include "urban/stadium_cheats.h"
 #include "urban/change_log.h"
+#include "urban/save_identity.h"
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
@@ -15,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -49,6 +52,17 @@ namespace urban::stadium
         constexpr uint32_t kTeamTable = 0x5D1240u, kTeamRoster = 0x120u, kRosterClass = 0x4u, kOwnTeamClass = 0x6659F0u;
         constexpr uint32_t kDate = 0x62F190u, kDateYear = 0x13Du; // year 255: the title's demo game
         constexpr uint32_t kClubYear = 0x88u;                       // the year the game's offers go by (1 = 1年目)
+        // Secretary and stadium satisfaction (2026-11-08, from the 5ch 改造コード threads: 6回裏 #671 secretary 0086695C,
+        // #751 stadium satisfaction 008668F7, i.e. club +0x141C / +0x13B7 with the PCSX2 club at 0x865540, the same base
+        // that puts the money +0xE50 at the PAR money code's 0x866390). The club's new-game set-up sub_0011A498 writes
+        // these offsets: +0x141C = 10, +0x13B6 = 90, +0x13B7 = 80.
+        //   +0x141C secretary: 0-3 index the name table 0x5CD960 (伊東 奈緒, 早坂 瑞樹, 宮本 亜由美, ナンシー・ハリスン,
+        //     sub_00130A28); anything else is "ナナシ" (no secretary yet; the new game's 10).
+        //   +0x13B7 stadium satisfaction (the 5ch poster: "the top is 80 in decimal?"; a new game starts at 80).
+        constexpr uint32_t kSecretary = 0x141Cu, kSatisfaction = 0x13B7u, kSatisfactionPair = 0x13B6u;
+        constexpr int kSecretaries = 4, kNoSecretary = 10, kSatisfactionMax = 100;
+        constexpr const char *kSecretaryNames[kSecretaries] = {"이토 나오 (伊東 奈緒)", "하야사카 미즈키 (早坂 瑞樹)", "미야모토 아유미 (宮本 亜由美)",
+                                                               "낸시 해리슨 (ナンシー・ハリスン)"};
         constexpr uint32_t kRamSize = 0x2000000u;
         constexpr int kTypes = 13, kSlotCount = 24, kRows = 8, kPracticeCount = 11, kExtraMax = 99;
         constexpr int kRowSize[kRows] = {4, 3, 3, 3, 3, 2, 2, 4};
@@ -91,6 +105,7 @@ namespace urban::stadium
             std::array<uint8_t, kPracticeCount * 3> practice{};
             std::array<int, kTypes> size{}, needYear{};
             int year = 0;
+            int secretary = -1, satisfaction = -1;
             int placed(int type) const
             {
                 return static_cast<int>(std::count(items.begin(), items.end(), static_cast<uint8_t>(type + 1)));
@@ -105,6 +120,8 @@ namespace urban::stadium
             Remove,
             ClearAll,
             Extra,
+            Secretary,    // type = 0-3, or kNoSecretary
+            Satisfaction, // extra = the value
         };
         struct Action
         {
@@ -116,6 +133,43 @@ namespace urban::stadium
         std::vector<Action> g_actions;
         urban::ChangeLog g_log;
         std::atomic<bool> g_refreshNow{false};
+
+        // The satisfaction lock, per save (cheat_saves/<save>/stadium_cheats.ini, satisfaction=<value>, -1 off): the frame
+        // hook writes it while the own club exists. g_pathMutex: the frame hook (EE) and the menu.
+        std::atomic<int> g_satisfactionLock{-1};
+        std::mutex g_pathMutex;
+        std::filesystem::path g_settingsPath;
+        std::string g_profile;
+        uint32_t g_generation = ~0u;
+
+        int loadLock(const std::filesystem::path &path)
+        {
+            std::ifstream file(path, std::ios::binary);
+            std::string line;
+            int lock = -1;
+            while (std::getline(file, line))
+            {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                    line.pop_back();
+                if (line.rfind("satisfaction=", 0) == 0)
+                    lock = std::clamp(std::atoi(line.c_str() + 13), -1, kSatisfactionMax);
+            }
+            return lock;
+        }
+
+        void saveLock(int lock)
+        {
+            std::filesystem::path path;
+            {
+                std::lock_guard<std::mutex> guard(g_pathMutex);
+                path = g_settingsPath;
+            }
+            if (path.empty())
+                return; // before any game: nothing to keep it for
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            file << "# 구장·시설 설정: 게임 메뉴(F2)의 \"구장·시설\" 탭이 씁니다 (satisfaction=-1 고정 안 함)\n"
+                 << "satisfaction=" << lock << "\n";
+        }
 
         uint32_t read32(uint32_t address)
         {
@@ -358,13 +412,52 @@ namespace urban::stadium
                           "stadium");
                 break;
             }
+            case Kind::Secretary:
+            {
+                if ((action.type < 0 || action.type >= kSecretaries) && action.type != kNoSecretary)
+                    break;
+                at(c, kSecretary) = static_cast<uint8_t>(action.type);
+                const int now = at(c, kSecretary);
+                g_log.add("비서: " + std::string(now < kSecretaries ? kSecretaryNames[now] : "없음 (ナナシ)") + " (값 " + std::to_string(now) +
+                              ") — 메모리에서 다시 읽은 값",
+                          "stadium");
+                break;
             }
+            case Kind::Satisfaction:
+            {
+                at(c, kSatisfaction) = static_cast<uint8_t>(std::clamp(action.extra, 0, kSatisfactionMax));
+                g_log.add("구장 만족도: " + std::to_string(at(c, kSatisfaction)) + " — 메모리에서 다시 읽은 값", "stadium");
+                break;
+            }
+            }
+        }
+
+        // The secretary's name as the game's table orders them, or the game's "no secretary".
+        std::string secretaryName(int value)
+        {
+            return value >= 0 && value < kSecretaries ? kSecretaryNames[value] : "없음 (ナナシ, 값 " + std::to_string(value) + ")";
         }
 
         // EE thread, at every vblank after the .pnach patches: the menu's actions, and every 15 frames what it shows.
         void frame()
         {
             static unsigned tick = 0u;
+            // Another save or a new game: that save's satisfaction lock (none for a new game until it is set).
+            if (const uint32_t generation = urban::saveid::generation(); generation != g_generation)
+            {
+                g_generation = generation;
+                const std::string profile = urban::saveid::current();
+                const std::filesystem::path path = urban::saveid::settingsFile(profile, "stadium_cheats.ini");
+                {
+                    std::lock_guard<std::mutex> guard(g_pathMutex);
+                    g_settingsPath = path;
+                    g_profile = profile;
+                }
+                std::error_code error;
+                g_satisfactionLock.store(!path.empty() && std::filesystem::exists(path, error) ? loadLock(path) : -1);
+                std::fprintf(stderr, "[stadium] save %s: satisfaction lock %d\n", profile.empty() ? "(none)" : profile.c_str(),
+                             g_satisfactionLock.load());
+            }
             const bool manual = g_refreshNow.exchange(false);
             std::lock_guard<std::mutex> lock(g_mutex);
             const uint32_t c = club();
@@ -379,6 +472,23 @@ namespace urban::stadium
             for (const Action &action : g_actions)
                 apply(c, action);
             g_actions.clear();
+            if (const int lock = g_satisfactionLock.load(std::memory_order_relaxed); lock >= 0 && at(c, kSatisfaction) != lock)
+                at(c, kSatisfaction) = static_cast<uint8_t>(lock);
+            // URBAN_STADIUM_LOG=1: the secretary and the satisfaction pair whenever they change (tests).
+            static const bool logFields = std::getenv("URBAN_STADIUM_LOG") != nullptr;
+            static int lastFields = -1;
+            if (logFields)
+            {
+                const int fields = at(c, kSecretary) << 16 | at(c, kSatisfactionPair) << 8 | at(c, kSatisfaction);
+                if (fields != lastFields)
+                {
+                    lastFields = fields;
+                    const uint32_t date = read32(kDate);
+                    std::fprintf(stderr, "[stadium] club %08x secretary %d satisfaction %d (+0x13B6 %d) year %d week %d\n", c, at(c, kSecretary),
+                                 at(c, kSatisfaction), at(c, kSatisfactionPair), valid(date, 0x144u) ? g_rdram[date + kDateYear] : -1,
+                                 valid(date, 0x144u) ? g_rdram[date + 0x140u] : -1);
+                }
+            }
             if (!acted && !manual && (++tick % 15u) != 0u && g_view.active)
                 return;
             View view;
@@ -392,12 +502,15 @@ namespace urban::stadium
             for (int type = 0; type < kTypes; ++type)
                 typeData(type, view.size[static_cast<size_t>(type)], view.needYear[static_cast<size_t>(type)]);
             view.year = static_cast<int>(read32(c + kClubYear));
+            view.secretary = at(c, kSecretary);
+            view.satisfaction = at(c, kSatisfaction);
             g_view = view;
             g_log.read(g_rdram);
         }
 
 #if defined(URBAN_STADIUM_MENU)
         int g_type = 0, g_row = 0;
+        int g_secretaryPick = 0, g_satisfactionDraft = 80;
         std::array<int, kTypes> g_extraDraft{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 
         // GS thread, while the menu is open: reads the frame hook's copy, queues actions for the next frame.
@@ -449,6 +562,52 @@ namespace urban::stadium
             ui->tooltip("구장 6 (돔 구장, 게임이 돔 완공 때 켜는 표시도 켬) · 잔디 3 (내외야 천연잔디) · 관중석 4 (리클라이닝 시트). "
                         "공사 중이던 것은 바로 끝냅니다. 비용 없음. 게임은 원래 연차로 막습니다 (돔은 10년차부터). "
                         "구장 등급이 오르면 시설 칸 줄이 열립니다 (돔: 8줄 24칸).");
+
+            ui->separator_text("비서 · 구장 만족도");
+            ui->text(("비서: " + secretaryName(view.secretary)).c_str());
+            ui->set_next_width(240.0f);
+            ui->combo("##secretary", &g_secretaryPick, kSecretaryNames, kSecretaries);
+            ui->same_line();
+            if (ui->button("비서 바꾸기"))
+                queue.push_back(Action{Kind::Secretary, g_secretaryPick});
+            ui->tooltip("구단 +0x141C (5ch 改造コード 6回裏 #671, his씨 블로그의 秘書変更와 같은 칸). 0~3 = 게임의 비서 4명, "
+                        "새 게임은 10 (ナナシ = 아직 비서 없음). 바로 바뀝니다.");
+            ui->same_line();
+            if (ui->small_button("비서 없음으로"))
+                queue.push_back(Action{Kind::Secretary, kNoSecretary});
+            {
+                std::string profile;
+                {
+                    std::lock_guard<std::mutex> guard(g_pathMutex);
+                    profile = g_profile;
+                }
+                const int lock = g_satisfactionLock.load();
+                ui->text(("구장 만족도: " + std::to_string(view.satisfaction) + (lock >= 0 ? "  (고정 " + std::to_string(lock) + ")" : "")).c_str());
+                ui->set_next_width(110.0f);
+                if (ui->input_int("##satisfaction", &g_satisfactionDraft, 1))
+                {
+                    g_satisfactionDraft = std::clamp(g_satisfactionDraft, 0, kSatisfactionMax);
+                    if (lock >= 0) // locked: the lock follows the new value
+                    {
+                        g_satisfactionLock.store(g_satisfactionDraft);
+                        saveLock(g_satisfactionDraft);
+                    }
+                }
+                ui->same_line();
+                if (ui->button("1회 적용##satisfaction"))
+                    queue.push_back(Action{Kind::Satisfaction, 0, 0, 0, g_satisfactionDraft});
+                ui->same_line();
+                int locked = lock >= 0 ? 1 : 0;
+                if (ui->checkbox("이 값으로 고정", &locked))
+                {
+                    const int now = locked ? g_satisfactionDraft : -1;
+                    g_satisfactionLock.store(now);
+                    saveLock(now);
+                }
+                ui->tooltip("구단 +0x13B7 (5ch 6回裏 #751: '최대는 10진 80?'). 새 게임 시작값이 80입니다. 고정은 이 세이브에만 저장되고, "
+                            "매 프레임 이 값으로 다시 씁니다 (게임이 주마다 바꿔도 유지).");
+                ui->text_disabled(("세이브: " + urban::saveid::describe(profile) + " — 만족도 고정은 이 세이브의 설정").c_str());
+            }
 
             ui->separator_text("연습 시설");
             int top = 0;
@@ -593,7 +752,8 @@ namespace urban::stadium
         if (g_safeMode)
             return;
         ps2x::pnach::addFrameHook(frame);
-        // Tests: URBAN_TEST_STADIUM="max;practice;fill:<type>;place:<type>:<row>;extra:<type>:<n>;clear" once a game runs.
+        // Tests: URBAN_TEST_STADIUM="max;practice;fill:<type>;place:<type>:<row>;extra:<type>:<n>;clear;sec:<0-3|10>;sat:<n>;
+        // satlock:<n|-1>" once a game runs.
         if (const char *test = std::getenv("URBAN_TEST_STADIUM"); test && *test)
         {
             static std::string script = test;
@@ -601,6 +761,11 @@ namespace urban::stadium
                 static bool queued = false;
                 if (queued || club() == 0u)
                     return;
+                {
+                    std::lock_guard<std::mutex> guard(g_pathMutex);
+                    if (g_settingsPath.empty())
+                        return; // the save is not known yet: satlock would have nowhere to go
+                }
                 queued = true;
                 std::lock_guard<std::mutex> lock(g_mutex);
                 size_t start = 0;
@@ -621,6 +786,15 @@ namespace urban::stadium
                         g_actions.push_back(Action{Kind::Place, a, b});
                     else if (std::sscanf(item.c_str(), "extra:%d:%d", &a, &b) == 2)
                         g_actions.push_back(Action{Kind::Extra, a, 0, 0, b});
+                    else if (std::sscanf(item.c_str(), "sec:%d", &a) == 1)
+                        g_actions.push_back(Action{Kind::Secretary, a});
+                    else if (std::sscanf(item.c_str(), "satlock:%d", &a) == 1)
+                    {
+                        g_satisfactionLock.store(std::clamp(a, -1, kSatisfactionMax));
+                        saveLock(g_satisfactionLock.load());
+                    }
+                    else if (std::sscanf(item.c_str(), "sat:%d", &a) == 1)
+                        g_actions.push_back(Action{Kind::Satisfaction, 0, 0, 0, a});
                     if (end == std::string::npos)
                         break;
                     start = end + 1;

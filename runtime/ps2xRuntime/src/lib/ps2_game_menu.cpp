@@ -31,6 +31,7 @@ namespace ps2x::menu
         std::string g_title = "Menu";
         std::string g_hint;
         std::string g_empty;
+        DrawPanel g_header;
         std::atomic<bool> g_open{false};
         std::atomic<bool> g_closedByWindow{false}; // the window's close button (GS thread)
 
@@ -55,6 +56,8 @@ namespace ps2x::menu
             {
                 if (!g_hint.empty())
                     ui->text_disabled(g_hint.c_str());
+                if (g_header)
+                    g_header(ui);
                 if (g_panels.empty())
                 {
                     ui->spacing();
@@ -159,6 +162,12 @@ namespace ps2x::menu
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_empty = std::move(text);
+    }
+
+    void setHeader(DrawPanel draw)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_header = std::move(draw);
     }
 
     bool isOpen() noexcept

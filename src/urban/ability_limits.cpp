@@ -62,6 +62,23 @@ namespace urban::limits
         bool g_log = false; // URBAN_LIMITS_LOG=1: the first values past 99 a match copy takes
         std::atomic<int> g_logged{0};
 
+        // Base runners past 99 (owner, 11-08: "치트사용한 선수들의 도루가 조금 약한것 같은데"). The runner object
+        // ([0x5E8E90], sub_002B5FE8: 4 entries of 0x30) gets the player's 走力 (copy +0x88) and 走塁 (copy +0x8B) in entry
+        // +0x28 / +0x29 as bytes, from three builders: sub_002B6D40 then adds the skill bonus, makes a "negative" byte
+        // (128 and up) 0 and cuts at 99; sub_002B7408 and sub_002B7B00 keep the raw byte. The steal judgements
+        // (sub_002C1268, sub_002C1050) read them as signed bytes. So with 99 제한 풀기 a 255 runner ran like a 0 (or a -1).
+        // Each builder calls sub_002A0458 right after its two stores, with the entry in a saved register: the hook cuts the
+        // two bytes at 99 there, and the game goes on as with a 99 runner (bonus, cap, steals).
+        struct RunnerSite
+        {
+            uint32_t ra;
+            int entryRegister;
+        };
+        constexpr RunnerSite kRunnerSites[] = {{0x2B6EF0u, 16}, {0x2B74E8u, 17}, {0x2B7CB0u, 18}}; // s0, s1, s2
+        constexpr uint32_t kRunnerCall = 0x2A0458u, kRunnerSpeed = 0x28u, kRunnerRunning = 0x29u;
+        GuestFunction g_runnerCallOriginal = nullptr;
+        std::atomic<int> g_runnerFixes{0};
+
         uint16_t read16(uint32_t address)
         {
             uint16_t value;
@@ -259,6 +276,36 @@ namespace urban::limits
 #endif
     }
 
+    namespace
+    {
+        // sub_002A0458 (EE thread): from a runner builder (by the return address), its entry's 走力 / 走塁 cut at 99 first
+        // while 99 제한 풀기 is on; then the game's function (nothing after it).
+        void runnerCallHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static const bool off = std::getenv("URBAN_TEST_NO_RUNNER_FIX") != nullptr; // tests: the game's bytes as they were
+            if (!off && g_on.load(std::memory_order_relaxed))
+            {
+                const uint32_t ra = getRegU32(ctx, 31);
+                for (const RunnerSite &site : kRunnerSites)
+                    if (ra == site.ra)
+                    {
+                        const uint32_t entry = getRegU32(ctx, site.entryRegister) & kRamMask;
+                        if (entry >= 0x100000u && entry < kRamMask - 0x30u)
+                            for (const uint32_t field : {kRunnerSpeed, kRunnerRunning})
+                                if (rdram[entry + field] > 99u)
+                                {
+                                    if (g_runnerFixes.fetch_add(1) < 12)
+                                        std::fprintf(stderr, "[limits] runner 0x%08x %s %u -> 99 (builder ra 0x%x)\n", entry,
+                                                     field == kRunnerSpeed ? "speed" : "running", rdram[entry + field], ra);
+                                    rdram[entry + field] = 99u;
+                                }
+                        break;
+                    }
+            }
+            g_runnerCallOriginal(rdram, ctx, runtime);
+        }
+    }
+
     void install(PS2Runtime &runtime, uint8_t *rdram, const std::filesystem::path &userDir)
     {
         (void)runtime;
@@ -278,6 +325,10 @@ namespace urban::limits
         if (hooks.replace(kOwnValue, "own_value_condition", &ownValueHook, ReplacementStatus::Native,
                           "99 제한: cut at 255 instead of 99 (switch on); off: the game's function"))
             g_ownValueOriginal = hooks.original(kOwnValue);
+        if (runtime.hasFunction(kRunnerCall) &&
+            hooks.replace(kRunnerCall, "runner_speed_cap", &runnerCallHook, ReplacementStatus::Native,
+                          "99 제한: a base runner's 走力 / 走塁 cut at 99 (255 read as negative by the steals); off: as is"))
+            g_runnerCallOriginal = hooks.original(kRunnerCall);
         ps2x::pnach::addFrameHook(frame);
 #if defined(URBAN_LIMITS_MENU)
         ps2x::menu::addPanel("99 제한", [](const Pcsx2GsUi *ui) { draw(ui); });

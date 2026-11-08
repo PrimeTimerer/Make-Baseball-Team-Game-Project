@@ -1,4 +1,5 @@
 #include "urban/staff_cheats.h"
+#include "urban/function_hooks.h"
 #include "urban/save_identity.h"
 
 #include "urban/skill_table.h"
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -100,7 +102,57 @@ namespace urban::staff
         {
             bool enabled = false;
             std::map<int, std::array<Entry, kRoles>> teams; // -1: the own team (whichever it is), else the team index
+            // The off-season retirement screen (owner 11-08: "선수의 은퇴나 코치로서 전환하는 오프시즌 메뉴 ... 무조건 수락").
+            bool retireAdvice = false; // 引退勧告: always accepted
+            bool retireStay = false;   // 引退引止め: always stays
+            bool coachAny = false;     // any retiring player can become a coach
         };
+
+        // The retirement screen (sub_005311A0, built by sub_005302A0 with its 引退引止め / 引退勧告 buttons) asks three
+        // functions, each called from that screen only (checked 2026-11-08 in the ELF):
+        //   sub_0018F2A8 引退勧告: 0 accepts (the player retires), 1 refuses (still good: +0x62 >= 3000, the wish list's
+        //     value >= 4000 or +0x5C >= 3000), 2 cannot (the roster's vtable +0x170): messages 0xE / 0x20 / 0x21.
+        //   sub_0018F150 引退引止め: 1 stays (+0x62 < 2000, the list value < 3500, +0x193 < 15, or < 80 when +0x21), 0
+        //     retires anyway (sub_0012FAB8).
+        //   sub_0018FE60 coach: 1 with 10+ years (+0x1D) and one of the listed skills (0x67B9D8 / 0x67B9F0) or a record at
+        //     +0x1C2..+0x1C5. The wish list builder sub_0018EDC8 (age 45+, or a low ability total) keeps it per player and
+        //     adds the coach candidates from it (5ch: "若いとコーチにできない", "45歳なら確実").
+        constexpr uint32_t kRetireAdvice = 0x18F2A8u, kRetireStay = 0x18F150u, kCoachable = 0x18FE60u;
+        std::atomic<bool> g_adviceOn{false}, g_stayOn{false}, g_coachOn{false};
+        GuestFunction g_adviceOriginal = nullptr, g_stayOriginal = nullptr, g_coachOriginal = nullptr;
+
+        // A forced answer (return in v0 to the caller), or the game's own.
+        void judge(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool on, uint32_t forced, GuestFunction original, const char *what)
+        {
+            if (on || !original)
+            {
+                static int logged = 0;
+                if (logged++ < 20)
+                    std::fprintf(stderr, "[staff] retirement screen: %s -> %u (forced)\n", what, forced);
+                setReturnU32(ctx, forced);
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+            original(rdram, ctx, runtime);
+        }
+        void adviceHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            judge(rdram, ctx, runtime, g_adviceOn.load(std::memory_order_relaxed), 0u, g_adviceOriginal, "引退勧告 accepted");
+        }
+        void stayHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            judge(rdram, ctx, runtime, g_stayOn.load(std::memory_order_relaxed), 1u, g_stayOriginal, "引退引止め stays");
+        }
+        void coachHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            judge(rdram, ctx, runtime, g_coachOn.load(std::memory_order_relaxed), 1u, g_coachOriginal, "coach possible");
+        }
+        void publishSwitches(const Settings &settings)
+        {
+            g_adviceOn.store(settings.retireAdvice);
+            g_stayOn.store(settings.retireStay);
+            g_coachOn.store(settings.coachAny);
+        }
         struct View
         {
             uint32_t record = 0u;
@@ -374,8 +426,10 @@ namespace urban::staff
                 g_settings = !g_settingsPath.empty() && std::filesystem::exists(g_settingsPath, error) ? loadSettings(g_settingsPath) : Settings{};
                 g_backups.clear(); // their records were the old game's
                 g_actions.clear();
-                std::fprintf(stderr, "[staff] save %s: staff cheats %s, %zu teams\n", g_profile.empty() ? "(none)" : g_profile.c_str(),
-                             g_settings.enabled ? "on" : "off", g_settings.teams.size());
+                publishSwitches(g_settings);
+                std::fprintf(stderr, "[staff] save %s: staff cheats %s, %zu teams, retirement: advice %d stay %d coach %d\n",
+                             g_profile.empty() ? "(none)" : g_profile.c_str(), g_settings.enabled ? "on" : "off", g_settings.teams.size(),
+                             g_settings.retireAdvice ? 1 : 0, g_settings.retireStay ? 1 : 0, g_settings.coachAny ? 1 : 0);
             }
             const int own = ownTeam();
             g_own = own;
@@ -441,6 +495,11 @@ namespace urban::staff
                     settings.enabled = value == "1";
                     continue;
                 }
+                if (key == "retire_advice" || key == "retire_stay" || key == "coach_any")
+                {
+                    (key == "retire_advice" ? settings.retireAdvice : key == "retire_stay" ? settings.retireStay : settings.coachAny) = value == "1";
+                    continue;
+                }
                 if (key != "entry")
                     continue;
                 std::vector<std::string> fields;
@@ -488,7 +547,11 @@ namespace urban::staff
             file << "# 스태프 치트 설정: 게임 메뉴(F2)의 \"스태프 치트\" 탭이 씁니다\n"
                  << "# entry=<own 또는 구단 0-11>,<역할 0 감독 1 투수코치 2 야수코치 3 트레이닝코치 4·5 스카우트>,<고정>,<기질>,<용병>,"
                     "<능력 20칸: - 그대로, 0-4 = D-S>,<스킬 16진+16진>\n"
-                 << "enabled=" << (settings.enabled ? 1 : 0) << "\n";
+                 << "enabled=" << (settings.enabled ? 1 : 0) << "\n"
+                 << "# 오프시즌 은퇴 화면: retire_advice 引退勧告 무조건 수락, retire_stay 引退引止め 무조건 성공, coach_any 코치 전환 조건 없음\n"
+                 << "retire_advice=" << (settings.retireAdvice ? 1 : 0) << "\n"
+                 << "retire_stay=" << (settings.retireStay ? 1 : 0) << "\n"
+                 << "coach_any=" << (settings.coachAny ? 1 : 0) << "\n";
             for (const auto &[team, entries] : settings.teams)
                 for (int role = 0; role < kRoles; ++role)
                 {
@@ -730,6 +793,33 @@ namespace urban::staff
             const std::string status = (own >= 0 ? std::string("내 구단 ") + kTeamNames[own] + " (자동 감지)" : std::string("내 구단을 찾는 중")) +
                                        " · 고정 " + std::to_string(locked) + "명";
             ui->text_disabled(status.c_str());
+
+            ui->separator_text("오프시즌 은퇴 화면 (引退引止め · 引退勧告 · 코치 전환)");
+            {
+                int advice = settings.retireAdvice ? 1 : 0, stay = settings.retireStay ? 1 : 0, coach = settings.coachAny ? 1 : 0;
+                if (ui->checkbox("引退勧告 무조건 수락", &advice))
+                {
+                    settings.retireAdvice = advice != 0;
+                    changed = true;
+                }
+                ui->tooltip("은퇴를 권하면 능력이 남아 있어도(원래는 거절) 받아들입니다. 게임 판정 sub_0018F2A8을 '수락'으로.");
+                ui->same_line();
+                if (ui->checkbox("引退引止め 무조건 성공", &stay))
+                {
+                    settings.retireStay = stay != 0;
+                    changed = true;
+                }
+                ui->tooltip("은퇴 희망 선수를 붙잡으면 항상 남습니다. 게임 판정 sub_0018F150을 '남음'으로.");
+                ui->same_line();
+                if (ui->checkbox("코치 전환 조건 없음", &coach))
+                {
+                    settings.coachAny = coach != 0;
+                    changed = true;
+                }
+                ui->tooltip("은퇴하는 선수 누구나 코치 후보가 됩니다. 게임 조건(재적 10년 이상 + 정해진 스킬이나 기록)을 건너뜀: sub_0018FE60. "
+                            "은퇴 화면을 열 때 목록을 만들므로, 화면을 열기 전에 켜 두세요.");
+                ui->text_disabled("이 세이브에 저장됩니다. 스태프 치트 켜기와 관계없이 각각 작동합니다.");
+            }
             std::vector<std::string> labels{std::string("내 구단 (자동") + (own >= 0 ? std::string(": ") + kTeamNames[own] : std::string()) + ")"};
             for (int t = 0; t < kTeams; ++t)
                 labels.push_back(kTeamNames[t]);
@@ -772,6 +862,7 @@ namespace urban::staff
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_settings = settings;
+                publishSwitches(g_settings);
                 path = g_settingsPath;
                 g_actions.insert(g_actions.end(), actions.begin(), actions.end());
                 if (!actions.empty())
@@ -804,5 +895,24 @@ namespace urban::staff
 #endif
         if (!g_safeMode)
             ps2x::pnach::addFrameHook(frame);
+    }
+
+    void installHooks(PS2Runtime &runtime)
+    {
+        (void)runtime;
+        if (!g_rdram || g_safeMode)
+            return;
+        FunctionHooks &hooks = FunctionHooks::instance();
+        if (hooks.replace(kRetireAdvice, "staff_retire_advice", &adviceHook, ReplacementStatus::Native,
+                          "staff cheats: 引退勧告 무조건 수락 (the retirement screen's advice judgement); off: the game's own"))
+            g_adviceOriginal = hooks.original(kRetireAdvice);
+        if (hooks.replace(kRetireStay, "staff_retire_stay", &stayHook, ReplacementStatus::Native,
+                          "staff cheats: 引退引止め 무조건 성공 (the retirement screen's persuasion judgement); off: the game's own"))
+            g_stayOriginal = hooks.original(kRetireStay);
+        if (hooks.replace(kCoachable, "staff_coach_any", &coachHook, ReplacementStatus::Native,
+                          "staff cheats: 코치 전환 조건 없음 (the wish list's coach judgement); off: the game's own"))
+            g_coachOriginal = hooks.original(kCoachable);
+        std::fprintf(stderr, "[staff] retirement screen hooks: advice %s, stay %s, coach %s\n", g_adviceOriginal ? "ok" : "MISSING",
+                     g_stayOriginal ? "ok" : "MISSING", g_coachOriginal ? "ok" : "MISSING");
     }
 }

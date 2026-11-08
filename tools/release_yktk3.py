@@ -29,7 +29,7 @@ FOLDERS = ["resources", "shadercache_pcsx2", "mods"]
 # Never, wherever they are (checked again on the finished folder).
 FORBIDDEN_NAMES = {"memcards", "states", "logs", "game_data", "cheat_saves", "cheat_values", "player_cheats.ini",
                    "scout_cheats.ini", "match_script.ini", "staff_cheats.ini", "ichinen_cheats.ini", "ability_limits.ini",
-                   "ichinen_skills.bin", "launcher.ini", "scout_models.tsv", "SLPM_658.53"}
+                   "ichinen_skills.bin", "stadium_cheats.ini", "launcher.ini", "scout_models.tsv", "SLPM_658.53"}
 FORBIDDEN_SUFFIXES = {".pdb", ".ilk", ".iso", ".ps2", ".state", ".ram", ".exp", ".lib"}
 FORBIDDEN_PATTERNS = [re.compile(p, re.I) for p in (r"\.bak", r"^ram_.*\.bin$", r"^vu1.*\.bin$", r"^perfil_", r"^perf-")]
 

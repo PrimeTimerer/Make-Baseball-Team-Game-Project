@@ -18,6 +18,8 @@ namespace ps2x::menu
     void setTitle(std::string title, std::string hint);
     // Shown instead of the tabs when no panel is registered (e.g. "no mod is on").
     void setEmptyText(std::string text);
+    // Drawn above the tabs, under the hint (e.g. which save the settings belong to and the last apply).
+    void setHeader(DrawPanel draw);
     [[nodiscard]] bool isOpen() noexcept;
     // Window thread, once per host frame: F2 opens/closes it and the input goes to the menu while it is open.
     void hostTick();

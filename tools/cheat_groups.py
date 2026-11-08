@@ -156,35 +156,67 @@ def lines_of(path):
 
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
-# What the split "Club Status Cheats" pieces do (REA / capstone on the game code, 2026-11-08; the web had no description).
-# The list (목록.tsv) shows these names and notes; the label stays the file name and the .pnach text stays the same, so
-# [Mods] Enabled and the compiled cheats (cheats_native.txt hashes) keep matching.
+# What the split "Club Status Cheats" pieces are: the owner's source site's 2006 XT/PAR codes (pasted 2026-11-08), matched
+# line for line (counts, consecutive words, offsets, decoded values such as 3854E7A6 = li v0,1 and E456E31D = the 70000C88
+# nop) with the game code read through REA / capstone. The list (목록.tsv) shows these names and notes; the label stays the
+# file name and the .pnach text stays the same, so [Mods] Enabled and the compiled cheats (cheats_native.txt) keep matching.
 FOUND = {
-    "구단 상태 ① (0x15A098)": ("선수 전원 18세 고정 + 컨디션 최상·피로 0 (매주)",
-                              "매주 연습 루틴(0x15A098)에서 내 팀 선수 전원의 나이 18세, 컨디션 게이지 9999(경기 능력 1.0배), "
-                              "축적 피로 0 등 상태 값을 고정. 켜 두면 나이를 먹지 않음 (원래 이름 구단 상태 ①)"),
-    "구단 상태 ② (0x15AA78)": ("능력 성장 즉시 상한까지 (매주)",
-                              "매주 연습 경험치가 각 능력의 상한까지 한 번에 오름, 19개 능력 (원래 이름 구단 상태 ②)"),
-    "구단 상태 ③ (0x3C4278)": ("구단 기간 카운터 즉시 종료 (+0x156F)",
-                              "구단 [0x5CA114]+0x156F의 남은 기간을 바로 0으로, +0x156C는 255. 무엇의 기간인지 미확정 (원래 이름 구단 상태 ③)"),
-    "구단 상태 ④ (0x275518)": ("값 11개 100 고정 (의미 미확정)",
-                              "0x275518의 +0x34 배열 값 11개를 100으로. 의미 미확정 (원래 이름 구단 상태 ④)"),
-    "구단 상태 ⑤ (0x170048)": ("구단 평가 수치 999 고정 (매주)",
-                              "구단 +0x145A~+0x1460의 수치 4~5개(0~999, 인기·평가 계열로 추정)를 매주 999로 (원래 이름 구단 상태 ⑤)"),
-    "구단 상태 ⑥ (0x16FB78)": ("시스템 데이터 값 100 고정 (의미 미확정)",
-                              "매주 누적되는 0x193ED4A 값을 100으로. 의미 미확정 (원래 이름 구단 상태 ⑥)"),
-    "구단 상태 ⑦ (0x16A858)": ("선수 상태 검사 항상 통과 (출전 가능 추정)",
-                              "부상 기간, 나이 24세 미만 등의 조건 검사(0x16A880)를 항상 통과로. 출전 가능 여부 쪽으로 추정 (원래 이름 구단 상태 ⑦)"),
-    "구단 상태 ⑧ (0x12A650)": ("구단 대기 기간 즉시 종료 (+0x1033)",
-                              "구단 +0x1033의 대기 기간을 바로 0으로, 경영 쪽 진행 항목 16칸과 함께 처리됨. 이름은 추정 (원래 이름 구단 상태 ⑧)"),
-    "구단 상태 ⑩ (0x3A5F40)": ("목록 항목 선택 조건 통과 (의미 미확정)",
-                              "0x3A5F40의 목록 항목 '선택 가능' 조건을 강제로 통과. 의미 미확정 (원래 이름 구단 상태 ⑩)"),
+    "구단 상태 ① (0x15A098)": ("연습 후 선수 상태 최대 + 계약 0/5 (매주)",
+                              "원본: 試合勘最大·丈夫度最大·モチベーション最大·コンディション最大·蓄積疲労なし·体力全快 + 必須 루틴의 "
+                              "不満なし·契約年数0/5. 연습 루틴(0x15A098)에서 경기 감각·튼튼함·의욕·컨디션 최대, "
+                              "축적 피로 0, 체력 회복, 불만 0, 계약 0/5년, 재적 연수·FA 값 1. 나이 18세(年齢18歳)는 11-08부터 "
+                              "'연습 후 나이 18세 (매주)'로 따로 켬 (원래 이름 구단 상태 ①)"),
+    "구단 상태 ② (0x15AA78)": ("연습하면 능력이 상한까지 성장",
+                              "원본: 能力仮限界まで成長. 연습 경험치가 각 능력의 임시 한계까지 한 번에 오름 (원래 이름 구단 상태 ②)"),
+    "구단 상태 ③ (0x3C4278)": ("트레이드 반드시 성공 + 2턴 답변 (2006 코드)",
+                              "원본: トレードかならず成功 + トレード2ターンで返答. 구단 +0x156F 답변 대기를 바로 끝냄. "
+                              "2023 코드표의 트레이드 성공·답변 1턴과 같은 기능 (원래 이름 구단 상태 ③)"),
+    "구단 상태 ④ (0x275518)": ("트레이드 화면에서 구단 우호도 최대",
+                              "원본: トレード画面へ入ると球団友好度最大. 다른 11개 구단과의 우호도 100 (원래 이름 구단 상태 ④)"),
+    "구단 상태 ⑤ (0x170048)": ("달이 바뀌면 연고지 공헌도 최대",
+                              "원본: 月が替わるとホームタウン貢献度最大. 구단 +0x145A~+0x1460 값 999 (원래 이름 구단 상태 ⑤)"),
+    "구단 상태 ⑥ (0x16FB78)": ("달이 바뀌면 구단 주목도 100%",
+                              "원본: 月が替わると球団注目度100% (원래 이름 구단 상태 ⑥)"),
+    "구단 상태 ⑦ (0x16A858)": ("트레이드 전 선수 선택 가능 (2006 코드)",
+                              "원본: トレード全選手選択可能. 이상한 조건(이쪽 선수가 필요 없는 트레이드 등)을 그대로 받으면 멈출 수 있음: "
+                              "선수 한 명을 조건에 넣어 다시 신청. 2023 코드표 판과 같은 기능 (원래 이름 구단 상태 ⑦)"),
+    "구단 상태 ⑧ (0x12A650)": ("출장 하루 만에 끝남",
+                              "원본: 出張１日で終了. 구단 +0x1033 출장 남은 날을 바로 0으로 (원래 이름 구단 상태 ⑧)"),
+    "구단 상태 ⑩ (0x3A5F40)": ("이치넨: 외국인 제한·보호 선수 무시",
+                              "원본: 外国人枠無視(1年モード) + 1年モードプロテクト無視 (원래 이름 구단 상태 ⑩)"),
 }
 # 資金最大 routine of the "Club Status Cheats": a jump at a function's return (0x104D68) to code written over .rodata
 # text at 0x68FFC8 that stores 99999990 at a fixed address (PCSX2's 0x866390/0x8664D0). That memory is allocated, so
 # here the address is other data (it broke 4 bytes of a save). Same hook, the game's money: [0x5CA114] + 0xE50 in
 # 1000 yen (sub_172BB0; the screen shows it / 10 as 万円, so 99999990 = 999億9999万円), in free memory below the ELF.
 # ([0x62F190] + 0x124, used until 2026-11-05, is only the office header's copy of it.)
+# 구단 상태 ① without its age write (owner 11-08: "18세 나이치트는 분리를 해줘"). ps2_recomp compiles a cheat routine once,
+# from what all the files write there (tools/cheat_code.py), so the two age words cannot simply leave this file: the
+# compiled routine would still store, with the number read from memory (0). So this file's routine moves to 0xF8400
+# without them (the original files keep theirs at 0xF8000; the hook word at 0x15A500 picks the routine), and the age gets
+# a hook of its own on the next experience call of the same player loop (sub_0015A098 0x15A544, in the 7-step aptitude
+# loop; s6 = the player record there as at 0x15A500): li v0,18; sb v0,0x18(s6); j 0x180390 (the call it replaced).
+# Turning a file off writes the game code words back (ps2_pnach), so each hook stops on its own.
+CLUB1 = "구단 상태 ① (0x15A098)"
+CLUB1_HOOK = (0x15A500, 0x0C03E000)  # jal 0xF8000
+CLUB1_ROUTINE = (0x0F8000, 0x0F8100)
+CLUB1_MOVE = 0x400                   # this file: jal 0xF8400, the routine at 0xF8400
+CLUB1_AGE = (0x0F8010, 0x0F8014)     # li v0,18 / sb v0,0x18(s6)
+AGE = "연습 후 나이 18세 (매주)"
+AGE_LINES = [(0x15A544, 0x0C03E140),  # jal 0xF8500 (the game: jal 0x180390)
+             (0x0F8500, 0x24020012),  # li v0, 18 (the age, 값.tsv)
+             (0x0F8504, 0xA2C20018),  # sb v0, 0x18(s6)
+             (0x0F8508, 0x080600E4),  # j 0x180390
+             (0x0F850C, 0x00000000)]  # nop
+# "ichinen 99" with +255: the shop list (sub_003A0FD0) writes the level into each shown level-type item (bought: the
+# ability byte mgr +0xCC[id] += level + 1, sub_003A1E98), and that byte add saturates (paddub) instead of wrapping, so
+# 99 + 255 ends at 255, not 98. The name keeps out of the category words: 기타, numbered after the others.
+ICHINEN255 = "이치넨 상점 아이템 +255 (포인트 최대)"
+ICHINEN255_LINES = [(0x3A10A4, 0x240600FE),  # li a2, 254 (값.tsv; the game: lh a2, 0xA(v1))
+                    (0x3A10AC, 0xA466000A),  # sh a2, 0xA(v1): the item's level (the game: addiu a2, a2, 1 for "＋ %d")
+                    (0x3A0C74, 0x00000000),  # the points cap's bnel goes, its delay slot stores 99999 always (as ichinen 99)
+                    (0x3A1F24, 0x70431628)]  # paddub v0, v0, v1: buying adds up to 255 (the game: addu, sb wraps)
+
 MONEY_HOOK = (0x104D68, 0x081A3FF2)
 MONEY_CAVE = (0x68FFC8, 0x68FFE0)
 MONEY_FIX = [(0x104D68, 0x0803E080),  # j 0xF8200
@@ -210,6 +242,8 @@ PARAMS = {
     "성장 폭발 경험치 최대": [("20141A84", "경험치", 0, 32767, "number")],
     "ichinen 99": [("203A10A4", "레벨형 아이템 레벨 (화면에는 +1)", 0, 98, "number")],
     "스카우터 최대": [("2068FEB0", "스카우트 능력 값", 0, 127, "number"), ("2068FECC", "지역 값", 0, 32767, "number")],
+    AGE: [("200F8500", "나이 (매주 연습 때 이 값으로)", 1, 60, "number")],
+    ICHINEN255: [("203A10A4", "레벨형 아이템 레벨 (산 값은 +1, 254 = +255)", 0, 254, "number")],
 }
 ATTENDANCE = "관중 수 설정 (구장 정원 무시)"
 # Data writes the user may hold at every frame (고정, the default) or write once: [CheatValues] "<file>|lock=0".
@@ -425,6 +459,17 @@ def split(mods, elf_path, functions_path, excel=None):
                         start = where if isinstance(where, int) else where[1]
                         label = f"{title} {CIRCLED[number] if number < len(CIRCLED) else number + 1} (0x{start:06X})"
                         note = "기능 이름 미확인: 원본 구획을 게임 함수별로 나눔"
+                    if label == CLUB1 and CLUB1_HOOK in piece:  # the age leaves (see CLUB1): the routine moves
+                        moved = []
+                        for a, v in piece:
+                            if (a, v) == CLUB1_HOOK:
+                                moved.append((a, v + (CLUB1_MOVE >> 2)))
+                            elif CLUB1_ROUTINE[0] <= a < CLUB1_ROUTINE[1]:
+                                if a not in CLUB1_AGE:
+                                    moved.append((a + CLUB1_MOVE, v))
+                            else:
+                                moved.append((a, v))
+                        piece = moved
                     shown, shown_note = FOUND.get(label, (None, None))
                     add_group(label, "", header, piece, source, note=note, shown=shown, shown_note=shown_note)
 
@@ -448,6 +493,13 @@ def split(mods, elf_path, functions_path, excel=None):
                                    (0x0F8300, 999999)],      # the attendance
               "tools/cheat_groups.py",
               note="경기 날 관중 수를 이 값으로 (구장 정원보다 커도 됨, 입장료 수입 = 관중 수 x 티켓 가격)")
+    # 구단 상태 ①'s age, on its own (see CLUB1), after the others so that their numbers stay.
+    add_group(AGE, "", "", AGE_LINES, "tools/cheat_groups.py (구단 상태 ①의 年齢18歳에서 분리)",
+              note="매주 연습 때 내 구단 선수 나이를 이 값으로 (기본 18, 선수 기록 +0x18). 원래 '연습 후 선수 상태 최대'에 들어 있던 것")
+    # ichinen 99's +255 version (see ICHINEN255), last again.
+    add_group(ICHINEN255, "", "", ICHINEN255_LINES, "tools/cheat_groups.py (ichinen 99의 +255판)",
+              note="이치넨 상점의 레벨형 아이템이 +255 (게임 목록에는 +254로 보임), 사면 그 능력 합이 255에서 멈춤 (게임은 256에서 0으로 돎), "
+                   "포인트 99999. ichinen 99와 같은 자리를 쓰니 하나만 켜기")
     # One file per function, numbered by category
     rows, used = [], set()
     category_order = [c for c, _ in CATEGORIES] + ["기타"]

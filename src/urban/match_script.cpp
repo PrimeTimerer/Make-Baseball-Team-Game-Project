@@ -128,13 +128,37 @@ namespace urban::matchscript
             Condition when;
         };
 
+        // Steals and BSO with conditions, several of each (owner, 11-08: "도루나 여타 다른것들도", like the rules): the
+        // first entry of the side whose condition holds wins, entries with a condition before those without. Side 0 =
+        // the own club bats (its runners steal), 1 = the opponents bat in the own club's games.
+        struct StealRule
+        {
+            int side = 0;
+            bool safe = true; // else out (sub_32DF88: a result other than 1 puts the running runner out)
+            Condition when;
+            bool operator==(const StealRule &) const = default;
+        };
+        struct BsoRule
+        {
+            int side = 0;
+            int count[3] = {-1, -1, -1}; // balls, strikes, outs (-1: as the game has it)
+            Condition when;
+        };
+
         struct Settings
         {
             bool enabled = false;
             bool steal = false; // the own team's steals are always safe
+            std::vector<StealRule> steals;
+            std::vector<BsoRule> bsoRules; // with conditions; the unconditional holds are bso below
             int limit = 0;      // forced HR / hit / walk per half-inning, 0 = no limit (an all-HR team never makes an out)
             std::vector<Rule> rules;
             std::vector<Boost> boosts;
+            // BSO: [0] while the own club bats, [1] while the opponents bat in the own club's games; each {balls, strikes,
+            // outs}, -1 = as the game has it. bsoCap: holding outs at 0 or 1 stops once the batting club has this many runs
+            // in the half-inning (0 = no limit).
+            int bso[2][3] = {{-1, -1, -1}, {-1, -1, -1}};
+            int bsoCap = 20;
         };
 
         uint8_t *g_rdram = nullptr;
@@ -250,6 +274,30 @@ namespace urban::matchscript
                     settings.steal = value == "1";
                 else if (key == "limit")
                     settings.limit = std::atoi(value.c_str());
+                else if (key == "bso" && parts.size() >= 4 && (target == -1 || target == -2)) // bso=<own|opp>,<balls>,<strikes>,<outs>[,condition]
+                {
+                    const int side = target == -1 ? 0 : 1;
+                    const int top[3] = {3, 2, 2};
+                    BsoRule rule;
+                    rule.side = side;
+                    for (int k = 0; k < 3; ++k)
+                        rule.count[k] = std::clamp(std::atoi(parts[k + 1].c_str()), -1, top[k]);
+                    rule.when = conditionOf(parts, 4);
+                    if (rule.when.any())
+                        settings.bsoRules.push_back(rule);
+                    else
+                        std::copy(rule.count, rule.count + 3, settings.bso[side]);
+                }
+                else if (key == "stealrule" && parts.size() >= 2 && (target == -1 || target == -2)) // stealrule=<own|opp>,<safe|out>[,condition]
+                {
+                    StealRule rule;
+                    rule.side = target == -1 ? 0 : 1;
+                    rule.safe = parts[1] != "out";
+                    rule.when = conditionOf(parts, 2);
+                    settings.steals.push_back(rule);
+                }
+                else if (key == "bsocap")
+                    settings.bsoCap = std::clamp(std::atoi(value.c_str()), 0, 99);
                 else if (key == "rule" && parts.size() >= 3)
                 {
                     Rule rule;
@@ -296,6 +344,17 @@ namespace urban::matchscript
                 file << "enabled=" << (settings.enabled ? 1 : 0) << "\r\n";
                 file << "steal=" << (settings.steal ? 1 : 0) << "\r\n";
                 file << "limit=" << settings.limit << "\r\n";
+                file << "# bso=<own 내 구단 공격 | opp 상대 공격>,<볼>,<스트라이크>,<아웃> (-1 그대로)  bsocap=아웃 고정(0·1)을 멈추는 한 이닝 득점 (0 제한 없음)\r\n";
+                file << "bso=own," << settings.bso[0][0] << ',' << settings.bso[0][1] << ',' << settings.bso[0][2] << "\r\n";
+                file << "bso=opp," << settings.bso[1][0] << ',' << settings.bso[1][1] << ',' << settings.bso[1][2] << "\r\n";
+                for (const BsoRule &rule : settings.bsoRules) // the same with the 7 condition fields
+                    file << "bso=" << (rule.side == 0 ? "own" : "opp") << ',' << rule.count[0] << ',' << rule.count[1] << ',' << rule.count[2]
+                         << conditionText(rule.when) << "\r\n";
+                file << "bsocap=" << settings.bsoCap << "\r\n";
+                file << "# stealrule=<own 내 구단 도루 | opp 상대 도루>,<safe 성공 | out 실패>[,조건 7칸]\r\n";
+                for (const StealRule &rule : settings.steals)
+                    file << "stealrule=" << (rule.side == 0 ? "own" : "opp") << ',' << (rule.safe ? "safe" : "out")
+                         << (rule.when.any() ? conditionText(rule.when) : std::string()) << "\r\n";
                 auto targetKey = [](int target) {
                     return target == -1 ? std::string("own") : target == -2 ? std::string("opp") : target == -3 ? std::string("all") : std::to_string(target);
                 };
@@ -340,9 +399,11 @@ namespace urban::matchscript
             g_stamp = stamp;
             g_haveStamp = true;
             g_settings = load(g_path);
-            std::fprintf(stderr, "[script] match scripts %s, %zu rules, %zu boosts, limit %d per half-inning, steals %s\n",
+            std::fprintf(stderr, "[script] match scripts %s, %zu rules, %zu boosts, limit %d per half-inning, steals %s (+%zu rules), bso own %d/%d/%d opp %d/%d/%d (+%zu with conditions) cap %d\n",
                          g_settings.enabled ? "on" : "off", g_settings.rules.size(), g_settings.boosts.size(), g_settings.limit,
-                         g_settings.steal ? "always safe" : "as they are");
+                         g_settings.steal ? "always safe" : "as they are", g_settings.steals.size(), g_settings.bso[0][0], g_settings.bso[0][1],
+                         g_settings.bso[0][2], g_settings.bso[1][0], g_settings.bso[1][1], g_settings.bso[1][2], g_settings.bsoRules.size(),
+                         g_settings.bsoCap);
         }
 
         bool isOwn(uint16_t id)
@@ -726,6 +787,61 @@ namespace urban::matchscript
 
         // Before the swing decision: a sign that makes the batter swing and hit (HR, hit), swing and miss (strikeout)
         // or take the pitch (walk). The sign is put back when the pitch's result is set (the two hooks below).
+        // BSO (owner 11-08; the 5ch 改造コード thread 6回裏 #703/#725: アウト 00979314, ストライク 00979318, ボール 00979319 in
+        // PCSX2 are this match object's +0xD4 (the copy of the outs at +0xD0), +0xD8 and +0xD9). Written before every pitch by
+        // the swing hook (3D, 結果表示 and simulated games alike), so the pitch's result counts on from the held value:
+        // balls 3 = any ball is a walk, strikes 2 = any strike is a strikeout, outs 2 = the next out ends the half-inning.
+        // Outs held at 0 or 1 never let the third out come (the 5ch poster scored 90 in one inning), so that stops once the
+        // batting club has bsoCap runs in this half-inning (the line score byte at +0x5880 + half); 0 = no limit, which a
+        // simulated game would never finish. Only the own club's games: in a game of two CPU clubs nothing is written.
+        void applyBso(uint32_t match)
+        {
+            if (!g_settings.enabled || !valid(match) || g_batter == 0u)
+                return;
+            bool any = !g_settings.bsoRules.empty();
+            for (const auto &side : g_settings.bso)
+                for (const int value : side)
+                    any = any || value >= 0;
+            if (!any)
+                return;
+            const int side = isOwn(g_batter) ? 0 : (g_pitcher != 0u && isOwn(g_pitcher)) ? 1 : -1;
+            if (side < 0)
+                return;
+            // A held count with a condition whose condition holds (the own club's view) wins over the side's plain one.
+            const int *want = g_settings.bso[side];
+            if (!g_settings.bsoRules.empty())
+            {
+                g_situation = readSituation();
+                for (const BsoRule &rule : g_settings.bsoRules)
+                    if (rule.side == side && holds(rule.when, side == 1))
+                    {
+                        want = rule.count;
+                        break;
+                    }
+            }
+            const uint32_t before = r32(match + 0xD0u) << 16 | static_cast<uint32_t>(r8(match + 0xD8u)) << 8 | r8(match + 0xD9u);
+            if (want[0] >= 0)
+                g_rdram[(match + 0xD9u) & 0x01FFFFFFu] = static_cast<uint8_t>(std::min(want[0], 3));
+            if (want[1] >= 0)
+                g_rdram[(match + 0xD8u) & 0x01FFFFFFu] = static_cast<uint8_t>(std::min(want[1], 2));
+            if (want[2] >= 0)
+            {
+                const uint32_t half = std::min<uint32_t>(r32(match + 0x14u) * 2u + (r32(match + 0x18u) != 0u ? 1u : 0u), 31u);
+                const int runs = r8(match + 0x5880u + half);
+                if (want[2] >= 2 || g_settings.bsoCap <= 0 || runs < g_settings.bsoCap)
+                {
+                    const uint32_t outs = static_cast<uint32_t>(std::min(want[2], 2));
+                    w32(match + 0xD0u, outs);
+                    w32(match + 0xD4u, outs);
+                }
+            }
+            static const bool stats = std::getenv("URBAN_SCRIPT_STATS") != nullptr;
+            const uint32_t after = r32(match + 0xD0u) << 16 | static_cast<uint32_t>(r8(match + 0xD8u)) << 8 | r8(match + 0xD9u);
+            if (stats && after != before)
+                std::fprintf(stderr, "[script] bso %s: O%u S%u B%u -> O%u S%u B%u\n", side == 0 ? "own" : "opp", before >> 16, (before >> 8) & 0xFFu,
+                             before & 0xFFu, after >> 16, (after >> 8) & 0xFFu, after & 0xFFu);
+        }
+
         void swingHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             restoreSign();
@@ -757,6 +873,7 @@ namespace urban::matchscript
                         g_forcedInHalf = 0;
                     }
                 }
+                applyBso(match);               // before the situation: rule conditions see the held count
                 g_situation = readSituation(); // the conditions of rules and stacks look at this pitch's situation
                 applyBoosts(ctx, rg);
                 // URBAN_SCRIPT_STATS=1: one line per plate appearance ("pa <batter>") and per ball in play ("play <batter>
@@ -878,15 +995,46 @@ namespace urban::matchscript
         // A steal's result: sub_32DF88 calls this with the base the runner leaves (1 first, 2 second, 3 third).
         void stealHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
-            if (g_settings.steal && g_settings.enabled)
+            // URBAN_SCRIPT_STATS=1: every steal's natural result and the runner bytes the judgement read (+0x28 / +0x29).
+            static const bool stats = std::getenv("URBAN_SCRIPT_STATS") != nullptr;
+            if (stats)
+            {
+                const uint32_t runners = r32(0x5E8E90u), base = getRegU32(ctx, 5);
+                const uint32_t entry = valid(runners) && base <= 3u ? runners + 0x30u * base : 0u;
+                const uint32_t rgNow = r32(kRealgamePtr);
+                std::fprintf(stderr, "[stat] steal base %u natural %d runner speed %u running %u (%s)\n", base,
+                             static_cast<int8_t>(r8(r32(0x5E75F8u) + 0xEB7u)), entry ? r8(entry + 0x28u) : 0u, entry ? r8(entry + 0x29u) : 0u,
+                             valid(rgNow) && batterId(rgNow) && isOwn(batterId(rgNow)) ? "own" : "other");
+            }
+            if (g_settings.enabled && (g_settings.steal || !g_settings.steals.empty()))
             {
                 const uint32_t rg = r32(kRealgamePtr);
                 const uint16_t batter = valid(rg) ? batterId(rg) : 0;
-                if (batter && isOwn(batter)) // the runners are the batting team's
+                // The runners are the batting team's: side 0 when the own club bats, 1 when it fields (its games only).
+                const int side = batter && isOwn(batter) ? 0 : (batter && pitcherId() && isOwn(pitcherId())) ? 1 : -1;
+                int result = -1; // -1 as the game rolls it, else 1 safe / 0 out
+                if (side >= 0 && !g_settings.steals.empty())
                 {
-                    std::fprintf(stderr, "[script] steal from base %u: safe (natural %d)\n", getRegU32(ctx, 5),
-                                 static_cast<int8_t>(r8(r32(0x5E75F8u) + 0xEB7u)));
-                    setReturnU32(ctx, 1u);
+                    g_situation = readSituation();
+                    for (const bool conditional : {true, false})
+                    {
+                        for (const StealRule &rule : g_settings.steals)
+                            if (rule.side == side && rule.when.any() == conditional && holds(rule.when, side == 1))
+                            {
+                                result = rule.safe ? 1 : 0;
+                                break;
+                            }
+                        if (result >= 0)
+                            break;
+                    }
+                }
+                if (result < 0 && side == 0 && g_settings.steal)
+                    result = 1;
+                if (result >= 0)
+                {
+                    std::fprintf(stderr, "[script] steal from base %u (%s runner): %s (natural %d)\n", getRegU32(ctx, 5), side == 0 ? "own" : "opp",
+                                 result ? "safe" : "out", static_cast<int8_t>(r8(r32(0x5E75F8u) + 0xEB7u)));
+                    setReturnU32(ctx, static_cast<uint32_t>(result));
                     ctx->pc = getRegU32(ctx, 31);
                     return;
                 }
@@ -907,6 +1055,18 @@ namespace urban::matchscript
         std::set<uint16_t> g_selected; // the checked players (global IDs), menu thread
         int g_boostTarget = 0, g_boostStat = 0;
         Condition g_when; // the condition the next rule or stack gets
+        // The rule builder by innings: action 0 = none (the row is skipped), else the Action (1 HR, 2 hit, 3 K, 4 BB).
+        struct InningRow
+        {
+            int from = 1, to = 3, action = 0;
+        };
+        std::vector<InningRow> g_innRows = {{1, 3, 4}, {4, 6, 2}, {7, 9, 1}}; // the owner's example: 볼넷, 안타, 홈런
+        // The one-player panel: the player (global ID, -1 none yet), its own condition, role, result, rows and stat.
+        int g_perPlayer = -1, g_perRole = 0, g_perAction = 0, g_perStat = 0;
+        Condition g_perWhen;
+        std::vector<InningRow> g_perRows = {{1, 3, 4}, {4, 6, 2}, {7, 9, 1}};
+        int g_stealPickSide = 0, g_stealPickResult = 0; // the steal entry to add: side, 0 safe / 1 out
+        int g_bsoPick[4] = {0, 0, 0, 0};                 // the held count to add: side, then balls / strikes / outs as combo items
         constexpr const char *kScoreModes[] = {"점수 상관없음", "이기고 있을 때", "지고 있을 때", "동점일 때", "이기거나 동점", "지거나 동점"};
         constexpr const char *kRunnerModes[] = {"주자 상관없음", "주자 없을 때", "주자 있을 때", "득점권 (2·3루)", "만루"};
         constexpr const char *kOutModes[] = {"아웃 상관없음", "0아웃", "1아웃", "2아웃"};
@@ -1139,47 +1299,243 @@ namespace urban::matchscript
                 ui->text_wrapped(("고른 선수 " + std::to_string(g_selected.size()) + "명: " + names).c_str());
             }
 
+            // A condition's inputs (the shared one below and the one-player one), each under its own ID.
+            auto conditionInputs = [ui](Condition &when, int id) {
+                ui->push_id(7000 + id);
+                ui->text("이닝");
+                ui->same_line();
+                ui->set_next_width(70.0f);
+                if (ui->input_int("##innfrom", &when.innFrom, 1))
+                    when.innFrom = std::clamp(when.innFrom, 0, 30);
+                ui->tooltip("0 = 1회부터");
+                ui->same_line();
+                ui->text("~");
+                ui->same_line();
+                ui->set_next_width(70.0f);
+                if (ui->input_int("##innto", &when.innTo, 1))
+                    when.innTo = std::clamp(when.innTo, 0, 30);
+                ui->tooltip("0 = 끝까지 (연장 포함)");
+                ui->same_line();
+                ui->set_next_width(130.0f);
+                ui->combo("##whenscore", &when.score, kScoreModes, 6);
+                ui->same_line();
+                ui->text("점수 차");
+                ui->same_line();
+                ui->set_next_width(70.0f);
+                if (ui->input_int("##diffmin", &when.diffMin, 1))
+                    when.diffMin = std::clamp(when.diffMin, 0, 99);
+                ui->same_line();
+                ui->text("~");
+                ui->same_line();
+                ui->set_next_width(70.0f);
+                if (ui->input_int("##diffmax", &when.diffMax, 1))
+                    when.diffMax = std::clamp(when.diffMax, 0, 99);
+                ui->tooltip("점수 차 범위 (0 = 제한 없음). 예: '지고 있을 때' + 1~3 = 1~3점 뒤질 때");
+                ui->set_next_width(150.0f);
+                ui->combo("##whenrunners", &when.runners, kRunnerModes, 5);
+                ui->same_line();
+                ui->set_next_width(120.0f);
+                ui->combo("##whenouts", &when.outs, kOutModes, 4);
+                ui->same_line();
+                if (ui->small_button("조건 없음으로"))
+                    when = Condition{};
+                ui->text_disabled(("지금 조건: " + conditionLabel(when)).c_str());
+                ui->pop_id();
+            };
+            // One result per target, role and condition: the same condition again replaces it, another condition adds one.
+            auto addRule = [&settings](const Rule &rule) {
+                for (Rule &existing : settings.rules)
+                    if (existing.target == rule.target && existing.pitcher == rule.pitcher && existing.when == rule.when)
+                    {
+                        existing.action = rule.action;
+                        return;
+                    }
+                settings.rules.push_back(rule);
+            };
+            auto addBoost = [&settings](const Boost &boost) {
+                for (const Boost &existing : settings.boosts)
+                    if (existing.target == boost.target && existing.stat == boost.stat && existing.when == boost.when)
+                        return false;
+                settings.boosts.push_back(boost);
+                return true;
+            };
+            auto stackText = [](const Boost &boost) {
+                char factor[96];
+                const uint32_t offset = kStats[boost.stat].offset;
+                if (offset == kDistance && !kStats[boost.stat].pitcher)
+                    std::snprintf(factor, sizeof(factor), " x%d.%d %+d (깊은 외야로 갈 확률 %d%%)", boost.percent / 100, (boost.percent % 100) / 10,
+                                  boost.add, deepChance(Factor{boost.percent, boost.add}));
+                else if (offset == kDominance && kStats[boost.stat].pitcher)
+                    std::snprintf(factor, sizeof(factor), " 상대 교타·선구안 ÷%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, -boost.add);
+                else
+                    std::snprintf(factor, sizeof(factor), " x%d.%d %+d", boost.percent / 100, (boost.percent % 100) / 10, boost.add);
+                return std::string(kStats[boost.stat].label) + factor;
+            };
+
+            // One player at a time (owner, 11-08: with several players checked, an add went to all of them by mistake):
+            // what is added here goes to this one player only, with a condition of its own.
+            ui->separator_text("선수 한 명씩 설정 (여기서 더하는 규칙·중첩은 이 선수에게만)");
+            {
+                std::vector<int> perIds;
+                auto note = [&perIds](int id) {
+                    if (id >= 0 && std::find(perIds.begin(), perIds.end(), id) == perIds.end())
+                        perIds.push_back(id);
+                };
+                for (const uint16_t id : g_selected)
+                    note(id);
+                for (const Rule &rule : settings.rules)
+                    note(rule.target);
+                for (const Boost &boost : settings.boosts)
+                    note(boost.target);
+                if (perIds.empty())
+                    ui->text_disabled("위에서 선수를 체크하면 여기서 한 명씩 따로 설정할 수 있습니다 (규칙·중첩이 있는 선수도 여기 나옵니다).");
+                else
+                {
+                    if (std::find(perIds.begin(), perIds.end(), g_perPlayer) == perIds.end())
+                        g_perPlayer = perIds.front();
+                    std::vector<std::string> perLabels;
+                    int perIndex = 0;
+                    for (size_t i = 0; i < perIds.size(); ++i)
+                    {
+                        const int id = perIds[i];
+                        const auto count = std::count_if(settings.rules.begin(), settings.rules.end(), [id](const Rule &r) { return r.target == id; }) +
+                                           std::count_if(settings.boosts.begin(), settings.boosts.end(), [id](const Boost &b) { return b.target == id; });
+                        perLabels.push_back(playerName(id) + (g_selected.count(static_cast<uint16_t>(id)) ? " · 체크됨" : "") + " · 규칙·중첩 " +
+                                            std::to_string(count) + "개");
+                        if (id == g_perPlayer)
+                            perIndex = static_cast<int>(i);
+                    }
+                    std::vector<const char *> perItems;
+                    for (const std::string &label : perLabels)
+                        perItems.push_back(label.c_str());
+                    ui->text("설정할 선수");
+                    ui->same_line();
+                    ui->set_next_width(460.0f);
+                    if (ui->combo("##perplayer", &perIndex, perItems.data(), static_cast<int>(perItems.size())))
+                        g_perPlayer = perIds[static_cast<size_t>(perIndex)];
+                    const int id = g_perPlayer;
+                    ui->text_disabled("이 선수의 조건 (아래 공통 '발동 조건'과 따로):");
+                    conditionInputs(g_perWhen, 1);
+                    int removeRule = -1, removeStack = -1;
+                    for (size_t i = 0; i < settings.rules.size(); ++i)
+                    {
+                        const Rule &rule = settings.rules[i];
+                        if (rule.target != id)
+                            continue;
+                        ui->push_id(6000 + static_cast<int>(i));
+                        if (ui->small_button("빼기"))
+                            removeRule = static_cast<int>(i);
+                        ui->same_line();
+                        ui->text((std::string(rule.pitcher ? "투수일 때 " : "타자일 때 ") + (rule.pitcher ? kPitcherActions : kBatterActions)[static_cast<int>(rule.action) - 1] +
+                                  " · " + conditionLabel(rule.when))
+                                     .c_str());
+                        ui->pop_id();
+                    }
+                    for (size_t i = 0; i < settings.boosts.size(); ++i)
+                    {
+                        const Boost &boost = settings.boosts[i];
+                        if (boost.target != id)
+                            continue;
+                        ui->push_id(6500 + static_cast<int>(i));
+                        if (ui->small_button("빼기"))
+                            removeStack = static_cast<int>(i);
+                        ui->same_line();
+                        ui->text(("중첩 " + stackText(boost) + " · " + conditionLabel(boost.when) + " (배율은 아래 '능력치 중첩'에서)").c_str());
+                        ui->pop_id();
+                    }
+                    if (removeRule >= 0)
+                    {
+                        settings.rules.erase(settings.rules.begin() + removeRule);
+                        changed = true;
+                    }
+                    if (removeStack >= 0)
+                    {
+                        settings.boosts.erase(settings.boosts.begin() + removeStack);
+                        changed = true;
+                    }
+                    const char *perRoles[] = {"타자", "투수"};
+                    ui->set_next_width(70.0f);
+                    ui->combo("##perrole", &g_perRole, perRoles, 2);
+                    ui->same_line();
+                    ui->set_next_width(110.0f);
+                    ui->combo("##peraction", &g_perAction, g_perRole ? kPitcherActions : kBatterActions, 4);
+                    ui->same_line();
+                    if (ui->button("이 선수에게만 더하기##perrule"))
+                    {
+                        addRule(Rule{id, g_perRole == 1, static_cast<Action>(g_perAction + 1), g_perWhen});
+                        changed = true;
+                    }
+                    // By innings, for this player (its own rows).
+                    const char *const *perNames = g_perRole ? kPitcherActions : kBatterActions;
+                    const char *perActionItems[] = {"그대로", perNames[0], perNames[1], perNames[2], perNames[3]};
+                    int removeRow = -1;
+                    for (size_t r = 0; r < g_perRows.size(); ++r)
+                    {
+                        InningRow &row = g_perRows[r];
+                        ui->push_id(6800 + static_cast<int>(r));
+                        ui->set_next_width(70.0f);
+                        if (ui->input_int("##prowfrom", &row.from, 1))
+                            row.from = std::clamp(row.from, 1, 30);
+                        ui->same_line();
+                        ui->text("~");
+                        ui->same_line();
+                        ui->set_next_width(70.0f);
+                        if (ui->input_int("##prowto", &row.to, 1))
+                            row.to = std::clamp(row.to, 0, 30);
+                        ui->same_line();
+                        ui->text("회");
+                        ui->same_line();
+                        ui->set_next_width(110.0f);
+                        ui->combo("##prowaction", &row.action, perActionItems, 5);
+                        ui->same_line();
+                        if (ui->small_button("줄 빼기"))
+                            removeRow = static_cast<int>(r);
+                        ui->pop_id();
+                    }
+                    if (removeRow >= 0)
+                        g_perRows.erase(g_perRows.begin() + removeRow);
+                    if (ui->small_button("줄 더하기##perrows"))
+                    {
+                        InningRow next;
+                        if (!g_perRows.empty() && g_perRows.back().to > 0)
+                        {
+                            next.from = std::min(g_perRows.back().to + 1, 30);
+                            next.to = std::min(next.from + 2, 30);
+                        }
+                        g_perRows.push_back(next);
+                    }
+                    ui->same_line();
+                    if (ui->button("이 선수에게만 이닝별로 더하기##perrows"))
+                    {
+                        for (const InningRow &row : g_perRows)
+                            if (row.action > 0)
+                            {
+                                Condition when = g_perWhen;
+                                when.innFrom = row.from;
+                                when.innTo = row.to;
+                                addRule(Rule{id, g_perRole == 1, static_cast<Action>(row.action), when});
+                            }
+                        changed = true;
+                    }
+                    std::vector<const char *> perStats;
+                    for (const Stat &stat : kStats)
+                        perStats.push_back(stat.label);
+                    ui->set_next_width(200.0f);
+                    ui->combo("##perstat", &g_perStat, perStats.data(), kStatCount);
+                    ui->same_line();
+                    if (ui->button("이 선수에게만 중첩 더하기 (x2.0)##perstack") && addBoost(Boost{id, g_perStat, 200, 0, g_perWhen}))
+                        changed = true;
+                    ui->text_disabled("역할·결과·이닝 줄은 이 선수 것만입니다. 위 체크(고른 선수)와 상관없이 이 선수 한 명에게만 더합니다.");
+                }
+            }
+
             // The condition the next rule or stack gets.
             ui->separator_text("발동 조건 (아래에서 '더하기'하는 규칙·중첩에 붙음)");
             ui->text_disabled("점수·이닝은 그 선수 구단 기준입니다: 타자 규칙·타자 능력치는 공격하는 쪽, 투수 규칙·투수 능력치는 수비하는 쪽.");
-            ui->text("이닝");
-            ui->same_line();
-            ui->set_next_width(70.0f);
-            if (ui->input_int("##innfrom", &g_when.innFrom, 1))
-                g_when.innFrom = std::clamp(g_when.innFrom, 0, 30);
-            ui->tooltip("0 = 1회부터");
-            ui->same_line();
-            ui->text("~");
-            ui->same_line();
-            ui->set_next_width(70.0f);
-            if (ui->input_int("##innto", &g_when.innTo, 1))
-                g_when.innTo = std::clamp(g_when.innTo, 0, 30);
-            ui->tooltip("0 = 끝까지 (연장 포함)");
-            ui->same_line();
-            ui->set_next_width(130.0f);
-            ui->combo("##whenscore", &g_when.score, kScoreModes, 6);
-            ui->same_line();
-            ui->text("점수 차");
-            ui->same_line();
-            ui->set_next_width(70.0f);
-            if (ui->input_int("##diffmin", &g_when.diffMin, 1))
-                g_when.diffMin = std::clamp(g_when.diffMin, 0, 99);
-            ui->same_line();
-            ui->text("~");
-            ui->same_line();
-            ui->set_next_width(70.0f);
-            if (ui->input_int("##diffmax", &g_when.diffMax, 1))
-                g_when.diffMax = std::clamp(g_when.diffMax, 0, 99);
-            ui->tooltip("점수 차 범위 (0 = 제한 없음). 예: '지고 있을 때' + 1~3 = 1~3점 뒤질 때");
-            ui->set_next_width(150.0f);
-            ui->combo("##whenrunners", &g_when.runners, kRunnerModes, 5);
-            ui->same_line();
-            ui->set_next_width(120.0f);
-            ui->combo("##whenouts", &g_when.outs, kOutModes, 4);
-            ui->same_line();
-            if (ui->small_button("조건 없음으로"))
-                g_when = Condition{};
-            ui->text_disabled(("지금 조건: " + conditionLabel(g_when)).c_str());
+            conditionInputs(g_when, 0);
+            const bool bulk = g_selected.size() > 1u;
+            const std::string bulkWarning = "대상이 '고른 선수 " + std::to_string(g_selected.size()) + "명'이면 " + std::to_string(g_selected.size()) +
+                                            "명 모두에게 더합니다. 한 명만 바꾸려면 위 '선수 한 명씩 설정'을 쓰세요.";
 
             // Forced results
             ui->separator_text("결과 강제 (먼저 맞는 것: 고른 선수 타자 > 고른 선수 투수 > 전체 타자 > 전체 투수, 조건 있는 규칙이 먼저)");
@@ -1221,22 +1577,73 @@ namespace urban::matchscript
             ui->set_next_width(110.0f);
             ui->combo("##ruleaction", &g_groupAction, g_groupRole ? kPitcherActions : kBatterActions, 4);
             ui->same_line();
-            if (ui->button("더하기##rule") && (g_groupTarget < 3 || havePlayer))
+            if (ui->button("이 조건으로 더하기##rule") && (g_groupTarget < 3 || havePlayer))
             {
                 for (const int target : targetsOf(g_groupTarget))
-                {
-                    const Rule rule{target, g_groupRole == 1, static_cast<Action>(g_groupAction + 1), g_when};
-                    bool replaced = false;
-                    for (Rule &existing : settings.rules)
-                        if (existing.target == rule.target && existing.pitcher == rule.pitcher && existing.when == rule.when)
-                        {
-                            existing.action = rule.action; // one result per target, role and condition
-                            replaced = true;
-                        }
-                    if (!replaced)
-                        settings.rules.push_back(rule);
-                }
+                    addRule(Rule{target, g_groupRole == 1, static_cast<Action>(g_groupAction + 1), g_when});
                 changed = true;
+            }
+            if (bulk && g_groupTarget == 3)
+                ui->text_colored(0xFF5050FFu, bulkWarning.c_str());
+            ui->text_disabled("같은 선수에게 조건이 다른 규칙을 여러 개 둘 수 있습니다: 위 '발동 조건'을 바꿔 가며 더하거나, 아래 이닝별 표로 한 번에 넣으세요.");
+            // Several results by innings at once (owner, 11-08: "1~3은 볼넷, 4~6은 안타, 7~9는 홈런"), for the target and role above.
+            if (ui->collapsing_header("이닝별로 한꺼번에 더하기 (대상·역할은 바로 위 칸)", 0))
+            {
+                const char *const *names = g_groupRole ? kPitcherActions : kBatterActions;
+                const char *actionItems[] = {"그대로", names[0], names[1], names[2], names[3]};
+                int removeRow = -1;
+                for (size_t r = 0; r < g_innRows.size(); ++r)
+                {
+                    InningRow &row = g_innRows[r];
+                    ui->push_id(500 + static_cast<int>(r));
+                    ui->set_next_width(70.0f);
+                    if (ui->input_int("##rowfrom", &row.from, 1))
+                        row.from = std::clamp(row.from, 1, 30);
+                    ui->same_line();
+                    ui->text("~");
+                    ui->same_line();
+                    ui->set_next_width(70.0f);
+                    if (ui->input_int("##rowto", &row.to, 1))
+                        row.to = std::clamp(row.to, 0, 30);
+                    ui->same_line();
+                    ui->text("회");
+                    ui->same_line();
+                    ui->set_next_width(110.0f);
+                    ui->combo("##rowaction", &row.action, actionItems, 5);
+                    ui->same_line();
+                    if (ui->small_button("줄 빼기"))
+                        removeRow = static_cast<int>(r);
+                    ui->pop_id();
+                }
+                if (removeRow >= 0)
+                    g_innRows.erase(g_innRows.begin() + removeRow);
+                if (ui->small_button("줄 더하기"))
+                {
+                    InningRow next;
+                    if (!g_innRows.empty() && g_innRows.back().to > 0)
+                    {
+                        next.from = std::min(g_innRows.back().to + 1, 30);
+                        next.to = std::min(next.from + 2, 30);
+                    }
+                    g_innRows.push_back(next);
+                }
+                ui->same_line();
+                if (ui->button("고른 대상에 이닝별로 더하기##innrows") && (g_groupTarget < 3 || havePlayer))
+                {
+                    for (const int target : targetsOf(g_groupTarget))
+                        for (const InningRow &row : g_innRows)
+                            if (row.action > 0)
+                            {
+                                Condition when = g_when; // its score, runners and outs too
+                                when.innFrom = row.from;
+                                when.innTo = row.to;
+                                addRule(Rule{target, g_groupRole == 1, static_cast<Action>(row.action), when});
+                            }
+                    changed = true;
+                }
+                if (bulk && g_groupTarget == 3)
+                    ui->text_colored(0xFF5050FFu, bulkWarning.c_str());
+                ui->text_disabled("'그대로' 줄은 건너뜁니다. 끝 이닝 0 = 끝까지(연장 포함). 위 '발동 조건'의 점수·주자·아웃 조건도 같이 붙습니다.");
             }
             ui->same_line();
             if (ui->small_button("규칙 모두 빼기") && !settings.rules.empty())
@@ -1271,6 +1678,167 @@ namespace urban::matchscript
             {
                 settings.steal = steal != 0;
                 changed = true;
+            }
+            // Steals with conditions, several (the checkbox above is the plain one, used when none of these holds).
+            {
+                static const char *const kStealSides[] = {"내 구단 도루", "상대 도루 (내 경기)"};
+                static const char *const kStealResults[] = {"무조건 성공", "무조건 실패"};
+                int removeSteal = -1;
+                for (size_t i = 0; i < settings.steals.size(); ++i)
+                {
+                    StealRule &rule = settings.steals[i];
+                    ui->push_id(3000 + static_cast<int>(i));
+                    if (ui->small_button("빼기"))
+                        removeSteal = static_cast<int>(i);
+                    ui->same_line();
+                    ui->text((std::string(kStealSides[rule.side]) + " · " + kStealResults[rule.safe ? 0 : 1] + " · " + conditionLabel(rule.when)).c_str());
+                    ui->same_line();
+                    if (ui->small_button("위 조건 붙이기##stealwhen"))
+                    {
+                        rule.when = g_when;
+                        changed = true;
+                    }
+                    ui->pop_id();
+                }
+                if (removeSteal >= 0)
+                {
+                    settings.steals.erase(settings.steals.begin() + removeSteal);
+                    changed = true;
+                }
+                ui->set_next_width(170.0f);
+                ui->combo("##stealside", &g_stealPickSide, kStealSides, 2);
+                ui->same_line();
+                ui->set_next_width(120.0f);
+                ui->combo("##stealresult", &g_stealPickResult, kStealResults, 2);
+                ui->same_line();
+                if (ui->button("이 조건으로 더하기##steal"))
+                {
+                    const StealRule rule{g_stealPickSide, g_stealPickResult == 0, g_when};
+                    bool replaced = false;
+                    for (StealRule &existing : settings.steals)
+                        if (existing.side == rule.side && existing.when == rule.when)
+                        {
+                            existing.safe = rule.safe;
+                            replaced = true;
+                        }
+                    if (!replaced)
+                        settings.steals.push_back(rule);
+                    changed = true;
+                }
+                ui->text_disabled("위 '발동 조건'이 붙습니다(예: 7~9회만 성공, 상대 도루는 늘 실패). 조건 있는 줄이 먼저, 그다음 조건 없는 줄, 맨 끝이 위 체크입니다.");
+            }
+
+            // BSO count (5ch 改造コード 6回裏 #725)
+            ui->separator_text("BSO 카운트 고정 (매 투구 직전에 씀, 내 구단 경기만)");
+            {
+                static const char *const kBallItems[] = {"그대로", "0", "1", "2", "3"};
+                static const char *const kCountItems[] = {"그대로", "0", "1", "2"};
+                static const char *const kSides[] = {"내 구단 공격 때", "상대 공격 때"};
+                static const char *const kParts[] = {"볼", "스트라이크", "아웃"};
+                for (int side = 0; side < 2; ++side)
+                {
+                    ui->push_id(200 + side);
+                    ui->text(kSides[side]);
+                    for (int part = 0; part < 3; ++part)
+                    {
+                        ui->same_line_at(120.0f + 150.0f * static_cast<float>(part));
+                        ui->text(kParts[part]);
+                        ui->same_line();
+                        ui->push_id(part);
+                        int pick = settings.bso[side][part] + 1;
+                        ui->set_next_width(70.0f);
+                        if (ui->combo("##bso", &pick, part == 0 ? kBallItems : kCountItems, part == 0 ? 5 : 4))
+                        {
+                            settings.bso[side][part] = pick - 1;
+                            changed = true;
+                        }
+                        ui->pop_id();
+                    }
+                    ui->pop_id();
+                }
+                // Held counts with a condition, several; the first one that holds wins over the side's row above.
+                int removeBso = -1;
+                auto countText = [](const char *name, int value) { return std::string(name) + " " + (value < 0 ? std::string("그대로") : std::to_string(value)); };
+                for (size_t i = 0; i < settings.bsoRules.size(); ++i)
+                {
+                    BsoRule &rule = settings.bsoRules[i];
+                    ui->push_id(4000 + static_cast<int>(i));
+                    if (ui->small_button("빼기"))
+                        removeBso = static_cast<int>(i);
+                    ui->same_line();
+                    ui->text((std::string(kSides[rule.side]) + " · " + countText("볼", rule.count[0]) + " · " + countText("스트라이크", rule.count[1]) +
+                              " · " + countText("아웃", rule.count[2]) + " · " + conditionLabel(rule.when))
+                                 .c_str());
+                    ui->same_line();
+                    if (ui->small_button("위 조건 붙이기##bsowhen") && g_when.any())
+                    {
+                        rule.when = g_when;
+                        changed = true;
+                    }
+                    ui->pop_id();
+                }
+                if (removeBso >= 0)
+                {
+                    settings.bsoRules.erase(settings.bsoRules.begin() + removeBso);
+                    changed = true;
+                }
+                ui->text("조건 붙은 고정");
+                ui->same_line();
+                ui->set_next_width(130.0f);
+                ui->combo("##bsopickside", &g_bsoPick[0], kSides, 2);
+                for (int part = 0; part < 3; ++part)
+                {
+                    ui->same_line();
+                    ui->text(kParts[part]);
+                    ui->same_line();
+                    ui->push_id(4500 + part);
+                    ui->set_next_width(70.0f);
+                    ui->combo("##bsopick", &g_bsoPick[part + 1], part == 0 ? kBallItems : kCountItems, part == 0 ? 5 : 4);
+                    ui->pop_id();
+                }
+                ui->same_line();
+                const bool canAddBso = g_when.any();
+                if (ui->button("이 조건으로 더하기##bso") && canAddBso)
+                {
+                    BsoRule rule;
+                    rule.side = g_bsoPick[0];
+                    for (int part = 0; part < 3; ++part)
+                        rule.count[part] = g_bsoPick[part + 1] - 1;
+                    rule.when = g_when;
+                    bool replaced = false;
+                    for (BsoRule &existing : settings.bsoRules)
+                        if (existing.side == rule.side && existing.when == rule.when)
+                        {
+                            std::copy(rule.count, rule.count + 3, existing.count);
+                            replaced = true;
+                        }
+                    if (!replaced)
+                        settings.bsoRules.push_back(rule);
+                    changed = true;
+                }
+                ui->text_disabled(canAddBso ? "위 '발동 조건'이 붙습니다(예: 1~3회 상대 공격 때 아웃 2). 맞는 줄이 있으면 위 두 줄보다 먼저 씁니다."
+                                            : "조건 붙은 고정은 위 '발동 조건'을 먼저 정해야 더해집니다(조건 없는 고정은 위 두 줄).");
+                ui->text_disabled("볼 3 = 볼 하나면 볼넷 · 스트라이크 2 = 스트라이크 하나면 삼진 · 아웃 2 = 아웃 하나면 공수 교대.");
+                ui->text_disabled("아웃 0·1 고정 = 세 번째 아웃이 안 나와 이닝이 계속됩니다 (5ch: 1회에 90점). 그래서 아래 득점에서 멈춥니다.");
+                ui->text(settings.bsoCap > 0 ? ("아웃 0·1 고정을 멈추는 한 이닝 득점: " + std::to_string(settings.bsoCap) + "점").c_str()
+                                             : "아웃 0·1 고정을 멈추는 한 이닝 득점: 제한 없음");
+                ui->same_line();
+                if (ui->small_button("제한 없음##bsocap"))
+                {
+                    settings.bsoCap = 0;
+                    changed = true;
+                }
+                for (int step : {-10, -1, 1, 10})
+                {
+                    ui->same_line();
+                    const std::string label = (step > 0 ? "+" : "") + std::to_string(step) + "##bsocap";
+                    if (ui->small_button(label.c_str()))
+                    {
+                        settings.bsoCap = std::clamp(settings.bsoCap + step, 0, 99);
+                        changed = true;
+                    }
+                }
+                ui->text_disabled("제한 없음은 3D 경기에서만 쓰세요: 결과 표시·시뮬레이션 경기는 끝나지 않습니다. '경기 스크립트 켜기'가 켜져 있어야 씁니다.");
             }
 
             // Stacking
@@ -1348,18 +1916,11 @@ namespace urban::matchscript
             if (ui->button("더하기 (x2.0 +0, 위에서 조절)##boost") && (g_boostTarget < 3 || havePlayer))
             {
                 for (const int target : targetsOf(g_boostTarget))
-                {
-                    const Boost boost{target, g_boostStat, 200, 0, g_when};
-                    bool exists = false;
-                    for (const Boost &existing : settings.boosts)
-                        exists = exists || (existing.target == boost.target && existing.stat == boost.stat && existing.when == boost.when);
-                    if (!exists)
-                    {
-                        settings.boosts.push_back(boost);
+                    if (addBoost(Boost{target, g_boostStat, 200, 0, g_when}))
                         changed = true;
-                    }
-                }
             }
+            if (bulk && g_boostTarget == 3)
+                ui->text_colored(0xFF5050FFu, bulkWarning.c_str());
             ui->same_line();
             if (ui->small_button("중첩 모두 빼기") && !settings.boosts.empty())
             {

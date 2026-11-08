@@ -76,6 +76,13 @@ namespace urban::scout
         constexpr uint32_t kRng = 0x15CEA0u, kForeignRoll = 0x19424Cu, kDomesticRoll = 0x1939F0u;
         constexpr uint32_t kForeignCount = 0x94u, kDomesticCount = 0xB4u;
         constexpr uint32_t kRamSize = 0x2000000u;
+        // パイプ (owner, 11-08: "스카우트들 파이프도 맥스로 고정"): the scouting object's +0x488 / +0x48C are the two scouts;
+        // a scout record's +0x2E holds 12 u16, the 6 domestic areas then the 6 overseas regions, the bars of the office's
+        // 国内パイプ / 海外パイプ screen (5 bars). The 5ch 스카우터 최대 code writes 8000 there when the scout screen is
+        // drawn (sub_003FA580), which the owner saw as 4 bars overseas while the domestic ones had gone down again.
+        constexpr uint32_t kScoutList = 0x488u, kPipes = 0x2Eu;
+        constexpr uint32_t kPipeCount = 12u;
+        constexpr uint16_t kPipeTop = 10000u;
 
         constexpr const char *kAreas[6] = {"홋카이도·도호쿠", "간토", "호쿠신에쓰·도카이", "긴키", "주고쿠·시코쿠", "규슈·오키나와"};
         constexpr const char *kKinds[3] = {"고교", "대학", "사회인"};
@@ -92,6 +99,7 @@ namespace urban::scout
             bool guard = true;      // CPU clubs lose the protected players
             bool guardFound = true; // ... every player the own team found too, not only the wish list and the kept ones
             bool listNow = true;    // wished / inserted domestic players on this year's 国内新人 list (+0x62 = 1)
+            bool pipes = false;     // the two scouts' 12 pipes held at the top (kPipeTop)
             std::set<uint16_t> want; // found at once
             std::set<uint16_t> keep; // protected without being on the wish list
             int team = -1;           // the own team when these settings were first used (another team: another game)
@@ -262,6 +270,8 @@ namespace urban::scout
                     settings.guardFound = value != "0";
                 else if (key == "listnow")
                     settings.listNow = value != "0";
+                else if (key == "pipes")
+                    settings.pipes = value == "1";
                 else if (key == "team")
                     settings.team = std::atoi(value.c_str());
                 else if (key == "want")
@@ -298,6 +308,7 @@ namespace urban::scout
                      << "guard=" << (settings.guard ? 1 : 0) << "\n"
                      << "guardfound=" << (settings.guardFound ? 1 : 0) << "\n"
                      << "listnow=" << (settings.listNow ? 1 : 0) << "\n"
+                     << "pipes=" << (settings.pipes ? 1 : 0) << "\n"
                      << "want=" << textOf(settings.want) << "\n"
                      << "keep=" << textOf(settings.keep) << "\n";
             }
@@ -631,9 +642,43 @@ namespace urban::scout
                 g_settings.team = team;
                 saveSettings(g_settings);
             }
+            // A memory card save's own file (per save since 11-08) is that game's whatever team it says: a wrong first
+            // team (the owner's M00 and M01 had team=0 from the file before the settings were per save, so the wish list
+            // never ran on 요코하마) becomes this game's. Only "new" (any new game) keeps the check.
+            const bool cardSave = g_profile.size() == 3u && (g_profile[0] == 'M' || g_profile[0] == 'V');
+            if (cardSave && g_settings.team >= 0 && g_settings.team != team && !g_path.empty())
+            {
+                std::fprintf(stderr, "[scout] save %s: settings team %d -> %d (this save's own team)\n", g_profile.c_str(), g_settings.team, team);
+                g_log.add("세이브 " + g_profile + "의 스카우트 설정이 다른 구단 번호로 저장돼 있어 이 세이브의 구단으로 고쳤습니다 (찜 " +
+                              std::to_string(g_settings.want.size()) + "명이 이제 적용됩니다)",
+                          "scout");
+                g_settings.team = team;
+                saveSettings(g_settings);
+            }
             g_teamMismatch = g_settings.team >= 0 && g_settings.team != team;
             const bool active = g_settings.enabled && !g_teamMismatch && !g_path.empty();
             g_on = active;
+            // パイプ 최대: the two scouts' 12 pipes at the top at every check (the game lowers and raises them weekly).
+            if (active && g_settings.pipes)
+                for (uint32_t s = 0; s < 2u; ++s)
+                {
+                    const uint32_t scout = read32(scouting + kScoutList + 4u * s);
+                    if (!valid(scout, kPipes + 2u * kPipeCount))
+                        continue;
+                    int raised = 0;
+                    for (uint32_t k = 0; k < kPipeCount; ++k)
+                        if (read16(scout + kPipes + 2u * k) != kPipeTop)
+                        {
+                            write16(scout + kPipes + 2u * k, kPipeTop);
+                            ++raised;
+                        }
+                    static bool logged[2] = {false, false};
+                    if (raised > 0 && !logged[s])
+                    {
+                        logged[s] = true;
+                        std::fprintf(stderr, "[scout] pipes of scout %u (0x%08x): %d raised to %u\n", s + 1u, scout, raised, kPipeTop);
+                    }
+                }
             const auto entryOf = [&](bool overseas, int index) {
                 return overseas ? foreign + 0xCu + kEntry * static_cast<uint32_t>(index) : domestic + kEntry * static_cast<uint32_t>(index);
             };
@@ -1445,6 +1490,17 @@ namespace urban::scout
             ui->same_line();
             ui->text_disabled(team < 0 ? "세이브를 불러오면 후보 명단이 나옵니다"
                                        : (std::string("내 구단 ") + kTeamNames[team] + " · 국내 후보 · 해외 후보를 매 순간 확인").c_str());
+            // The settings of another team's game (a new game's "new" file) do nothing: say so, and offer to take them.
+            if (team >= 0 && settings.team >= 0 && settings.team < kTeams && settings.team != team)
+            {
+                ui->text_colored(0xFF5050FFu, ("이 설정은 " + std::string(kTeamNames[settings.team]) + " 게임에서 만든 것이라 지금은 쓰지 않습니다 (찜·발굴·독점 모두 멈춤).").c_str());
+                ui->same_line();
+                if (ui->small_button("이 구단 설정으로 쓰기"))
+                {
+                    settings.team = team;
+                    changed = true;
+                }
+            }
             ui->text("하루 발굴 수 (스카우트 1명, 하루):");
             ui->same_line();
             ui->set_next_width(220.0f);
@@ -1480,6 +1536,14 @@ namespace urban::scout
                 changed = true;
             }
             ui->tooltip("게임은 올해 지명·교섭 대상인 국내 후보만 보고 리스트(国内新人)에 보입니다(+0x62). 켜면 찜하거나 DB에서 넣은 국내 선수도 지금 대상이 됩니다. 실험 기능: 드래프트에서 확인 필요.");
+            int pipes = settings.pipes ? 1 : 0;
+            if (ui->checkbox("스카우트 파이프 최대 고정 (국내 6곳 · 해외 6곳, 스카우트 2명)", &pipes))
+            {
+                settings.pipes = pipes != 0;
+                changed = true;
+            }
+            ui->tooltip("오피스의 国内パイプ·海外パイプ 막대를 모두 끝까지(값 10000) 매 순간 둡니다. 파이프가 굵을수록 국내 신인 정보와 외국인 발굴에 유리합니다. "
+                        "기능별 '스카우터 최대'는 스카우트 화면을 열 때만 8000(막대 4칸)을 씁니다.");
             ui->text_disabled(("찜 " + std::to_string(settings.want.size()) + "명 · 독점 " + std::to_string(settings.keep.size()) +
                                "명. 찜한 선수는 '선수 치트 켜기'처럼 이 탭이 켜져 있을 때 바로 발굴됩니다.")
                                   .c_str());

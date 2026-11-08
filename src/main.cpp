@@ -32,6 +32,8 @@
 #include "urban/stadium_cheats.h"
 #include "urban/match_script.h"
 #include "urban/scout_cheats.h"
+#include "urban/cheat_status.h"
+#include "urban/lineup_lock.h"
 #include "urban/save_identity.h"
 #include "runtime/ps2_game_menu.h"
 
@@ -1492,10 +1494,16 @@ int main(int argc, char *argv[])
         urban::players::installCamp(runtime);
         // Ichinen-made skills past the game's 99 in matches (the 이치넨 tab's switch): a hook, so after attach.
         urban::ichinen::installHooks(runtime);
+        // The off-season retirement screen's judgements (the 스태프 치트 tab's switches): hooks, so after attach.
+        urban::staff::installHooks(runtime);
         // The 99 limit of abilities in matches (the 99 제한 tab): hooks and the pitch object's code variant, so after attach.
         urban::limits::install(runtime, runtime.memory().getRDRAM(), userDir);
         // Scouting: finds a day, the wish list found at once, CPU clubs kept off protected players (scout_cheats.ini).
         urban::scout::install(runtime, runtime.memory().getRDRAM(), userDir);
+        // 라인업 고정: the own team's saved lineup and rotation written as a match is set up (a hook, so after attach).
+        urban::lineup::install(runtime, runtime.memory().getRDRAM());
+        // The menu's status line: this save, and "적용됨" at the right whenever a tab saved its settings.
+        urban::status::install(userDir);
         ps2xRegisterGeneratedExtraFunctions(runtime); // code cheats write outside the game code (tools/cheat_code.py)
         urban::hangdump::setRuntime(&runtime);
         urban::hangdump::installCrashReport();

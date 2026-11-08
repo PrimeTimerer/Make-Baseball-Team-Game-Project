@@ -127,10 +127,13 @@ namespace urban::players
         // so 90-127 show S+ (11-07's "255 shown D" was an experience of 65535). 球速 stops at 99: the pitch object and the
         // km/h table end there (writeStat).
         constexpr int kValueMax = 127;
-        // The value a rank pick (or a fill) gives a stat: the rank's top, 球速 at most 99 (162 km/h, the game's last).
+        // The value a rank pick (or a fill) gives a stat: the rank's top, every stat alike (owner 11-08: "99로 되든 말든 127로
+        // 모든 스탯을"). 球速 127 is safe: the pitch object (sub_002B0748, 0x2B09D4) cuts 球速 to 99 before the km/h table
+        // (sub_002B1660 reads 100 up as 0) and the 99 제한 variant leaves that cut; 体力 plays at 99 in matches too.
         int statTop(int stat, int value)
         {
-            return std::min(value, stat == sSpeedP ? 99 : kValueMax);
+            (void)stat;
+            return std::min(value, kValueMax);
         }
 
         int gradeOf(int value)
@@ -140,7 +143,10 @@ namespace urban::players
                     return g;
             return kGradeCount - 1;
         }
-        // An ability as an edit sets it: -1 leaves a field as it is; limit -2 raises the limit to the value when lower.
+        // An ability as an edit sets it: -1 leaves a field as it is; limit -2 raises the limit to the value when lower, -3
+        // raises it to the top (127, every stat) when lower (owner 11-08: "상한과 득의도도 맥시멈"; a higher one, e.g. 255 from
+        // an S+ code, stays).
+        constexpr int kLimitToTop = -3;
         struct StatEdit
         {
             int value = -1, limit = -1, apt = -1;
@@ -293,8 +299,13 @@ namespace urban::players
             int pitch = 0; // > 0: the pitch kind to add, with value / limit / aptitude
             int value = 50, limit = 99, apt = 2;
             int bats = -1; // >= 0: the batting side to set
-            int age = 0;
+            int age = 0;   // frames waited for the player to be found
+            int setAge = -1; // >= 0: the player's age to write (record +0x18, own and CPU records alike)
         };
+        // Age (owner 11-08, from the 5ch 改造コード thread 6回裏 #121/#266: the game's code stores it with sb a1,0x18(s1);
+        // "他球団選手45歳" makes a player retire, a low age keeps him playing for decades (#432)). One write: the game
+        // counts it on from there each year.
+        constexpr int kAgeMax = 60;
         std::vector<Practice> g_practices;
         constexpr uint32_t kBats = 0x39u;
         constexpr uint32_t kExpTable = 0x5D1320u; // u16 experience per ability value 0-100 (the game's data)
@@ -559,7 +570,7 @@ namespace urban::players
             if (std::getline(fields, field, ','))
                 edit.value = std::clamp(std::atoi(trim(field).c_str()), -1, kValueMax);
             if (std::getline(fields, field, ','))
-                edit.limit = std::clamp(std::atoi(trim(field).c_str()), -2, kValueMax);
+                edit.limit = std::clamp(std::atoi(trim(field).c_str()), kLimitToTop, kValueMax);
             if (std::getline(fields, field, ','))
                 edit.apt = std::clamp(std::atoi(trim(field).c_str()), -1, 4);
             return edit;
@@ -1076,7 +1087,8 @@ namespace urban::players
         // more once gave a 3 in matches). Above 99 the value byte itself counts only with the 99 제한 tab's switch.
         void writeStat(uint32_t entry, const StatEdit &edit, int stat)
         {
-            const int top = stat == sSpeedP ? 99 : kValueMax; // 球速 99 = 162 km/h, the end of the game's table
+            (void)stat;
+            const int top = kValueMax; // 球速 too (the game's pitch object cuts it to 99 = 162 km/h, see statTop)
             if (edit.apt >= 0)
                 g_rdram[entry + 1u] = static_cast<uint8_t>(std::min(edit.apt, 4));
             if (edit.value >= 0)
@@ -1088,6 +1100,8 @@ namespace urban::players
             }
             if (edit.limit >= 0)
                 g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.limit, top));
+            else if (edit.limit == kLimitToTop && g_rdram[entry + 3u] < top)
+                g_rdram[entry + 3u] = static_cast<uint8_t>(top);
             else if (edit.limit == -2 && edit.value >= 0 && g_rdram[entry + 3u] < std::min(edit.value, top))
                 g_rdram[entry + 3u] = static_cast<uint8_t>(std::min(edit.value, top));
         }
@@ -1731,6 +1745,18 @@ namespace urban::players
                         row.team = t;
                         row.number = g_rdram[record + kNumber];
                         row.age = g_rdram[record + kAge];
+                        // URBAN_TEST_AGE_LOG=1: the own players' ages whenever they change (tests of the age cheats).
+                        static const bool ageLog = std::getenv("URBAN_TEST_AGE_LOG") != nullptr;
+                        if (ageLog && own)
+                        {
+                            static std::map<uint16_t, int> ages;
+                            const auto seen = ages.find(id);
+                            if (seen == ages.end() || seen->second != row.age)
+                            {
+                                std::fprintf(stderr, "[players] age %u %d -> %d\n", id, seen == ages.end() ? -1 : seen->second, row.age);
+                                ages[id] = row.age;
+                            }
+                        }
                         row.pitcher = g_rdram[record + kPitcher] != 0u;
                         row.name = nameOf(record);
                         row.skills = readSkills(record);
@@ -1827,13 +1853,13 @@ namespace urban::players
                     std::string item;
                     while (std::getline(items, item, ';'))
                     {
-                        int f[6] = {0, 0, 50, 99, 2, -1};
+                        int f[7] = {0, 0, 50, 99, 2, -1, -1}; // id, pitch, value, limit, aptitude, bats, age
                         std::istringstream fields(item);
                         std::string field;
-                        for (int k = 0; k < 6 && std::getline(fields, field, ','); ++k)
+                        for (int k = 0; k < 7 && std::getline(fields, field, ','); ++k)
                             f[k] = std::atoi(field.c_str());
                         if (f[0] > 0)
-                            g_practices.push_back(Practice{static_cast<uint16_t>(f[0]), f[1], f[2], f[3], f[4], f[5], 0});
+                            g_practices.push_back(Practice{static_cast<uint16_t>(f[0]), f[1], f[2], f[3], f[4], f[5], 0, f[6]});
                     }
                 }
             }
@@ -1873,10 +1899,12 @@ namespace urban::players
                         if (stat < 0)
                             continue;
                         StatEdit edit;
-                        edit.value = std::clamp(std::atoi(value.c_str()), 0, kValueMax);
+                        edit.value = trim(value) == "-" ? -1 : std::clamp(std::atoi(value.c_str()), 0, kValueMax); // "-": as it is
                         edit.limit = -2;
                         if (std::string aptitude; std::getline(fields, aptitude, ','))
-                            edit.apt = std::clamp(std::atoi(aptitude.c_str()), 0, 4);
+                            edit.apt = trim(aptitude) == "-" ? -1 : std::clamp(std::atoi(aptitude.c_str()), 0, 4);
+                        if (std::string limit; std::getline(fields, limit, ',')) // a 5th field: the limit, "max" = to the top
+                            edit.limit = trim(limit) == "max" ? kLimitToTop : std::clamp(std::atoi(limit.c_str()), 0, kValueMax);
                         g_oneShots.push_back(OneShot{static_cast<uint16_t>(std::atoi(id.c_str())), stat, edit, 0});
                     }
                 }
@@ -1956,6 +1984,12 @@ namespace urban::players
                 {
                     g_rdram[record + kBats] = static_cast<uint8_t>((g_rdram[record + kBats] & ~3u) | static_cast<unsigned>(it->bats));
                     g_log.add("타석: " + name + " → " + kBatsNames[g_rdram[record + kBats] & 3u] + " — 메모리에서 다시 읽은 값", "players");
+                }
+                if (it->setAge >= 0 && it->setAge <= kAgeMax)
+                {
+                    const int was = g_rdram[record + kAge];
+                    g_rdram[record + kAge] = static_cast<uint8_t>(it->setAge);
+                    g_log.add("나이: " + name + " " + std::to_string(was) + "세 → " + std::to_string(g_rdram[record + kAge]) + "세 — 메모리에서 다시 읽은 값", "players");
                 }
                 it = g_practices.erase(it);
             }
@@ -2207,7 +2241,9 @@ namespace urban::players
         struct Draft
         {
             int value = 0, limit = 0, apt = 0;
-            bool use = false; // bulk and group rows: part of the next action
+            bool use = false;       // bulk and group rows: part of the next action
+            bool keepValue = false; // bulk rows: leave each player's value (a quick fill of the limit or aptitude only)
+            bool limitMax = false;  // bulk rows: raise each player's limit to the top (kLimitToTop)
         };
         uint16_t g_focus = 0u;              // the player on the card
         std::set<uint16_t> g_picked;        // the ticked players
@@ -2221,6 +2257,7 @@ namespace urban::players
         int g_onlyEdited = 0, g_onlyPicked = 0;
         int g_lastClick = -1; // the row last clicked, in the shown order (shift-click ranges)
         int g_fillGrade = 0;  // the quick fill's rank
+        int g_fillValue = 1, g_fillLimit = 0, g_fillApt = 0; // what the quick fill's buttons fill: value, limit to the top, aptitude S
         constexpr const char *kPositions[7] = {"투", "포", "1루", "2루", "3루", "유", "외"};
         // IM_COL32 order (R in the low byte): S+ gold, S orange, A+/A red, B+/B yellow, C+/C green, D+ blue, D grey.
         constexpr uint32_t kGradeColors[kGradeCount] = {0xFF2CD7FFu, 0xFF28AAFFu, 0xFF5A5AFFu, 0xFF7882FFu, 0xFF50BEFFu,
@@ -2232,7 +2269,9 @@ namespace urban::players
         std::string valueText(int stat, int value)
         {
             char text[32];
-            if (stat == sSpeedP)
+            if (stat == sSpeedP && value > 99)
+                std::snprintf(text, sizeof(text), "%dkm %s %d", kmOf(value), kGrades[gradeOf(value)], value); // plays as 99
+            else if (stat == sSpeedP)
                 std::snprintf(text, sizeof(text), "%dkm %s", kmOf(value), kGrades[gradeOf(value)]);
             else
                 std::snprintf(text, sizeof(text), "%s %d", kGrades[gradeOf(value)], value);
@@ -2244,6 +2283,8 @@ namespace urban::players
             std::string text = edit.value >= 0 ? valueText(-1, edit.value) : std::string("값 그대로");
             if (edit.limit >= 0)
                 text += " 상한 " + std::to_string(edit.limit);
+            else if (edit.limit == kLimitToTop)
+                text += " 상한 최대";
             if (edit.apt >= 0)
                 text += std::string(" 득의 ") + kAptitudes[edit.apt];
             return text;
@@ -2294,12 +2335,18 @@ namespace urban::players
             edit.value = std::clamp(draft.value, 0, kValueMax);
             if (row)
             {
+                // An unchanged value stays as it is (a limit or aptitude change alone must not rewrite it: a 198/255 from an
+                // S+ code would come down to 127, and the experience to the value's table entry).
+                if (draft.value == row->value(stat))
+                    edit.value = -1;
                 edit.limit = draft.limit != row->value(stat, 3) ? std::clamp(draft.limit, 0, kValueMax) : -2;
                 edit.apt = draft.apt != std::min(row->value(stat, 1), 4) ? std::clamp(draft.apt, 0, 4) : -1;
             }
             else
             {
-                edit.limit = -2;
+                if (draft.keepValue)
+                    edit.value = -1;
+                edit.limit = draft.limitMax ? kLimitToTop : -2;
                 edit.apt = draft.apt >= 0 && draft.apt <= 4 ? draft.apt : -1;
             }
             return edit;
@@ -2586,21 +2633,57 @@ namespace urban::players
             {
                 if ((group >= 0 && kStats[stat].group != group) || (group < 0 && kStats[stat].group == kPitches) || !shownStat(row, stat))
                     continue;
+                // What the quick fill's ticks ask: the rank's value, the limit to the top (127; a higher one
+                // stays), aptitude S (4).
                 if (row)
-                    cardDraft(stat, *row, lockOf(settings, id, stat)).value = statTop(stat, value);
+                {
+                    Draft &draft = cardDraft(stat, *row, lockOf(settings, id, stat));
+                    if (g_fillValue)
+                        draft.value = statTop(stat, value);
+                    if (g_fillLimit)
+                        draft.limit = std::max(draft.limit, statTop(stat, kValueMax));
+                    if (g_fillApt)
+                        draft.apt = 4;
+                }
                 else
                 {
                     auto it = g_drafts.find(stat);
-                    if (it == g_drafts.end())
+                    const bool fresh = it == g_drafts.end();
+                    if (fresh)
                     {
                         Draft draft;
                         draft.apt = -1; // as each player has it
                         it = g_drafts.emplace(stat, draft).first;
                     }
-                    it->second.value = statTop(stat, value);
-                    it->second.use = true;
+                    Draft &draft = it->second;
+                    if (g_fillValue)
+                    {
+                        draft.value = statTop(stat, value);
+                        draft.keepValue = false;
+                    }
+                    else if (fresh || !draft.use)
+                        draft.keepValue = true; // only the limit or aptitude: each player's value stays
+                    if (g_fillLimit)
+                        draft.limitMax = true;
+                    if (g_fillApt)
+                        draft.apt = 4;
+                    draft.use = true;
                 }
             }
+        }
+
+        // The quick fill's ticks (card and bulk): what its buttons fill.
+        void drawFillTicks(const Pcsx2GsUi *ui)
+        {
+            ui->text("채울 것:");
+            ui->same_line();
+            ui->checkbox("값 (위 등급)##fillvalue", &g_fillValue);
+            ui->same_line();
+            ui->checkbox("상한 최대##filllimit", &g_fillLimit);
+            ui->tooltip("상한을 127까지(구속 포함, 경기에서 구속은 99로 계산) 올립니다. 이미 더 높으면(S+ 코드의 255 등) 그대로 둡니다.");
+            ui->same_line();
+            ui->checkbox("득의도 S##fillapt", &g_fillApt);
+            ui->tooltip("득의도를 S(최대)로. '값'을 끄면 상한·득의도만 채우고 값은 그대로 둡니다.");
         }
 
         // 특훈: the camp's special practice done at once for any number of players (a new pitch for pitchers, the batting
@@ -2762,6 +2845,29 @@ namespace urban::players
             std::snprintf(head, sizeof(head), "%s · %s · %d세 · ID %u", kTeamNames[row.team], row.pitcher ? "투수" : kPositions[row.position],
                           row.age, row.id);
             ui->text_disabled(head);
+            {
+                // Age: one write, any club's player (5ch 改造コード 6回裏 #121/#266/#432).
+                static uint16_t ageFor = 0u;
+                static int ageDraft = 0;
+                if (ageFor != row.id)
+                {
+                    ageFor = row.id;
+                    ageDraft = row.age;
+                }
+                ui->text("나이");
+                ui->same_line();
+                ui->set_next_width(90.0f);
+                if (ui->input_int("##age", &ageDraft, 1))
+                    ageDraft = std::clamp(ageDraft, 0, kAgeMax);
+                ui->same_line();
+                if (ui->small_button("나이 적용"))
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_practices.push_back(Practice{row.id, 0, 0, 0, 0, -1, 0, ageDraft});
+                }
+                ui->tooltip("선수 기록 +0x18 (자기 구단·다른 구단 모두). 한 번 쓰면 그 뒤로는 게임이 해마다 올립니다. "
+                            "5ch 改造コード 스레의 쓰임새: 45세로 하면 은퇴 희망을 내고, 낮추면 오래 뜁니다. 결과는 '최근 변화'에 남습니다.");
+            }
             const int locks = lockCount(settings, row.id);
             std::string state = !settings.enabled ? "선수 치트 꺼짐: 켜야 고정·S+ 항목이 써집니다 ('적용'은 바로 씀)"
                                 : pin != settings.pins.end() ? (pin->second.on ? "S+ 항목·스킬: 이 선수만 따로 (" + std::to_string(std::popcount(items)) + "항목)"
@@ -2814,6 +2920,7 @@ namespace urban::players
                 }
                 ui->same_line();
                 ui->text_disabled("(새 값 칸에 넣기만 함)");
+                drawFillTicks(ui);
                 int dirty = 0;
                 for (int stat = 0; stat < kStatCount; ++stat)
                     if (const auto it = g_drafts.find(stat); it != g_drafts.end() && shownStat(&row, stat) && draftChanged(it->second, row, stat))
@@ -2912,6 +3019,7 @@ namespace urban::players
                 if (ui->small_button("체크 모두 해제"))
                     for (auto &[stat, draft] : g_drafts)
                         draft.use = false;
+                drawFillTicks(ui);
                 int used = 0;
                 for (const auto &[stat, draft] : g_drafts)
                     used += draft.use ? 1 : 0;
@@ -2943,13 +3051,14 @@ namespace urban::players
                     changed = true;
                 }
                 ui->end_disabled();
-                ui->text_disabled("체크한 능력만 씁니다. 득의도 '그대로'는 선수마다 원래 값을 둡니다. 상한은 새 값보다 낮을 때만 올립니다.");
+                ui->text_disabled("체크한 능력만 씁니다. 득의도 '그대로'는 선수마다 원래 값을 둡니다. 상한은 새 값보다 낮을 때만 올리고, "
+                                  "'최대'면 127까지 올립니다(255처럼 더 높으면 그대로).");
                 static const char *const aptitudes[6] = {"그대로", "D", "C", "B", "A", "S"};
                 for (int group : {kPitching, kBatting, kFielding})
                 {
                     ui->separator_text(groupTitle(group));
                     ui->push_id(600 + group);
-                    if (ui->begin_table("bulkstats", 7, PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
+                    if (ui->begin_table("bulkstats", 8, PCSX2GS_TABLE_ROW_BG | PCSX2GS_TABLE_BORDERS, 0.0f, 0.0f))
                     {
                         ui->table_column("쓰기", 0, 36.0f);
                         ui->table_column("능력", 0, 86.0f);
@@ -2957,6 +3066,7 @@ namespace urban::players
                         ui->table_column("새 값", 0, 60.0f);
                         ui->table_column("등급", 0, 62.0f);
                         ui->table_column("득의도", 0, 70.0f);
+                        ui->table_column("상한", 0, 50.0f);
                         ui->table_column("고정 중", 0, 0.0f);
                         ui->table_headers();
                         for (int stat = 0; stat < kStatCount; ++stat)
@@ -2998,11 +3108,19 @@ namespace urban::players
                                 ui->text_colored(gradeColor(high), ("~ " + valueText(stat, high)).c_str());
                             }
                             ui->table_next_column();
-                            ui->set_next_width(56.0f);
-                            if (ui->input_int("##value", &draft.value, 0))
+                            if (draft.keepValue)
                             {
-                                draft.value = std::clamp(draft.value, 0, kValueMax);
-                                draft.use = true;
+                                ui->text_disabled("그대로");
+                                ui->tooltip("값은 선수마다 그대로 둡니다 (빠른 입력에서 '값'을 끄고 채움). 등급을 고르면 그 값을 씁니다.");
+                            }
+                            else
+                            {
+                                ui->set_next_width(56.0f);
+                                if (ui->input_int("##value", &draft.value, 0))
+                                {
+                                    draft.value = std::clamp(draft.value, 0, kValueMax);
+                                    draft.use = true;
+                                }
                             }
                             ui->table_next_column();
                             int rank = gradeOf(draft.value);
@@ -3010,6 +3128,7 @@ namespace urban::players
                             if (ui->combo("##rank", &rank, kGrades, kGradeCount))
                             {
                                 draft.value = statTop(stat, kGradeTop[rank]);
+                                draft.keepValue = false;
                                 draft.use = true;
                             }
                             ui->table_next_column();
@@ -3020,6 +3139,14 @@ namespace urban::players
                                 draft.apt = apt - 1;
                                 draft.use = true;
                             }
+                            ui->table_next_column();
+                            int top = draft.limitMax ? 1 : 0;
+                            if (ui->checkbox("최대##limitmax", &top))
+                            {
+                                draft.limitMax = top != 0;
+                                draft.use = true;
+                            }
+                            ui->tooltip("상한을 127까지(구속 포함) 올립니다. 이미 더 높으면(255 등) 그대로. 끄면 새 값보다 낮을 때만 새 값으로.");
                             ui->table_next_column();
                             if (locked > 0)
                                 ui->text_colored(kChangedText, (std::to_string(locked) + " / " + std::to_string(count) + "명").c_str());

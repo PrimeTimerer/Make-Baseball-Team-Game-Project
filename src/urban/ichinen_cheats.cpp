@@ -104,6 +104,11 @@ namespace urban::ichinen
             long long points = -1;
             bool lockPoints = false;
             bool rebuy = false; // every slot buyable again at every frame
+            // 능력 아이템 레벨 고정 (owner, 11-08: "상시로 내 마음대로"): every ability and pitch item of the catalog (types 0
+            // and 1) at ＋itemPlus while this and enabled are on, so the lineup the next opponent brings and a slot picked
+            // here sell at it too; a buy's byte add saturates at 255 meanwhile (kBuyAdd).
+            bool itemLevel = false;
+            int itemPlus = 255;
             bool noCap = true; // Ichinen-made skills add past the game's 99 in matches (default on since 11-08; nocap=0 keeps it off)
             // The editor's bonus caps, for skills made on top of ability cheats (the owner's design, 2026-11-08): 교타 +72 and
             // 변화구 +99 unless unlocked; the other bytes go to 255.
@@ -139,6 +144,7 @@ namespace urban::ichinen
             std::array<uint8_t, kConditions> conditionOwned{};
             std::vector<std::string> abilityJapanese, conditionJapanese;
             std::map<int32_t, std::string> players; // the catalog's players found on the rosters
+            bool listCheat = false; // the list draw holds "li a2, n": the ichinen 99 / +255 cheat files are on
         };
         struct Action
         {
@@ -199,6 +205,22 @@ namespace urban::ichinen
         View g_view;
         std::vector<Action> g_actions;
         std::map<int, std::string> g_abilityKorean, g_conditionKorean;
+        // The 능력 아이템 레벨 hold (frame, under g_mutex): the levels it found (catalog index -> level) for its OFF, the
+        // catalog they belong to and the level it writes.
+        uint32_t g_levelsCatalog = 0u;
+        std::map<uint32_t, int16_t> g_levelsBefore;
+        int16_t g_levelsWritten = 0;
+        bool g_levelsHeld = false;
+        int g_testLevel = 0; // URBAN_TEST_ICHINEN_LEVEL="<1-255>" (tests): the hold on at that ＋value, not saved
+        // A buy's add (sub_003A1E98 0x3A1F24): the game's addu wraps the ability byte at 256, paddub (unsigned bytes,
+        // saturating) stops it at 255. recomp/code_variants/ichinen_buy_saturate.pnach has that version compiled.
+        constexpr uint32_t kBuyAdd = 0x3A1F24u, kBuyAddGame = 0x00431021u, kBuyAddSaturate = 0x70431628u;
+        // The list draw (sub_003A0FD0 0x3A10A4-0x3A10AC): the ichinen 99 / +255 cheat files make it "li a2, n" + "sh a2,
+        // 0xA(v1)", which writes n into each drawn item and prints n. A quick state saved with them on brings those words
+        // back even with the files off. While the level hold is on, its frame hook (after the patches) puts the game's
+        // words back (lh a2, 0xA(v1) / addiu a2, a2, 1: prints ＋level+1, writes nothing).
+        constexpr uint32_t kListLevel = 0x3A10A4u, kListStore = 0x3A10ACu;
+        constexpr uint32_t kListLevelGame = 0x8466000Au, kListStoreGame = 0x24C60001u, kListStoreCheat = 0xA466000Au;
         std::atomic<bool> g_noCap{false};
         GuestFunction g_bonusOriginal = nullptr;
         bool g_bonusLog = false;                    // URBAN_ICHINEN_LOG=1: a line per bonus
@@ -344,6 +366,77 @@ namespace urban::ichinen
                 g_rdram[m + kSkillOwned + static_cast<uint32_t>(item.id)] = 0u;
             else if (item.type == 6u && item.id >= 0 && item.id < kConditions)
                 g_rdram[m + kConditionOwned + static_cast<uint32_t>(item.id)] = 0u;
+        }
+
+        // 능력 아이템 레벨: the catalog's ability and pitch items (types 0 and 1) at level (shown and bought as ＋level+1),
+        // and a buy's add saturating.
+        void holdLevels(uint32_t m, uint32_t count, int16_t level)
+        {
+            const uint32_t catalog = read32(m + kCatalog);
+            if (catalog != g_levelsCatalog)
+            {
+                g_levelsBefore.clear();
+                g_levelsCatalog = catalog;
+            }
+            int written = 0;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t entry = catalog + 16u * i;
+                if (read32(entry + 4u) > 1u)
+                    continue;
+                const int16_t now = static_cast<int16_t>(read16(entry + 0xAu));
+                if (now == level)
+                    continue;
+                g_levelsBefore.emplace(i, now); // the first level seen stays
+                write16(entry + 0xAu, static_cast<uint16_t>(level));
+                ++written;
+            }
+            if (written > 0 && (!g_levelsHeld || level != g_levelsWritten))
+                std::fprintf(stderr, "[ichinen] item levels: %d ability items -> +%d (catalog 0x%x)\n", written, level + 1, catalog);
+            g_levelsWritten = level;
+            g_levelsHeld = true;
+            if (read32(kBuyAdd) == kBuyAddGame)
+                write32(kBuyAdd, kBuyAddSaturate);
+            if ((read32(kListLevel) & 0xFFFF0000u) == 0x24060000u && read32(kListStore) == kListStoreCheat)
+            {
+                write32(kListLevel, kListLevelGame);
+                write32(kListStore, kListStoreGame);
+            }
+            // A line per bought ability (manager +0xCC[id], what a buy adds to) while the hold is on.
+            static uint32_t seenManager = 0u;
+            static std::array<uint8_t, kAbilities> seen{};
+            for (uint32_t id = 0; id < static_cast<uint32_t>(kAbilities); ++id)
+            {
+                const uint8_t now = g_rdram[m + 0xCCu + id];
+                if (seenManager == m && now != seen[id])
+                    std::fprintf(stderr, "[ichinen] bought: ability %u total %u -> %u\n", id, seen[id], now);
+                seen[id] = now;
+            }
+            seenManager = m;
+        }
+
+        // Its OFF: the game's add, and the levels it found where its own still stand. m = 0 (the shop is gone: a match, the
+        // mode left): the add only; the levels found wait for the shop (frame calls this again then if the hold is off).
+        void releaseLevels(uint32_t m)
+        {
+            g_levelsHeld = false;
+            if (read32(kBuyAdd) == kBuyAddSaturate)
+                write32(kBuyAdd, kBuyAddGame);
+            if (m == 0u)
+                return;
+            int restored = 0;
+            if (read32(m + kCatalog) == g_levelsCatalog)
+                for (const auto &[i, before] : g_levelsBefore)
+                {
+                    const uint32_t entry = g_levelsCatalog + 16u * i;
+                    if (static_cast<int16_t>(read16(entry + 0xAu)) == g_levelsWritten)
+                    {
+                        write16(entry + 0xAu, static_cast<uint16_t>(before));
+                        ++restored;
+                    }
+                }
+            std::fprintf(stderr, "[ichinen] item levels off: %d restored\n", restored);
+            g_levelsBefore.clear();
         }
 
         void setPoints(long long points)
@@ -886,6 +979,11 @@ namespace urban::ichinen
                 g_settingsPath = urban::saveid::settingsFile(g_profile, "ichinen_cheats.ini");
                 std::error_code error;
                 g_settings = !g_settingsPath.empty() && std::filesystem::exists(g_settingsPath, error) ? loadSettings(g_settingsPath) : Settings{};
+                if (g_testLevel > 0)
+                {
+                    g_settings.enabled = g_settings.itemLevel = true;
+                    g_settings.itemPlus = g_testLevel;
+                }
                 g_noCap.store(g_settings.noCap);
                 publishCaps(g_settings);
                 std::fprintf(stderr, "[ichinen] save %s: 노캡 %s, 최종값 상한 %s, 상시 작동 %s\n", g_profile.empty() ? "(none)" : g_profile.c_str(),
@@ -896,6 +994,8 @@ namespace urban::ichinen
             const uint32_t m = manager();
             if (m == 0u)
             {
+                if (g_levelsHeld)
+                    releaseLevels(0u);
                 g_actions.clear();
                 if (g_view.active)
                     g_view = View{};
@@ -932,6 +1032,10 @@ namespace urban::ichinen
                 if (g_settings.lockPoints && g_settings.points >= 0)
                     setPoints(g_settings.points);
             }
+            if (g_settings.enabled && g_settings.itemLevel)
+                holdLevels(m, count, static_cast<int16_t>(std::clamp(g_settings.itemPlus, 1, 255) - 1));
+            else if (g_levelsHeld || !g_levelsBefore.empty())
+                releaseLevels(m);
             if ((++tick % 15u) != 0u && !acted && g_view.active)
                 return;
             View view;
@@ -943,6 +1047,7 @@ namespace urban::ichinen
             for (uint32_t k = 0; k < slots; ++k)
                 view.lineup.push_back(static_cast<int32_t>(read32(m + kLineup + 4u * k)));
             view.boughtA = read32(m + kBoughtA);
+            view.listCheat = (read32(kListLevel) & 0xFFFF0000u) == 0x24060000u;
             std::memcpy(view.skillOwned.data(), g_rdram + m + kSkillOwned, view.skillOwned.size());
             std::memcpy(view.conditionOwned.data(), g_rdram + m + kConditionOwned, view.conditionOwned.size());
             const uint32_t abilities = read32(m + kAbilityNames), conditions = read32(m + kConditionNames);
@@ -1089,6 +1194,10 @@ namespace urban::ichinen
                     settings.lockPoints = value == "1";
                 else if (key == "rebuy")
                     settings.rebuy = value == "1";
+                else if (key == "itemlevel")
+                    settings.itemLevel = value == "1";
+                else if (key == "itemplus")
+                    settings.itemPlus = std::clamp(std::atoi(value.c_str()), 1, 255);
                 else if (key == "nocap")
                     settings.noCap = value == "1";
                 else if (key == "capcontact")
@@ -1154,6 +1263,8 @@ namespace urban::ichinen
                  << "points=" << settings.points << "\n"
                  << "lockpoints=" << (settings.lockPoints ? 1 : 0) << "\n"
                  << "rebuy=" << (settings.rebuy ? 1 : 0) << "\n"
+                 << "itemlevel=" << (settings.itemLevel ? 1 : 0) << "\n"
+                 << "itemplus=" << settings.itemPlus << "\n"
                  << "nocap=" << (settings.noCap ? 1 : 0) << "\n"
                  << "capcontact=" << (settings.capContact ? 1 : 0) << "\n"
                  << "contactcap=" << settings.contactCap << "\n"
@@ -2025,6 +2136,28 @@ namespace urban::ichinen
                 settings.rebuy = rebuyAll != 0;
                 changed = true;
             }
+            int levelHold = settings.itemLevel ? 1 : 0;
+            if (ui->checkbox("능력 아이템 레벨 고정", &levelHold))
+            {
+                settings.itemLevel = levelHold != 0;
+                changed = true;
+            }
+            ui->tooltip("상점 카탈로그의 능력·변화구 아이템을 모두 오른쪽 ＋값으로 둡니다(매 프레임). 상대가 바뀌어 새로 나온 목록도, "
+                        "아래에서 골라 넣은 슬롯도 이 값으로 팝니다. 산 값은 그 능력의 합에 더해지고, 켜 둔 동안은 255에서 멈춥니다"
+                        "(게임은 256에서 0으로 돎). 켜 둔 동안은 기능별 'ichinen 99'·'44 …+255'의 목록 레벨 쓰기 대신 이 값을 씁니다. "
+                        "끄면 원래 레벨로 돌립니다.");
+            ui->same_line();
+            ui->set_next_width(90.0f);
+            int plus = settings.itemPlus;
+            if (ui->input_int("＋값 (1~255)##itemplus", &plus, 1) && std::clamp(plus, 1, 255) != settings.itemPlus)
+            {
+                settings.itemPlus = std::clamp(plus, 1, 255);
+                changed = true;
+            }
+            if (settings.itemLevel && !settings.enabled)
+                ui->text_disabled("위 '이치넨 치트 켜기'가 꺼져 있어 레벨 고정을 쓰지 않습니다.");
+            else if (!settings.itemLevel && view.listCheat)
+                ui->text_disabled("지금은 기능별 'ichinen 99'·'44 …+255'(또는 그것을 켜고 만든 퀵 세이브)의 목록 레벨 쓰기가 돌고 있습니다.");
             std::vector<std::string> labels;
             for (size_t i = 0; i < view.catalog.size(); ++i)
                 labels.push_back(std::to_string(i) + "  " + itemLabel(view, view.catalog[i]));
@@ -2258,6 +2391,8 @@ namespace urban::ichinen
         publishCaps(g_settings);
         if (const char *log = std::getenv("URBAN_ICHINEN_LOG"))
             g_bonusLog = std::strcmp(log, "1") == 0;
+        if (const char *test = std::getenv("URBAN_TEST_ICHINEN_LEVEL"); test && *test)
+            g_testLevel = std::clamp(std::atoi(test), 1, 255);
         if (const char *test = std::getenv("URBAN_TEST_ICHINEN"); test && *test)
         {
             const std::string spec = test;

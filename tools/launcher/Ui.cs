@@ -52,10 +52,17 @@ namespace Yktk3Launcher
         {
             Launcher = launcher;
             Title = "YKTK3 PC 런처";
-            Width = 1180;
-            Height = 780;
-            MinWidth = 980;
-            MinHeight = 640;
+            // A screen smaller than the window gets it cut to its work area (the taskbar stays clear).
+            Rect work = SystemParameters.WorkArea;
+            Width = Math.Min(1180, work.Width);
+            Height = Math.Min(780, work.Height);
+            MinWidth = Math.Min(980, work.Width);
+            MinHeight = Math.Min(640, work.Height);
+            // Maximized, this borderless window covered the whole screen, the taskbar's strip too (measured 11-08 at
+            // 2560x1600 150%: bottom 1610 with the work area ending at 1528), so the toasts at the bottom went under the
+            // taskbar. The system's maximized size is the work area plus the resize border that root.Margin takes off.
+            MaxWidth = SystemParameters.MaximizedPrimaryScreenWidth;
+            MaxHeight = SystemParameters.MaximizedPrimaryScreenHeight;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             FontFamily = Ui.Res<FontFamily>("UiFont");
             Foreground = Ui.Brush("Text");
@@ -319,11 +326,12 @@ namespace Yktk3Launcher
             {
                 Background = new SolidColorBrush(Color.FromRgb(0x14, 0x1E, 0x33)), BorderBrush = Ui.Brush("Accent"), BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(12), Padding = new Thickness(16, 10, 16, 10), Margin = new Thickness(0, 8, 0, 0),
-                Child = new TextBlock { Text = text, Foreground = Ui.Brush("Text"), FontSize = 13 },
+                Child = new TextBlock { Text = text, Foreground = Ui.Brush("Text"), FontSize = 13, TextWrapping = TextWrapping.Wrap, MaxWidth = 640 },
                 Effect = new DropShadowEffect { Color = Color.FromRgb(0x22, 0xD3, 0xEE), BlurRadius = 18, ShadowDepth = 0, Opacity = 0.35 },
             };
             toasts.Children.Add(toast);
-            var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(500)) { BeginTime = TimeSpan.FromSeconds(2.6) };
+            // Long ones (a value's range, a label with its note) stay longer to be read.
+            var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(500)) { BeginTime = TimeSpan.FromSeconds(text.Length > 40 ? 5 : 2.6) };
             fade.Completed += delegate { toasts.Children.Remove(toast); };
             toast.BeginAnimation(OpacityProperty, fade);
         }
