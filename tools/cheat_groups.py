@@ -156,6 +156,30 @@ def lines_of(path):
 
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+# What the split "Club Status Cheats" pieces do (REA / capstone on the game code, 2026-11-08; the web had no description).
+# The list (목록.tsv) shows these names and notes; the label stays the file name and the .pnach text stays the same, so
+# [Mods] Enabled and the compiled cheats (cheats_native.txt hashes) keep matching.
+FOUND = {
+    "구단 상태 ① (0x15A098)": ("선수 전원 18세 고정 + 컨디션 최상·피로 0 (매주)",
+                              "매주 연습 루틴(0x15A098)에서 내 팀 선수 전원의 나이 18세, 컨디션 게이지 9999(경기 능력 1.0배), "
+                              "축적 피로 0 등 상태 값을 고정. 켜 두면 나이를 먹지 않음 (원래 이름 구단 상태 ①)"),
+    "구단 상태 ② (0x15AA78)": ("능력 성장 즉시 상한까지 (매주)",
+                              "매주 연습 경험치가 각 능력의 상한까지 한 번에 오름, 19개 능력 (원래 이름 구단 상태 ②)"),
+    "구단 상태 ③ (0x3C4278)": ("구단 기간 카운터 즉시 종료 (+0x156F)",
+                              "구단 [0x5CA114]+0x156F의 남은 기간을 바로 0으로, +0x156C는 255. 무엇의 기간인지 미확정 (원래 이름 구단 상태 ③)"),
+    "구단 상태 ④ (0x275518)": ("값 11개 100 고정 (의미 미확정)",
+                              "0x275518의 +0x34 배열 값 11개를 100으로. 의미 미확정 (원래 이름 구단 상태 ④)"),
+    "구단 상태 ⑤ (0x170048)": ("구단 평가 수치 999 고정 (매주)",
+                              "구단 +0x145A~+0x1460의 수치 4~5개(0~999, 인기·평가 계열로 추정)를 매주 999로 (원래 이름 구단 상태 ⑤)"),
+    "구단 상태 ⑥ (0x16FB78)": ("시스템 데이터 값 100 고정 (의미 미확정)",
+                              "매주 누적되는 0x193ED4A 값을 100으로. 의미 미확정 (원래 이름 구단 상태 ⑥)"),
+    "구단 상태 ⑦ (0x16A858)": ("선수 상태 검사 항상 통과 (출전 가능 추정)",
+                              "부상 기간, 나이 24세 미만 등의 조건 검사(0x16A880)를 항상 통과로. 출전 가능 여부 쪽으로 추정 (원래 이름 구단 상태 ⑦)"),
+    "구단 상태 ⑧ (0x12A650)": ("구단 대기 기간 즉시 종료 (+0x1033)",
+                              "구단 +0x1033의 대기 기간을 바로 0으로, 경영 쪽 진행 항목 16칸과 함께 처리됨. 이름은 추정 (원래 이름 구단 상태 ⑧)"),
+    "구단 상태 ⑩ (0x3A5F40)": ("목록 항목 선택 조건 통과 (의미 미확정)",
+                              "0x3A5F40의 목록 항목 '선택 가능' 조건을 강제로 통과. 의미 미확정 (원래 이름 구단 상태 ⑩)"),
+}
 # 資金最大 routine of the "Club Status Cheats": a jump at a function's return (0x104D68) to code written over .rodata
 # text at 0x68FFC8 that stores 99999990 at a fixed address (PCSX2's 0x866390/0x8664D0). That memory is allocated, so
 # here the address is other data (it broke 4 bytes of a save). Same hook, the game's money: [0x5CA114] + 0xE50 in
@@ -329,12 +353,13 @@ def split(mods, elf_path, functions_path, excel=None):
     groups = {}  # signature -> group
     whole = []   # files kept whole: (file, name)
 
-    def add_group(name, jp, header, lines, source, verbatim=None, note="", entry=None):
+    def add_group(name, jp, header, lines, source, verbatim=None, note="", entry=None, shown=None, shown_note=None):
         """A function: the same table entry from several files is one (their lines joined, a place once), else the
         same lines are one."""
         signature = ("entry", entry) if entry is not None else tuple(lines) if verbatim is None else tuple(verbatim)
         group = groups.setdefault(signature, {"name": name, "jp": jp, "header": header, "lines": [],
-                                              "verbatim": verbatim, "sources": [], "note": note})
+                                              "verbatim": verbatim, "sources": [], "note": note,
+                                              "shown": shown, "shown_note": shown_note})
         if verbatim is None:
             for address, value in lines:
                 if not any(a == address for a, _ in group["lines"]):
@@ -400,7 +425,8 @@ def split(mods, elf_path, functions_path, excel=None):
                         start = where if isinstance(where, int) else where[1]
                         label = f"{title} {CIRCLED[number] if number < len(CIRCLED) else number + 1} (0x{start:06X})"
                         note = "기능 이름 미확인: 원본 구획을 게임 함수별로 나눔"
-                    add_group(label, "", header, piece, source, note=note)
+                    shown, shown_note = FOUND.get(label, (None, None))
+                    add_group(label, "", header, piece, source, note=note, shown=shown, shown_note=shown_note)
 
     # Code table entries no cheat file has (off unless turned on)
     covered = {g["jp"] for g in groups.values() if g["jp"]}
@@ -452,8 +478,9 @@ def split(mods, elf_path, functions_path, excel=None):
                 for address, value in group["lines"]:
                     out.write(f"patch=1,EE,2{address:07X},word,{value:08X}\n")
         count = len(group["verbatim"]) if group["verbatim"] is not None else len(group["lines"])
-        note = f"{count}줄" + (", 필수 루틴 포함" if routine else "") + (f", {group['note']}" if group["note"] else "")
-        rows.append((f"{OUT_DIR}/{file_name}", category, group["name"], group["jp"], "; ".join(group["sources"]), note))
+        listed = group.get("shown_note") or group["note"]
+        note = f"{count}줄" + (", 필수 루틴 포함" if routine else "") + (f", {listed}" if listed else "")
+        rows.append((f"{OUT_DIR}/{file_name}", category, group.get("shown") or group["name"], group["jp"], "; ".join(group["sources"]), note))
     for file_name, title in whole:
         rows.append((file_name, category_of(title), title, "", file_name, "파일 통째 (조건·포인터 코드)"))
     with open(os.path.join(out_dir, "목록.tsv"), "w", encoding="utf-8", newline="\n") as out:
