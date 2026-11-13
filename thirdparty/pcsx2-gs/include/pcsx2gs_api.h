@@ -32,6 +32,7 @@ typedef struct Pcsx2GsOpenParams
     //   blending=0..5 (minimum ... maximum),
     //   texture_dir=<folder holding replacements/> (HD textures, PCSX2's names and formats: PNG, DDS),
     //   texture_precache=0/1 (load all of them at start instead of as the game uses them)
+    //   texture_dump=0/1 (with texture_dir: PNGs of the textures the game uses, in <texture_dir>/dumps)
     const char *options;
 } Pcsx2GsOpenParams;
 

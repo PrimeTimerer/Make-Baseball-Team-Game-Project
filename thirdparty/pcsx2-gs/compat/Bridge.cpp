@@ -105,6 +105,8 @@ namespace
                 options.Dithering = clampU8(value, 0, 3);
             else if (key == "texture_precache")
                 options.PrecacheTextureReplacements = value != 0;
+            else if (key == "texture_dump")
+                options.DumpReplaceableTextures = value != 0; // PNGs of the textures the game uses, in <texture_dir>/dumps
             else if (key == "blending")
                 options.AccurateBlendingUnit = static_cast<AccBlendLevel>(std::clamp(value, 0, 5));
         }

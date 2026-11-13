@@ -2,6 +2,7 @@
 
 #include "urban/function_hooks.h"
 #include "urban/skill_table.h"
+#include "urban/korean.h"
 #include "urban/save_identity.h"
 
 #include "runtime/ps2_game_menu.h"
@@ -321,7 +322,7 @@ namespace urban::ichinen
         {
             if (!valid(pointer & ~3u, 4u) || pointer >= kRamSize - limit)
                 return std::string();
-            const char *text = reinterpret_cast<const char *>(g_rdram + pointer);
+            const char *text = urban::korean::japanese(reinterpret_cast<const char *>(g_rdram + pointer));
             return fromSjis(text, strnlen(text, limit));
         }
 

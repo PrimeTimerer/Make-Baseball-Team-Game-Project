@@ -1,4 +1,5 @@
 #include "runtime/ps2_async_vif.h"
+#include "runtime/ps2_cd_image.h"
 #include "runtime/ps2_pnach.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_save_state.h"
@@ -15,6 +16,7 @@
 #include "urban/function_hooks.h"
 #include "urban/game_disc.h"
 #include "urban/hang_dump.h"
+#include "urban/korean.h"
 #include "urban/native_profile.h"
 #include "urban/opening.h"
 #include "urban/thread_policy.h"
@@ -1242,6 +1244,40 @@ int main(int argc, char *argv[])
         setDefaultEnv("PS2X_DATA_DIR", userDir.string()); // the PCSX2 GS's shader cache and HD textures (gs_pcsx2_backend.cpp)
     loadControlsFile(userDir); // controls.ini, PCSX2 format (converted from the controls.ini/controles.ini of older versions)
     loadConfigFile(userDir / "config.ini");
+    // Korean translation: files in <user folder>\korean\DATA.CVM\... replace the disc's files inside DATA.CVM (fonts,
+    // message tables). Nothing changes without that folder; PS2X_DISC_OVERLAY=<folder> uses another one, =0 none.
+    std::filesystem::path koreanFolder; // also holds RAM_PATCH.TXT (urban::korean, installed with the other modules)
+    if (const char *overlay = std::getenv("PS2X_DISC_OVERLAY"); !overlay || !*overlay)
+    {
+        std::error_code error;
+        if (std::filesystem::is_directory(userDir / "korean" / "DATA.CVM", error))
+        {
+            koreanFolder = userDir / "korean";
+            PS2CdImage::setOverlayDirectory(koreanFolder);
+        }
+    }
+    else if (std::string(overlay) != "0")
+        koreanFolder = overlay;
+    // Its Korean textures (PCSX2 texture replacement PNGs in <korean>\textures\replacements), unless another texture
+    // folder is set (PS2X_PCSX2_TEXTURE_DIR, read when the PCSX2 renderer opens).
+    if (const char *textures = std::getenv("PS2X_PCSX2_TEXTURE_DIR"); !koreanFolder.empty() && (!textures || !*textures))
+    {
+        std::error_code error;
+        if (std::filesystem::is_directory(koreanFolder / "textures" / "replacements", error))
+        {
+            // loaded at start (a few small PNGs), so a screen never shows its Japanese texture first
+            const char *precache = std::getenv("PS2X_PCSX2_TEXTURE_PRECACHE");
+#if defined(_WIN32)
+            _wputenv_s(L"PS2X_PCSX2_TEXTURE_DIR", (koreanFolder / "textures").wstring().c_str());
+            if (!precache || !*precache)
+                _wputenv_s(L"PS2X_PCSX2_TEXTURE_PRECACHE", L"1");
+#else
+            setenv("PS2X_PCSX2_TEXTURE_DIR", (koreanFolder / "textures").string().c_str(), 1);
+            if (!precache || !*precache)
+                setenv("PS2X_PCSX2_TEXTURE_PRECACHE", "1", 1);
+#endif
+        }
+    }
     // --write-settings: only write (or complete/convert) controls.ini and config.ini with their comments and defaults,
     // then exit. The launcher runs it before editing them for the first time.
     for (int i = 1; i < argc; ++i)
@@ -1449,6 +1485,9 @@ int main(int argc, char *argv[])
             urban::ichinen::install(runtime.memory().getRDRAM(), userDir);
             // The stadium (level, turf, seats), its facilities by square and the practice facilities, from the club object.
             urban::stadium::install(runtime.memory().getRDRAM());
+            // Korean translation: the executable's name tables (korean\RAM_PATCH.TXT), next to the disc overlay.
+            if (!koreanFolder.empty())
+                urban::korean::install(runtime.memory().getRDRAM(), koreanFolder);
             // The performance log: logs/perf-<time>.txt, a line a second (PS2X_PERF_LOG=0: off).
             urban::perflog::install(runtime.memory().getRDRAM(), userDir);
             // F1: the key list, in Korean (PCSX2's GS draws it with the Korean and Japanese fonts).

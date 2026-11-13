@@ -351,6 +351,23 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
     }
 
     const std::filesystem::path hostPath{std::string(path)};
+    // The IOP CD driver opens the disc image itself: read it through PS2CdImage so the disc overlay applies there too.
+    if (const std::filesystem::path &image = PS2Runtime::getIoPaths().cdImage;
+        !image.empty() && hostPath == image && PS2CdImage::instance().ensureOpenFromIoPaths())
+    {
+        HostFile file;
+        file.cdImage = true;
+        file.cdImageOffset = 0u;
+        file.size = std::numeric_limits<uint64_t>::max() / 4u;
+        std::lock_guard<std::mutex> lock(m_hostFileMutex);
+        uint64_t handle = m_nextHostFileHandle++;
+        if (handle == 0u)
+        {
+            handle = m_nextHostFileHandle++;
+        }
+        m_hostFiles.emplace(handle, file);
+        return handle;
+    }
 #if defined(_WIN32)
     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
 #else

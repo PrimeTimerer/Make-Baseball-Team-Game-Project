@@ -3,6 +3,10 @@
 !/game/README.md
 /textures/*
 !/textures/README.md
+# The game's own Japanese text, extracted from the player's disc by tools/korean/extract.py and exe_extract.py (game
+# data); the Korean translations and the tools are tracked.
+/tools/korean/source/
+/tools/korean/exe/source.json
 # Build output, recompiled game code, benchmark savestates and runs (game data: never in the repository).
 /build/
 /generated/

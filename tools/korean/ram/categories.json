@@ -1,0 +1,7 @@
+{
+"note": "Hometown contribution categories: string literals of the executable at 0x67a160, 8 bytes apart, returned by the switch at 0x16d2c0 (0 none, 1-5). The game inserts them into messages (plan results: 'many people took an interest in {category}').",
+"base": "0x67a160",
+"stride": 8,
+"ja": ["なし", "環境", "経済", "生活", "交通", "スポーツ"],
+"ko": ["없음", "환경", "경제", "생활", "교통", "스포츠"]
+}

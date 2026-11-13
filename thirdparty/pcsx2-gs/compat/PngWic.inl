@@ -86,9 +86,46 @@ bool PNGLoader(GSTextureReplacements::File& file, const char* filename, GSTextur
     return true;
 }
 
-// Texture dumping is not used by the port.
+// Texture dumping (texture_dump=1): 32-bit RGBA rows as the GS reads them (A = 0x80 is opaque), written as a PNG with
+// alpha, so an edited copy loads back through PNGLoader above the same way.
 bool GSTextureReplacements::SavePNGImage(const std::string& filename, u32 width, u32 height, const u8* buffer, u32 pitch)
 {
-    return false;
+    IWICImagingFactory *factory = WicFactory();
+    if (!factory || width == 0 || height == 0)
+        return false;
+    std::vector<u8> bgra(static_cast<size_t>(width) * height * 4);
+    for (u32 y = 0; y < height; ++y)
+    {
+        const u8 *src = buffer + static_cast<size_t>(y) * pitch;
+        u8 *dst = bgra.data() + static_cast<size_t>(y) * width * 4;
+        for (u32 x = 0; x < width; ++x, src += 4, dst += 4)
+        {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+        }
+    }
+    const int chars = MultiByteToWideChar(CP_UTF8, 0, filename.c_str(), -1, nullptr, 0);
+    if (chars <= 0)
+        return false;
+    std::wstring wide(static_cast<size_t>(chars), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, 0, filename.c_str(), -1, wide.data(), chars))
+        return false;
+
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    return SUCCEEDED(factory->CreateStream(stream.GetAddressOf())) &&
+           SUCCEEDED(stream->InitializeFromFilename(wide.c_str(), GENERIC_WRITE)) &&
+           SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf())) &&
+           SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+           SUCCEEDED(encoder->CreateNewFrame(frame.GetAddressOf(), nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+           SUCCEEDED(frame->SetSize(width, height)) && SUCCEEDED(frame->SetPixelFormat(&format)) &&
+           IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA) &&
+           SUCCEEDED(frame->WritePixels(height, width * 4, static_cast<UINT>(bgra.size()), bgra.data())) &&
+           SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
 }
 

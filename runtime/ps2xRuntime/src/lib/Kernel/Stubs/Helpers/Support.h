@@ -460,6 +460,27 @@ namespace
         }
 
         const std::filesystem::path cdImage = getCdImagePath();
+        // Through PS2CdImage when it has the image open, so the disc overlay (replaced files) applies to sector reads too.
+        if (PS2CdImage &image = PS2CdImage::instance(); !cdImage.empty() && image.ensureOpenFromIoPaths())
+        {
+            const uint64_t offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
+            const uint64_t end = offset + static_cast<uint64_t>(sectors) * kCdSectorSize;
+            if (end > (image.readableSize() + kCdSectorSize - 1) / kCdSectorSize * kCdSectorSize)
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+            std::memset(dst, 0, byteCount);
+            const uint64_t available = image.readableSize() > offset ? image.readableSize() - offset : 0u;
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(byteCount, available));
+            if (count != 0u && !image.read(offset, dst, count))
+            {
+                g_lastCdError = -1;
+                return false;
+            }
+            g_lastCdError = 0;
+            return true;
+        }
         if (!cdImage.empty())
         {
             uint64_t totalSectors = 0;

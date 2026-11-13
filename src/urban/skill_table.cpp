@@ -1,4 +1,5 @@
 #include "urban/skill_table.h"
+#include "urban/korean.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -80,7 +81,7 @@ namespace urban::skills
             std::memcpy(&pointer, rdram + table + 4u * index, sizeof(pointer));
             if (pointer < 0x100000u || pointer >= kRamSize - 64u)
                 return std::string(); // not loaded yet
-            const char *text = reinterpret_cast<const char *>(rdram + pointer);
+            const char *text = urban::korean::japanese(reinterpret_cast<const char *>(rdram + pointer));
             std::string name = utf8FromSjis(text, strnlen(text, 48));
             if (!name.empty())
             {

@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_pnach.h"
+#include "urban/korean.h"
 #include "urban/mods.h"
 
 #if __has_include("pcsx2gs_api.h")
@@ -367,7 +368,7 @@ namespace urban::cheatmenu
                 std::memcpy(&pointer, g_rdram + 0x5CD520u + 4u * i, sizeof(pointer));
                 if (pointer < 0x100000u || pointer >= 0x2000000u - 64u)
                     return names; // not loaded yet
-                const char *text = reinterpret_cast<const char *>(g_rdram + pointer);
+                const char *text = urban::korean::japanese(reinterpret_cast<const char *>(g_rdram + pointer));
 #if defined(_WIN32)
                 const std::string japanese = convert(std::string(text, strnlen(text, 48)), 932, CP_UTF8);
 #else
@@ -421,8 +422,13 @@ namespace urban::cheatmenu
             for (uint32_t i = 0; i < count; ++i)
             {
                 const char *text = reinterpret_cast<const char *>(g_rdram + table + 0x10u + i * 0x88u);
+                // With the Korean translation on, the table may already hold Korean names (as kanji codes): the launcher
+                // list keeps the game's Japanese names.
+                std::string sjis = urban::korean::original(table + 0x10u + i * 0x88u);
+                if (sjis.empty())
+                    sjis.assign(text, strnlen(text, 0x28));
 #if defined(_WIN32)
-                const std::string name = convert(std::string(text, strnlen(text, 0x28)), 932, CP_UTF8);
+                const std::string name = convert(sjis, 932, CP_UTF8);
 #else
                 const std::string name = std::to_string(i);
 #endif

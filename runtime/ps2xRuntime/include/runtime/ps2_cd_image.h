@@ -32,13 +32,18 @@ public:
     bool read(uint64_t offset, void *destination, size_t size) const;
     bool readSectors(uint32_t lba, uint32_t count, void *destination) const;
     uint64_t sizeBytes() const;
+    uint64_t readableSize() const; // sizeBytes() plus the overlay's appended files
     std::filesystem::path path() const;
 
     static std::string normalizeKey(std::string_view ps2Path);
 
+    // Files under <directory>/DATA.CVM/<path> replace files inside DATA.CVM (also PS2X_DISC_OVERLAY=<directory>).
+    static void setOverlayDirectory(const std::filesystem::path &directory);
+
 private:
     PS2CdImage() = default;
     bool parseDirectory(uint32_t lba, uint32_t size, const std::string &prefix, int depth);
+    void applyOverlayUnlocked();
     bool readUnlocked(uint64_t offset, void *destination, size_t size) const;
 
     mutable std::mutex m_mutex;

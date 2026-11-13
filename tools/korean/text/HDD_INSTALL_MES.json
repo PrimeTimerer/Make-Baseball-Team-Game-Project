@@ -1,0 +1,13 @@
+{
+"0": "{0100fd}{0102fe}이 애플리케이션은 \"PlayStation BB Unit\"에{010a}애플리케이션 데이터를 설치할 수 있습니다.{010a}설치를 시작하시겠습니까?",
+"1": "{0100fd}{0102fe}\"PlayStation BB Unit\"이 \"PlayStation 2\" 본체에{010a}올바르게 연결되어 있지 않습니다.{010a}연결을 확인해 주세요.{01ffff}또한 애플리케이션 데이터를 설치하려면{010a}{0101ff}1,024MB 이상{01feff}의 여유 용량이 필요합니다.{01ffff}",
+"2": "{0100fd}{0102fe}{01f1fe}설치 중입니다.{0100f2}{010a}\"PlayStation 2\" 본체의 전원을 ON/OFF 하지 마세요.{010a}{0101ff}×버튼{01feff}으로 설치를 중지할 수 있습니다.",
+"3": "{0100fd}{0102fe}\"PlayStation BB Unit\"에 설치가 완료되었습니다.{01ffff}",
+"4": "{0100fd}{0102fe}\"PlayStation BB Unit\"에 애플리케이션 데이터 설치를 취소했습니다.{01ffff}다시 설치할 때는{010a}{0101ff}설정,종료{01feff}→{0101ff}설치{01feff}를 선택해 주세요.{01ffff}",
+"5": "{0100fd}{0102fe}IO ERROR가 검출되었습니다. \"PlayStation BB Unit\" 부속 사용 설명서에 따라 \"PlayStation BB Unit\"을 복구해 주세요.{01ffff}",
+"6": "{0100fd}{0102fe}\"PlayStation BB Unit\"의 여유 용량이 부족합니다.{010a}애플리케이션 데이터를 설치하려면{010a}{0101ff}1,024MB 이상{01feff}의 여유 용량이 필요합니다.{01ffff}",
+"7": "{0100fd}{0102fe}\"PlayStation BB Unit\"이 포맷되어 있지 않습니다.{010a}\"PlayStation BB Unit\" 부속 사용 설명서에 따라{010a}포맷해 주세요.{01ffff}",
+"8": "{0100fd}{0102fe}\"PlayStation BB Unit\" 안에 {0101ff}프로야구 팀을 만들자! 3{01feff}의{010a}애플리케이션 데이터 파손 파일이 있습니다.{010a}이 파일에 덮어써서 설치하시겠습니까?",
+"9": "{0100fd}{0102fe}이미 \"PlayStation BB Unit\" 안에{010a}{0101ff}프로야구 팀을 만들자! 3{01feff}의{010a}애플리케이션 데이터가 설치되어 있습니다.{01ffff}설치된 데이터를 삭제할 때는{010a}\"PlayStation BB Navigator\"에서 삭제해 주세요.{01ffff}",
+"10": "{0100fd}{0102fe}\"PlayStation BB Unit\" 안에 {0101ff}프로야구 팀을 만들자! 3{01feff}의{010a}애플리케이션 데이터 파손 파일이 있습니다.{01ffff}\"PlayStation BB Unit\"에 애플리케이션 데이터를{010a}다시 설치할 때는{010a}{0101ff}설정,종료{01feff}→{0101ff}설치{01feff}를 선택해 주세요.{01ffff}"
+}
