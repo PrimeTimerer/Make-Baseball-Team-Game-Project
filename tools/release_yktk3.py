@@ -9,6 +9,8 @@ What never goes in: anything from the disc (game_data, RAM and VU1 dumps), what 
 it runs (memcards, states, logs, cheat_saves, cheat_values, player_cheats.ini, scout_cheats.ini, match_script.ini,
 staff_cheats.ini, ichinen_cheats.ini, ability_limits.ini, ichinen_skills.bin, launcher.ini, profiles), debug files
 (.pdb, .ilk) and backups (.bak*).
+The Korean patch (build/port/bin/korean, made from the disc by tools/korean/kobuild.py) is a separate download,
+YKTK3-Korean-<version>.zip, with its install notes; its texture dumps never go in.
 
 usage: py -3 tools/release_yktk3.py [version, default today's date]"""
 import datetime
@@ -74,8 +76,57 @@ PlayStation 2 판 (SEGA 2005, SLPM-65853) 의 PC 네이티브 포트입니다. �
   런처의 치트 페이지에서 켜고 끕니다.
 - 필요한 것: Windows 10/11 64비트, DirectX 11 그래픽카드, SSE4.1 CPU.
 
+한국어로 하려면
+- 같은 릴리스의 YKTK3-Korean-{version}.zip 을 받아, 그 안의 korean 폴더를 이 폴더(yktk3.exe 가 있는 곳)에 넣습니다.
+  korean 폴더를 지우거나 이름을 바꾸면 다시 일본어로 나옵니다.
+
 라이선스: GPL-3.0 (LICENSE.txt). 사용한 라이브러리: THIRD-PARTY.txt. 소스는 위 GitHub 저장소에 있습니다.
 """
+
+KOREAN_README = """프로야구 팀을 만들자! 3 PC 포트 한글 패치 {version}
+==================================================
+설치
+1. 같은 릴리스의 YKTK3-PC-{version}.zip (또는 그보다 새 버전)을 먼저 풀어 둡니다.
+2. 이 ZIP 안의 korean 폴더를 그 폴더(yktk3.exe 가 있는 곳)에 그대로 넣습니다.
+   yktk3.exe
+   korean\\DATA.CVM\\...
+   korean\\RAM_PATCH.TXT
+   korean\\textures\\replacements\\...
+3. 런처로 평소처럼 시작합니다. 메시지, 메뉴, 이름, 화면 글씨가 한국어로 나옵니다.
+
+알아 둘 것
+- 정품 디스크 이미지(SLPM-65853)가 있어야 합니다. 게임은 디스크에서 읽고, 이 패치는 그 위에 한국어를 덮습니다.
+- 한글 패치를 넣기 전에 만든 빠른 저장(F5)을 불러오면 그 안의 옛 글꼴이 다시 쓰입니다. 메모리카드 세이브('이어서')로
+  시작하세요.
+- 선수·스태프 이름은 세이브 데이터와 맞추려고 일본어 그대로 둡니다. 아직 덤프하지 못한 화면(캠프 등)의 그림 글씨도
+  일본어로 남아 있습니다.
+- 일본어로 돌아가려면 korean 폴더를 지우거나 이름을 바꿉니다.
+- 이 패치에는 게임 디스크에서 만든 데이터(글꼴, 메시지 표, 텍스처)가 들어 있습니다. 원본을 가진 사람이 개인적으로
+  쓰는 용도입니다. 게임과 그 데이터의 권리는 SEGA 에 있습니다.
+
+번역과 도구: {repo} (tools/korean)
+"""
+
+
+def korean_zip(version: str):
+    """build/release/YKTK3-Korean-<version>.zip: the korean folder (made by tools/korean/kobuild.py from the disc) without
+    its texture dumps, and the install notes. None when there is no korean folder."""
+    source = BIN / "korean"
+    if not (source / "RAM_PATCH.TXT").exists() or not (source / "DATA.CVM").is_dir():
+        return None
+    archive = RELEASE / f"YKTK3-Korean-{version}.zip"
+    if archive.exists():
+        archive.unlink()
+    count = 0
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        z.writestr("한글 패치 읽어 주세요.txt", KOREAN_README.format(version=version, repo=REPO))
+        for path in sorted(source.rglob("*")):
+            relative = path.relative_to(source)
+            if not path.is_file() or relative.parts[:2] == ("textures", "dumps") or forbidden(path):
+                continue
+            z.write(path, Path("korean") / relative)
+            count += 1
+    return archive, count
 
 
 def main():
@@ -121,6 +172,12 @@ def main():
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     files = sum(1 for p in folder.rglob("*") if p.is_file())
     print(f"{archive} ({archive.stat().st_size / 1048576:.1f} MB, {files} files)\nSHA-256 {digest}")
+    # The Korean patch is a separate download (made from the disc): never inside the release folder above.
+    korean = korean_zip(version)
+    if korean:
+        path, count = korean
+        print(f"{path} ({path.stat().st_size / 1048576:.1f} MB, {count} files)\n"
+              f"SHA-256 {hashlib.sha256(path.read_bytes()).hexdigest()}")
     return 0
 
 

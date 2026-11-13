@@ -17,9 +17,11 @@ namespace urban::korean
 {
     namespace
     {
-        // Fixed: "<address> <korean> [<japanese>]" (strings and tables of the executable, the bytes they replace).
-        // Through a pointer: "@<pointer> <magic> <offset> <korean> <japanese>": the table the game loaded at [pointer]
-        // (checked by the magic bytes it starts with); only a field that still holds the Japanese bytes is replaced.
+        // Fixed: "<address> <korean> [<japanese>]" (strings and tables of the executable). The Japanese bytes are read
+        // from memory at install (the executable is loaded by then), so the file needs only the Korean ones.
+        // Through a pointer: "@<pointer> <magic> <offset> <korean> #<fnv1a64>" (or the old "<japanese>" bytes): the table
+        // the game loaded at [pointer] (checked by the magic bytes it starts with); a field is replaced only while it
+        // still holds the Japanese bytes, recognised by their hash, and those bytes are kept for original()/japanese().
         struct Patch
         {
             bool viaPointer = false;
@@ -29,16 +31,31 @@ namespace urban::korean
             std::vector<uint8_t> korean;
             std::vector<uint8_t> japanese;
             std::vector<uint8_t> text; // japanese + NUL, for japanese()
+            bool hashed = false;       // pointer patch recognising the Japanese field by hash
+            uint64_t hash = 0;
         };
 
         struct State
         {
             std::vector<Patch> patches;
-            std::unordered_map<uint32_t, size_t> fixedAt; // fixed patch with Japanese bytes by address
+            std::unordered_map<uint32_t, size_t> fixedAt; // fixed patch by address
         };
+
+        // Japanese fields of hashed pointer patches, kept the first time each is replaced (patch index -> bytes + NUL).
+        // Entries are never changed once added, so pointers into them stay valid.
+        std::mutex g_capturedMutex;
+        std::unordered_map<size_t, std::vector<uint8_t>> g_captured;
 
         uint8_t *g_rdram = nullptr;
         std::shared_ptr<const State> g_patches;
+
+        uint64_t fnv1a64(const uint8_t *data, size_t size)
+        {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < size; ++i)
+                h = (h ^ data[i]) * 0x100000001b3ull;
+            return h;
+        }
 
         std::vector<uint8_t> hexBytes(const std::string &hex)
         {
@@ -55,6 +72,8 @@ namespace urban::korean
             std::string line;
             while (std::getline(in, line))
             {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
                 if (line.empty() || line[0] == '#')
                     continue;
                 std::vector<std::string> f;
@@ -72,8 +91,14 @@ namespace urban::korean
                     p.magic = hexBytes(f[1]);
                     p.offset = static_cast<uint32_t>(std::stoul(f[2], nullptr, 16));
                     p.korean = hexBytes(f[3]);
-                    p.japanese = hexBytes(f[4]);
-                    if (p.korean.size() != p.japanese.size() || p.korean.empty())
+                    if (!f[4].empty() && f[4][0] == '#')
+                    {
+                        p.hashed = true;
+                        p.hash = std::stoull(f[4].substr(1), nullptr, 16);
+                    }
+                    else
+                        p.japanese = hexBytes(f[4]);
+                    if (p.korean.empty() || (!p.hashed && p.korean.size() != p.japanese.size()))
                         continue;
                 }
                 else if (f.size() == 2 || f.size() == 3)
@@ -96,8 +121,6 @@ namespace urban::korean
             return out;
         }
 
-        void apply(uint8_t *rdram, const std::vector<Patch> &patches);
-
         // The target of a pointer patch now, or 0 when the table is not loaded.
         uint32_t target(const Patch &p)
         {
@@ -113,8 +136,9 @@ namespace urban::korean
         // Only where the memory differs.
         void apply(uint8_t *rdram, const std::vector<Patch> &patches)
         {
-            for (const Patch &p : patches)
+            for (size_t i = 0; i < patches.size(); ++i)
             {
+                const Patch &p = patches[i];
                 if (!p.viaPointer)
                 {
                     uint8_t *at = rdram + p.address;
@@ -123,9 +147,38 @@ namespace urban::korean
                     continue;
                 }
                 const uint32_t to = target(p);
-                if (to != 0u && std::memcmp(rdram + to, p.japanese.data(), p.japanese.size()) == 0)
-                    std::memcpy(rdram + to, p.korean.data(), p.korean.size());
+                if (to == 0u)
+                    continue;
+                uint8_t *at = rdram + to;
+                if (p.hashed)
+                {
+                    if (fnv1a64(at, p.korean.size()) != p.hash)
+                        continue;
+                    {
+                        std::lock_guard<std::mutex> lock(g_capturedMutex);
+                        if (g_captured.find(i) == g_captured.end())
+                        {
+                            std::vector<uint8_t> text(at, at + p.korean.size());
+                            text.push_back(0);
+                            g_captured.emplace(i, std::move(text));
+                        }
+                    }
+                    std::memcpy(at, p.korean.data(), p.korean.size());
+                }
+                else if (std::memcmp(at, p.japanese.data(), p.japanese.size()) == 0)
+                    std::memcpy(at, p.korean.data(), p.korean.size());
             }
+        }
+
+        // The Japanese text of pointer patch i (bytes + NUL), or nullptr while it has not been seen yet.
+        const uint8_t *pointerText(const State &state, size_t i)
+        {
+            const Patch &p = state.patches[i];
+            if (!p.hashed)
+                return p.text.data();
+            std::lock_guard<std::mutex> lock(g_capturedMutex);
+            const auto it = g_captured.find(i);
+            return it == g_captured.end() ? nullptr : it->second.data();
         }
     }
 
@@ -134,12 +187,15 @@ namespace urban::korean
         const auto state = std::atomic_load(&g_patches);
         if (!state || !g_rdram)
             return {};
-        for (const Patch &p : state->patches)
+        for (size_t i = 0; i < state->patches.size(); ++i)
+        {
+            const Patch &p = state->patches[i];
             if (p.viaPointer && target(p) == (address & 0x01FFFFFFu))
             {
-                const auto end = std::find(p.japanese.begin(), p.japanese.end(), uint8_t{0});
-                return std::string(p.japanese.begin(), end);
+                const uint8_t *text = pointerText(*state, i);
+                return text ? std::string(reinterpret_cast<const char *>(text)) : std::string();
             }
+        }
         return {};
     }
 
@@ -152,9 +208,12 @@ namespace urban::korean
         const uint32_t address = static_cast<uint32_t>(at - g_rdram);
         if (const auto it = state->fixedAt.find(address); it != state->fixedAt.end())
             return reinterpret_cast<const char *>(state->patches[it->second].text.data());
-        for (const Patch &p : state->patches)
-            if (p.viaPointer && target(p) == address)
-                return reinterpret_cast<const char *>(p.text.data());
+        for (size_t i = 0; i < state->patches.size(); ++i)
+            if (state->patches[i].viaPointer && target(state->patches[i]) == address)
+            {
+                const uint8_t *original = pointerText(*state, i);
+                return original ? reinterpret_cast<const char *>(original) : text;
+            }
         return text;
     }
 
@@ -168,14 +227,27 @@ namespace urban::korean
         state->patches = load(file);
         if (state->patches.empty())
             return;
+        // The executable is loaded and not patched yet: its own bytes are the Japanese originals of the fixed patches.
+        size_t kept = 0;
         for (size_t i = 0; i < state->patches.size(); ++i)
-            if (!state->patches[i].viaPointer && !state->patches[i].japanese.empty())
-                state->fixedAt.emplace(state->patches[i].address, i);
+        {
+            Patch &p = state->patches[i];
+            if (p.viaPointer)
+                continue;
+            if (p.japanese.empty())
+            {
+                p.japanese.assign(rdram + p.address, rdram + p.address + p.korean.size());
+                p.text = p.japanese;
+                p.text.push_back(0);
+                ++kept;
+            }
+            state->fixedAt.emplace(p.address, i);
+        }
         g_rdram = rdram;
         std::shared_ptr<const State> shared = state;
         std::atomic_store(&g_patches, shared);
-        std::cout << "[korean] " << shared->patches.size() << " names patched in memory (" << file.string() << ")"
-                  << std::endl;
+        std::cout << "[korean] " << shared->patches.size() << " names patched in memory, " << kept
+                  << " originals kept from the executable (" << file.string() << ")" << std::endl;
         // Now, before the game starts (code that copies a pointer table at boot sees the Korean one), and then every
         // frame: the executable's data comes back with every save state; the plan table is loaded later, from a package.
         apply(rdram, shared->patches);

@@ -458,8 +458,17 @@ def plan_ram_lines(plans, m, files, warnings):
             continue
         off = 0x10 + i * PLAN_RECORD
         ja = raw[tbl + off: tbl + off + PLAN_FIELD]
-        lines.append("@005cd51c %s %x %s %s" % (b"TBL1".hex(), off, (b + bytes(PLAN_FIELD - len(b))).hex(), ja.hex()))
+        # the Japanese field by its FNV-1a 64 hash only: the file carries no Japanese text (korean.cpp keeps the bytes
+        # it sees in memory)
+        lines.append("@005cd51c %s %x %s #%016x" % (b"TBL1".hex(), off, (b + bytes(PLAN_FIELD - len(b))).hex(), fnv1a64(ja)))
     return lines
+
+
+def fnv1a64(data):
+    h = 0xcbf29ce484222325
+    for c in data:
+        h = ((h ^ c) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
 
 
 def build_textures(out, work, warnings):
@@ -540,10 +549,12 @@ def main():
         end = addr + len(b)
     plan_lines = plan_ram_lines(plans, m, files, warnings)
     with open(os.path.join(out, "RAM_PATCH.TXT"), "w", encoding="ascii") as f:
-        f.write("# <address> <korean> <japanese>: name tables and strings of the executable, written over the game memory\n")
+        # Korean bytes only: the game's Japanese ones are read from memory when the port starts (korean.cpp)
+        f.write("# <address> <korean>: name tables and strings of the executable, written over the game memory\n")
         for addr, b, ja in patches:
-            f.write("%08x %s %s\n" % (addr, b.hex(), ja.hex()))
-        f.write("# @<pointer> <magic> <offset> <korean> <japanese>: the plan table the game loads ([0x5CD51C] -> TBL1)\n")
+            f.write("%08x %s\n" % (addr, b.hex()))
+        f.write("# @<pointer> <magic> <offset> <korean> #<fnv1a64 of the Japanese field>: the plan table the game loads "
+                "([0x5CD51C] -> TBL1)\n")
         for line in plan_lines:
             f.write(line + "\n")
     textures = build_textures(out, work, warnings)
