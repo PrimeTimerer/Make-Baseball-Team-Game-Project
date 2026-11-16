@@ -37,7 +37,8 @@ namespace Yktk3Launcher
             using (Stream theme = typeof(Program).Assembly.GetManifestResourceStream("Theme.xaml"))
                 app.Resources = (ResourceDictionary)XamlReader.Load(theme);
             var launcher = new Launcher(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/'));
-            int command = CommandLine.Run(launcher, args); // --diagnose, --install-korean (Setup.cs)
+            ReleaseUpdater.Cleanup(launcher.Dir); // *.old files a past update left in use (Setup.cs)
+            int command = CommandLine.Run(launcher, args); // --diagnose, --install-korean, --update (Setup.cs)
             if (command >= 0)
                 return command;
             bool play = args.Any(a => a.Equals("--play", StringComparison.OrdinalIgnoreCase));

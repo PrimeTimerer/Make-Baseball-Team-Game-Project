@@ -121,6 +121,60 @@ namespace Yktk3Launcher
 
         public UpdateInfo LastUpdate;
         public ReleaseUpdate LastRelease;
+        public TextBlock DialogText; // the message of the dialog shown last (UpdateNow writes its progress there)
+
+        // Release folders: the newest release downloaded and swapped in (Setup.cs ReleaseUpdater), then the launcher restarts.
+        // A foreground thread: closing the window does not stop it halfway through the swap.
+        public void UpdateNow()
+        {
+            Dialog("", Ui.Brush("Accent"), "업데이트하는 중", "새 버전을 확인하는 중...");
+            TextBlock text = DialogText;
+            var dispatcher = Dispatcher;
+            new System.Threading.Thread(delegate()
+            {
+                UpdateResult result = null;
+                Exception failure = null;
+                try
+                {
+                    result = ReleaseUpdater.Run(Launcher, delegate(string line)
+                    {
+                        dispatcher.BeginInvoke(new Action(delegate { text.Text = line; }));
+                    });
+                }
+                catch (Exception error)
+                {
+                    failure = error;
+                }
+                dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (failure != null)
+                        Dialog("", Ui.Brush("Bad"), "업데이트하지 못했습니다", failure.Message + "\n\n이 폴더는 그대로입니다. '업데이트 방법'대로 직접 받아도 됩니다.",
+                               new DialogAction("업데이트 방법", delegate
+                               {
+                                   Dialog("", Ui.Brush("Accent"), "새 버전 받는 법", Releases.HowToUpdate(Launcher, LastRelease), new DialogAction("닫기", null, true));
+                               }, true),
+                               new DialogAction("닫기", null));
+                    else if (result.Version == null)
+                        Dialog("", Ui.Brush("Good"), "이미 최신 버전입니다", "지금 버전: " + Releases.Version(Launcher.Dir), new DialogAction("확인", null, true));
+                    else
+                        Dialog("", Ui.Brush("Good"), "업데이트했습니다: " + result.Version,
+                               (result.Note.Length > 0 ? result.Note + "\n" : "") + "세이브와 설정은 그대로입니다. 새 런처로 다시 시작합니다.",
+                               new DialogAction("다시 시작", RestartLauncher, true));
+                }));
+            }) { IsBackground = false }.Start();
+        }
+
+        void RestartLauncher()
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(System.IO.Path.Combine(Launcher.Dir, "YKTK3 Launcher.exe")) { WorkingDirectory = Launcher.Dir });
+            }
+            catch (Exception)
+            {
+            }
+            Application.Current.Shutdown();
+        }
 
         // Release folders: GitHub once a day (now: from the tools page). The home page and the badge show a newer one.
         public void CheckRelease(bool now, Action done)
@@ -337,7 +391,8 @@ namespace Yktk3Launcher
             titleText.VerticalAlignment = VerticalAlignment.Center;
             head.Children.Add(titleText);
             stack.Children.Add(head);
-            stack.Children.Add(Ui.Text(message, "Body"));
+            DialogText = Ui.Text(message, "Body");
+            stack.Children.Add(DialogText);
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 22, 0, 0) };
             foreach (DialogAction action in actions)
             {

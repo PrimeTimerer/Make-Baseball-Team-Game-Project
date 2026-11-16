@@ -158,6 +158,8 @@ namespace Yktk3Launcher
                     updateStack.Children.Add(Ui.Text("확인하지 못했습니다: " + latest.Error, "Caption"));
                 else if (latest != null)
                     updateStack.Children.Add(latest.Newer ? Ui.Chip("", "새 버전 " + latest.Latest, Ui.Brush("Accent")) : Ui.Chip("", "최신입니다", Ui.Brush("Good")));
+                if (latest != null && latest.Newer)
+                    updateStack.Children.Add(Ui.Row(Ui.Button("지금 업데이트", delegate { Window.UpdateNow(); }, "AccentButton", null, new Thickness(0, 12, 0, 0))));
                 string page = latest != null && latest.Page != null ? latest.Page : Releases.Page;
                 updateStack.Children.Add(Ui.Row(
                     Ui.Button("업데이트 확인", delegate

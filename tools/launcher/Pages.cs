@@ -72,7 +72,7 @@ namespace Yktk3Launcher
             var title = Ui.Text("새 버전 " + info.Latest + "이 나왔습니다", "Body");
             title.FontWeight = FontWeights.SemiBold;
             text.Children.Add(title);
-            text.Children.Add(Ui.Text("지금 버전 " + info.Local + ". 새 ZIP을 이 폴더에 덮어 풀면 됩니다: 세이브와 설정은 그대로 남습니다.", "Caption"));
+            text.Children.Add(Ui.Text("지금 버전 " + info.Local + ". '지금 업데이트'를 누르면 새 버전을 받아 바꿉니다. 세이브와 설정은 그대로 남습니다.", "Caption"));
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             grid.ColumnDefinitions.Add(new ColumnDefinition());
@@ -82,12 +82,12 @@ namespace Yktk3Launcher
             grid.Children.Add(icon);
             Grid.SetColumn(text, 1);
             grid.Children.Add(text);
-            var buttons = Ui.Row(Ui.Button("업데이트 방법", delegate
+            var buttons = Ui.Row(Ui.Button("지금 업데이트", delegate { Window.UpdateNow(); }, "AccentButton"), Ui.Button("업데이트 방법", delegate
             {
                 Window.Dialog("", Ui.Brush("Accent"), "새 버전 " + info.Latest + " 받는 법", Releases.HowToUpdate(Launcher, info),
                               new DialogAction("다운로드 페이지", delegate { OpenPage(info.Page ?? Releases.Page); }, true),
                               new DialogAction("닫기", null));
-            }, "AccentButton"), Ui.Button("다운로드 페이지", delegate { OpenPage(info.Page ?? Releases.Page); }, null, null, new Thickness(8, 0, 0, 0)));
+            }, null, null, new Thickness(8, 0, 0, 0)), Ui.Button("다운로드 페이지", delegate { OpenPage(info.Page ?? Releases.Page); }, null, null, new Thickness(8, 0, 0, 0)));
             buttons.Margin = new Thickness(16, 0, 0, 0);
             Grid.SetColumn(buttons, 2);
             grid.Children.Add(buttons);
