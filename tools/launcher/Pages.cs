@@ -49,13 +49,120 @@ namespace Yktk3Launcher
             PcInfo pc = PcInfo.Read();
             var stack = new StackPanel { Margin = new Thickness(16, 8, 16, 24) };
             stack.Children.Add(Hero(disc));
+            FrameworkElement update = UpdateBanner();
+            if (update != null)
+                stack.Children.Add(update);
             FrameworkElement banner = RecommendationBanner(pc);
             if (banner != null)
                 stack.Children.Add(banner);
             Border discCard = DiscCard(disc), record = RecordCard(), pcCard = PcCard(pc);
             discCard.Margin = record.Margin = new Thickness(0, 0, 16, 16);
             stack.Children.Add(Ui.Columns(3, discCard, record, pcCard));
+            stack.Children.Add(KoreanCard());
             return new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        }
+
+        // A newer release on GitHub (release folders only: checked once a day by the main window).
+        FrameworkElement UpdateBanner()
+        {
+            ReleaseUpdate info = Window.LastRelease;
+            if (info == null || !info.Newer)
+                return null;
+            var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            var title = Ui.Text("새 버전 " + info.Latest + "이 나왔습니다", "Body");
+            title.FontWeight = FontWeights.SemiBold;
+            text.Children.Add(title);
+            text.Children.Add(Ui.Text("지금 버전 " + info.Local + ". 새 ZIP을 이 폴더에 덮어 풀면 됩니다: 세이브와 설정은 그대로 남습니다.", "Caption"));
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition());
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var icon = Ui.Icon("", 22, Ui.Brush("Accent"));
+            icon.Margin = new Thickness(0, 0, 16, 0);
+            grid.Children.Add(icon);
+            Grid.SetColumn(text, 1);
+            grid.Children.Add(text);
+            var buttons = Ui.Row(Ui.Button("업데이트 방법", delegate
+            {
+                Window.Dialog("", Ui.Brush("Accent"), "새 버전 " + info.Latest + " 받는 법", Releases.HowToUpdate(Launcher, info),
+                              new DialogAction("다운로드 페이지", delegate { OpenPage(info.Page ?? Releases.Page); }, true),
+                              new DialogAction("닫기", null));
+            }, "AccentButton"), Ui.Button("다운로드 페이지", delegate { OpenPage(info.Page ?? Releases.Page); }, null, null, new Thickness(8, 0, 0, 0)));
+            buttons.Margin = new Thickness(16, 0, 0, 0);
+            Grid.SetColumn(buttons, 2);
+            grid.Children.Add(buttons);
+            var card = new Border { Style = Ui.Style("Card"), BorderBrush = Ui.Brush("Accent"), Child = grid };
+            card.Margin = new Thickness(0, 0, 0, 16);
+            return card;
+        }
+
+        static void OpenPage(string url)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(url);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        // The Korean patch: installed from a downloaded YKTK3-Korean ZIP, switched on and off.
+        Border KoreanCard()
+        {
+            bool on = KoreanPatch.On(Launcher), off = KoreanPatch.Off(Launcher);
+            string version = KoreanPatch.Version(Launcher);
+            string zip = KoreanPatch.FindZip(Launcher);
+            string zipVersion = zip != null ? KoreanPatch.ZipVersion(zip) : null;
+            bool zipIsNew = zip != null && (!on && !off || version == null || (zipVersion != null && string.CompareOrdinal(zipVersion, version) > 0));
+            var status = on ? Ui.Chip("", "한국어" + (version != null ? " · " + version : ""), Ui.Brush("Good"))
+                       : off ? Ui.Chip("", "꺼짐 (일본어로 나옴)", Ui.Brush("Warn")) : Ui.Chip("", "설치 안 됨", Ui.Brush("Warn"));
+            status.HorizontalAlignment = HorizontalAlignment.Left;
+            var note = Ui.Text(on ? "메시지, 메뉴, 이름, 화면 글씨가 한국어로 나옵니다. 끄면 일본어로 돌아갑니다."
+                             : off ? "한글 패치가 꺼져 있어 일본어로 나옵니다."
+                             : "같은 릴리스의 YKTK3-Korean ZIP을 받아 두면 여기서 바로 설치합니다 (다운로드 폴더, 바탕화면, 이 폴더에서 찾음).", "Caption");
+            note.Margin = new Thickness(0, 6, 0, 12);
+            var buttons = new WrapPanel();
+            Action<string> install = delegate(string file)
+            {
+                try
+                {
+                    KoreanPatch.Install(Launcher, file);
+                    Window.Toast("한글 패치를 설치했습니다" + (KoreanPatch.ZipVersion(file) != null ? ": " + KoreanPatch.ZipVersion(file) : ""));
+                }
+                catch (Exception error)
+                {
+                    Window.Error("한글 패치를 설치하지 못했습니다", error);
+                }
+                Window.Refresh();
+            };
+            if (zipIsNew)
+                buttons.Children.Add(Ui.Button((on || off ? "새 한글 패치로 바꾸기" : "한글 패치 설치") + (zipVersion != null ? " (" + zipVersion + ")" : ""),
+                                               delegate { install(zip); }, "AccentButton", "", new Thickness(0, 0, 8, 0)));
+            buttons.Children.Add(Ui.Button("ZIP 고르기", delegate
+            {
+                var dialog = new Microsoft.Win32.OpenFileDialog { Title = "YKTK3 한글 패치 ZIP", Filter = "한글 패치 (YKTK3-Korean-*.zip)|YKTK3-Korean-*.zip|ZIP (*.zip)|*.zip" };
+                if (dialog.ShowDialog(Window) == true)
+                    install(dialog.FileName);
+            }, null, "", new Thickness(0, 0, 8, 0)));
+            if (on || off)
+                buttons.Children.Add(Ui.Button(on ? "일본어로 하기" : "한국어로 하기", delegate
+                {
+                    try
+                    {
+                        KoreanPatch.Switch(Launcher, !on);
+                        Window.Toast(on ? "한글 패치를 껐습니다 (일본어)" : "한글 패치를 켰습니다");
+                    }
+                    catch (Exception error)
+                    {
+                        Window.Error("바꾸지 못했습니다 (게임이 실행 중이면 끈 뒤에 해 주세요)", error);
+                    }
+                    Window.Refresh();
+                }, null, "", new Thickness(0, 0, 8, 0)));
+            buttons.Children.Add(Ui.Button("받는 곳", delegate { OpenPage(Releases.Page); }, null, ""));
+            var card = Ui.Card("한글 패치", status, note, buttons);
+            card.Margin = new Thickness(0, 0, 0, 16);
+            return card;
         }
 
         FrameworkElement Hero(string disc)
@@ -258,9 +365,14 @@ namespace Yktk3Launcher
             string setting = Launcher.Config("Game", "Iso", "");
             var name = Ui.Text(disc != null ? System.IO.Path.GetFileName(disc) : "디스크 이미지가 없습니다", "Body");
             name.FontWeight = FontWeights.SemiBold;
-            var where = Ui.Text(disc != null ? (setting.Length == 0 ? "game 폴더에서 자동으로 찾음 · " : "") + System.IO.Path.GetDirectoryName(disc) : "game 폴더에 .iso를 넣거나 직접 고르세요.", "Caption");
+            var where = Ui.Text(disc != null ? (setting.Length == 0 ? "game 폴더에서 자동으로 찾음 · " : "") + System.IO.Path.GetDirectoryName(disc)
+                                : searching ? "이 PC에서 찾는 중... " + searchStatus
+                                : "'PC에서 찾기'를 누르거나, 이 폴더나 game 폴더에 .iso를 넣거나, 직접 고르세요.", "Caption");
             where.Margin = new Thickness(0, 2, 0, 14);
+            where.TextTrimming = TextTrimming.CharacterEllipsis;
             var buttons = new WrapPanel();
+            if (disc == null && !searching)
+                buttons.Children.Add(Ui.Button("PC에서 찾기", SearchDisc, "AccentButton", "", new Thickness(0, 0, 8, 0)));
             buttons.Children.Add(Ui.Button("고르기", delegate
             {
                 var dialog = new Microsoft.Win32.OpenFileDialog { Title = "SLPM-65853 디스크 이미지", Filter = "디스크 이미지 (*.iso)|*.iso|모든 파일 (*.*)|*.*" };
@@ -272,6 +384,7 @@ namespace Yktk3Launcher
                     return;
                 }
                 Launcher.SetConfig("Game", "Iso", dialog.FileName);
+                DiscSearch.Remember(dialog.FileName);
                 Window.Refresh();
             }, null, "", new Thickness(0, 0, 8, 0)));
             if (setting.Length > 0)
@@ -281,6 +394,42 @@ namespace Yktk3Launcher
                     Window.Refresh();
                 }, null, ""));
             return Ui.Card("디스크", status, name, where, buttons);
+        }
+
+        bool searching;
+        string searchStatus = "";
+
+        // The desktop, downloads, documents and every fixed drive, two folders deep (DiscSearch), on a background thread.
+        void SearchDisc()
+        {
+            searching = true;
+            Window.Refresh();
+            var dispatcher = Window.Dispatcher;
+            int folders = 0;
+            new System.Threading.Thread(delegate()
+            {
+                string found = DiscSearch.Search(delegate(string folder)
+                {
+                    if (++folders % 200 == 0)
+                        dispatcher.BeginInvoke(new Action(delegate { searchStatus = folder; }));
+                });
+                dispatcher.BeginInvoke(new Action(delegate
+                {
+                    searching = false;
+                    searchStatus = "";
+                    if (found != null)
+                    {
+                        Launcher.SetConfig("Game", "Iso", found);
+                        DiscSearch.Remember(found);
+                        Window.Toast("디스크 이미지를 찾았습니다: " + System.IO.Path.GetFileName(found));
+                    }
+                    else
+                        Window.Dialog("", Ui.Brush("Warn"), "디스크 이미지를 찾지 못했습니다",
+                                      "바탕화면, 다운로드, 문서와 각 드라이브의 두 단계 아래 폴더까지 찾아봤습니다.\n본인 SLPM-65853 디스크로 만든 .iso를 이 폴더나 game 폴더에 넣거나, '고르기'로 직접 골라 주세요.",
+                                      new DialogAction("확인", null, true));
+                    Window.Refresh();
+                }));
+            }) { IsBackground = true }.Start();
         }
 
         Border RecordCard()

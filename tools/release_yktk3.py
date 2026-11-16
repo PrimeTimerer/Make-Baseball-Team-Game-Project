@@ -3,8 +3,9 @@
 What goes in (one folder; the launcher finds yktk3.exe next to it):
   YKTK3 Launcher.exe, yktk3.exe and every DLL next to it, PCSX2's GS resources and shader cache,
   cheats_native.txt (the cheats compiled into yktk3.exe), player_cheat_items.txt, the mods folder (.pnach cheats,
-  their notes), a config.ini with no disc path and no cheat switched on, the default controls.ini,
-  README.txt, LICENSE.txt, THIRD-PARTY.txt.
+  their notes), config.default.ini (no disc path, no cheat switched on) and controls.default.ini (the first run makes
+  config.ini / controls.ini from them, so a new version unpacked over the folder keeps the player's own), VERSION.txt
+  (the launcher compares it with the newest release on GitHub), README.txt, LICENSE.txt, THIRD-PARTY.txt.
 What never goes in: anything from the disc (game_data, RAM and VU1 dumps), what the game or the launcher writes while
 it runs (memcards, states, logs, cheat_saves, cheat_values, player_cheats.ini, scout_cheats.ini, match_script.ini,
 staff_cheats.ini, ichinen_cheats.ini, ability_limits.ini, ichinen_skills.bin, launcher.ini, profiles), debug files
@@ -26,12 +27,13 @@ BIN = ROOT / "build" / "port" / "bin"
 RELEASE = ROOT / "build" / "release"
 REPO = "https://github.com/PrimeTimerer/Make-Baseball-Team-Game-Project"
 
-FILES = ["yktk3.exe", "YKTK3 Launcher.exe", "cheats_native.txt", "player_cheat_items.txt", "controls.ini"]
+FILES = ["yktk3.exe", "YKTK3 Launcher.exe", "cheats_native.txt", "player_cheat_items.txt"]
 FOLDERS = ["resources", "shadercache_pcsx2", "mods"]
 # Never, wherever they are (checked again on the finished folder).
 FORBIDDEN_NAMES = {"memcards", "states", "logs", "game_data", "cheat_saves", "cheat_values", "player_cheats.ini",
                    "scout_cheats.ini", "match_script.ini", "staff_cheats.ini", "ichinen_cheats.ini", "ability_limits.ini",
-                   "ichinen_skills.bin", "stadium_cheats.ini", "launcher.ini", "scout_models.tsv", "SLPM_658.53"}
+                   "ichinen_skills.bin", "stadium_cheats.ini", "launcher.ini", "scout_models.tsv", "SLPM_658.53",
+                   "config.ini", "controls.ini", "korean", "korean.off", "korean.new", "diagnose.txt"}
 FORBIDDEN_SUFFIXES = {".pdb", ".ilk", ".iso", ".ps2", ".state", ".ram", ".exp", ".lib"}
 FORBIDDEN_PATTERNS = [re.compile(p, re.I) for p in (r"\.bak", r"^ram_.*\.bin$", r"^vu1.*\.bin$", r"^perfil_", r"^perf-")]
 
@@ -59,10 +61,20 @@ PlayStation 2 판 (SEGA 2005, SLPM-65853) 의 PC 네이티브 포트입니다. �
 소스: {repo}
 
 시작하기
-1. "YKTK3 Launcher.exe" 를 엽니다.
-2. 직접 가지고 있는 정품 디스크로 만든 이미지(.iso, SLPM-65853)를 고릅니다. 디스크 이미지는 들어 있지 않습니다.
+1. 이 ZIP을 원하는 곳에 풀고 "YKTK3 Launcher.exe" 를 엽니다.
+2. 디스크 이미지: 직접 가지고 있는 정품 디스크로 만든 이미지(.iso, SLPM-65853)가 필요합니다(들어 있지 않음).
+   - 이 폴더나 그 안의 game 폴더에 넣어 두면 자동으로 찾습니다.
+   - 다른 곳에 있으면 홈의 'PC에서 찾기'(바탕화면·다운로드·문서·각 드라이브를 찾음)나 '고르기'를 누릅니다.
+   - 한 번 찾은 위치는 이 PC에 기록되어, 새 버전을 다른 폴더에 풀어도 바로 찾습니다.
    yktk3.exe 는 실행할 때 디스크의 실행 파일(SLPM_658.53)을 SHA-256 으로 대조해 정품 디스크에서만 동작합니다.
 3. 플레이를 누릅니다. 화면·컨트롤러·메모리카드·치트는 런처에서 정합니다.
+   처음 실행할 때 config.default.ini / controls.default.ini 로 설정 파일(config.ini, controls.ini)을 만듭니다.
+
+업데이트
+- 런처가 하루 한 번 GitHub 의 새 버전을 확인해 홈에 알려 줍니다(도구 > 업데이트 확인).
+- 새 YKTK3-PC-<버전>.zip 을 받아 게임과 런처를 끈 뒤, ZIP 안의 폴더 내용을 이 폴더에 그대로 덮어쓰면 됩니다.
+  세이브(memcards), 빠른 저장(states), 설정(config.ini, controls.ini), 세이브별 치트 설정(cheat_saves)은 ZIP에 없어서
+  그대로 남습니다.
 
 알아 둘 것
 - yktk3.exe 에는 게임의 실행 코드(SEGA)를 C++ 로 변환한 코드가 들어 있습니다. 게임과 그 안의 모든 데이터·코드의 권리는
@@ -77,8 +89,9 @@ PlayStation 2 판 (SEGA 2005, SLPM-65853) 의 PC 네이티브 포트입니다. �
 - 필요한 것: Windows 10/11 64비트, DirectX 11 그래픽카드, SSE4.1 CPU.
 
 한국어로 하려면
-- 같은 릴리스의 YKTK3-Korean-{version}.zip 을 받아, 그 안의 korean 폴더를 이 폴더(yktk3.exe 가 있는 곳)에 넣습니다.
-  korean 폴더를 지우거나 이름을 바꾸면 다시 일본어로 나옵니다.
+- 같은 릴리스의 YKTK3-Korean-{version}.zip 을 받아 두고(다운로드 폴더나 바탕화면), 런처 홈의 '한글 패치'에서
+  '한글 패치 설치'를 누릅니다. 직접 하려면 ZIP 안의 korean 폴더를 이 폴더(yktk3.exe 가 있는 곳)에 넣습니다.
+- 같은 곳에서 '일본어로 하기' / '한국어로 하기'로 바꿀 수 있습니다. 새 한글 패치가 나오면 같은 방법으로 바꿉니다.
 
 라이선스: GPL-3.0 (LICENSE.txt). 사용한 라이브러리: THIRD-PARTY.txt. 소스는 위 GitHub 저장소에 있습니다.
 """
@@ -87,7 +100,8 @@ KOREAN_README = """프로야구 팀을 만들자! 3 PC 포트 한글 패치 {ver
 ==================================================
 설치
 1. 같은 릴리스의 YKTK3-PC-{version}.zip (또는 그보다 새 버전)을 먼저 풀어 둡니다.
-2. 이 ZIP 안의 korean 폴더를 그 폴더(yktk3.exe 가 있는 곳)에 그대로 넣습니다.
+2. 런처 홈의 '한글 패치'에서 '한글 패치 설치'를 누릅니다(이 ZIP을 다운로드 폴더, 바탕화면, 게임 폴더에서 찾음).
+   직접 하려면 이 ZIP 안의 korean 폴더를 그 폴더(yktk3.exe 가 있는 곳)에 그대로 넣습니다.
    yktk3.exe
    korean\\DATA.CVM\\...
    korean\\RAM_PATCH.TXT
@@ -100,7 +114,7 @@ KOREAN_README = """프로야구 팀을 만들자! 3 PC 포트 한글 패치 {ver
   시작하세요.
 - 선수·스태프 이름은 세이브 데이터와 맞추려고 일본어 그대로 둡니다. 아직 덤프하지 못한 화면(캠프 등)의 그림 글씨도
   일본어로 남아 있습니다.
-- 일본어로 돌아가려면 korean 폴더를 지우거나 이름을 바꿉니다.
+- 일본어로 돌아가려면 런처의 '일본어로 하기'를 누릅니다(korean 폴더 이름이 korean.off 로 바뀝니다).
 - 이 패치에는 게임 디스크에서 만든 데이터(글꼴, 메시지 표, 텍스처)가 들어 있습니다. 원본을 가진 사람이 개인적으로
   쓰는 용도입니다. 게임과 그 데이터의 권리는 SEGA 에 있습니다.
 
@@ -120,9 +134,10 @@ def korean_zip(version: str):
     count = 0
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         z.writestr("한글 패치 읽어 주세요.txt", KOREAN_README.format(version=version, repo=REPO))
+        z.writestr("korean/VERSION.txt", version + "\n")  # the launcher shows it and offers a newer ZIP
         for path in sorted(source.rglob("*")):
             relative = path.relative_to(source)
-            if not path.is_file() or relative.parts[:2] == ("textures", "dumps") or forbidden(path):
+            if not path.is_file() or relative.parts[:2] == ("textures", "dumps") or relative.name == "VERSION.txt" or forbidden(path):
                 continue
             z.write(path, Path("korean") / relative)
             count += 1
@@ -149,9 +164,13 @@ def main():
         source = BIN / sub
         if source.is_dir():
             shutil.copytree(source, folder / sub, ignore=lambda d, names: [n for n in names if forbidden(Path(d) / n)])
+    # Settings as defaults only: unpacking a new version over the folder never replaces the player's config.ini/controls.ini.
     config = BIN / "config.ini"
     if config.exists():
-        (folder / "config.ini").write_text(clean_config(config.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
+        (folder / "config.default.ini").write_text(clean_config(config.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
+    if (BIN / "controls.ini").exists():
+        shutil.copy2(BIN / "controls.ini", folder / "controls.default.ini")
+    (folder / "VERSION.txt").write_text(version + "\n", encoding="utf-8")
     (folder / "README.txt").write_text(README.format(version=version, repo=REPO), encoding="utf-8")
     shutil.copy2(ROOT / "LICENSE", folder / "LICENSE.txt")
     third = ROOT / "thirdparty" / "README.md"

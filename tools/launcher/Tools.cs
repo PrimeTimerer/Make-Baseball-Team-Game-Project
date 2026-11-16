@@ -129,7 +129,7 @@ namespace Yktk3Launcher
     public class ToolsPage : PageBase
     {
         UpdateInfo update;
-        bool checking;
+        bool checking, releaseChecking;
 
         public ToolsPage(MainWindow window) : base(window)
         {
@@ -144,8 +144,40 @@ namespace Yktk3Launcher
         {
             string root = Updater.RepoRoot(Launcher.Dir);
             var updateStack = new StackPanel();
-            if (root == null)
+            string release = root == null ? Releases.Version(Launcher.Dir) : null;
+            if (root == null && release == null)
                 updateStack.Children.Add(Ui.Text("이 폴더는 git으로 받은 저장소 안에 있지 않아 자동 업데이트를 할 수 없습니다. GitHub에서 새 버전을 받아 다시 빌드하세요.", "Caption"));
+            else if (root == null)
+            {
+                // a release folder: GitHub releases, and how to update by unpacking the new ZIP over this folder
+                updateStack.Children.Add(Ui.Text("지금 버전: " + release + " (배포판)", "Body"));
+                ReleaseUpdate latest = Window.LastRelease;
+                if (releaseChecking)
+                    updateStack.Children.Add(Ui.Text("확인하는 중...", "Caption"));
+                else if (latest != null && latest.Error != null)
+                    updateStack.Children.Add(Ui.Text("확인하지 못했습니다: " + latest.Error, "Caption"));
+                else if (latest != null)
+                    updateStack.Children.Add(latest.Newer ? Ui.Chip("", "새 버전 " + latest.Latest, Ui.Brush("Accent")) : Ui.Chip("", "최신입니다", Ui.Brush("Good")));
+                string page = latest != null && latest.Page != null ? latest.Page : Releases.Page;
+                updateStack.Children.Add(Ui.Row(
+                    Ui.Button("업데이트 확인", delegate
+                    {
+                        releaseChecking = true;
+                        Window.Refresh();
+                        Window.CheckRelease(true, delegate
+                        {
+                            releaseChecking = false;
+                            Window.Refresh();
+                        });
+                    }, null, "", new Thickness(0, 12, 8, 0)),
+                    Ui.Button("업데이트 방법", delegate
+                    {
+                        Window.Dialog("", Ui.Brush("Accent"), "새 버전 받는 법", Releases.HowToUpdate(Launcher, Window.LastRelease),
+                                      new DialogAction("다운로드 페이지", delegate { Process.Start(page); }, true),
+                                      new DialogAction("닫기", null));
+                    }, null, "", new Thickness(0, 12, 8, 0)),
+                    Ui.Button("다운로드 페이지", delegate { Process.Start(page); }, null, "", new Thickness(0, 12, 0, 0))));
+            }
             else
             {
                 string local = Updater.LocalCommit(root);
@@ -518,7 +550,7 @@ namespace Yktk3Launcher
             return null;
         }
 
-        static string Get(string url)
+        public static string Get(string url)
         {
             ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
             using (var web = new WebClient())

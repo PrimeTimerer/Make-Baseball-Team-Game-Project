@@ -115,9 +115,55 @@ namespace Yktk3Launcher
                     LastUpdate = info;
                     ShowUpdateBadge(info);
                 });
+            else if (Releases.Version(launcher.Dir) != null)
+                CheckRelease(false, null);
         }
 
         public UpdateInfo LastUpdate;
+        public ReleaseUpdate LastRelease;
+
+        // Release folders: GitHub once a day (now: from the tools page). The home page and the badge show a newer one.
+        public void CheckRelease(bool now, Action done)
+        {
+            string today = DateTime.Now.ToString("yyyy-MM-dd");
+            if (!now && Launcher.State("ReleaseChecked", "") == today)
+            {
+                string latest = Launcher.State("ReleaseLatest", ""), page = Launcher.State("ReleasePage", "");
+                if (latest.Length > 0)
+                {
+                    LastRelease = new ReleaseUpdate { Local = Releases.Version(Launcher.Dir), Latest = latest, Page = page.Length > 0 ? page : null };
+                    ShowReleaseBadge();
+                }
+                return;
+            }
+            var dispatcher = Dispatcher;
+            new System.Threading.Thread(delegate()
+            {
+                ReleaseUpdate info = Releases.Check(Launcher.Dir);
+                dispatcher.BeginInvoke(new Action(delegate
+                {
+                    LastRelease = info;
+                    if (info.Error == null)
+                    {
+                        Launcher.SetState("ReleaseChecked", today);
+                        Launcher.SetState("ReleaseLatest", info.Latest ?? "");
+                        Launcher.SetState("ReleasePage", info.Page ?? "");
+                    }
+                    ShowReleaseBadge();
+                    if (done != null)
+                        done();
+                    else if (info.Newer)
+                        Refresh();
+                }));
+            }) { IsBackground = true }.Start();
+        }
+
+        void ShowReleaseBadge()
+        {
+            bool newer = LastRelease != null && LastRelease.Newer;
+            UpdateBadge.Text = newer ? "↑ 새 버전 " + LastRelease.Latest : "";
+            UpdateBadge.Visibility = newer ? Visibility.Visible : Visibility.Collapsed;
+        }
 
         public void ShowUpdateBadge(UpdateInfo info)
         {

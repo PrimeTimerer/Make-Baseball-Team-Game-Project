@@ -1242,6 +1242,16 @@ int main(int argc, char *argv[])
     const std::filesystem::path userDir = userDirectory(exeDir);
     if (userDir != exeDir)
         setDefaultEnv("PS2X_DATA_DIR", userDir.string()); // the PCSX2 GS's shader cache and HD textures (gs_pcsx2_backend.cpp)
+    // A release carries its settings as config.default.ini / controls.default.ini (unpacking a new version over the
+    // folder must not replace the player's own): the first run makes config.ini / controls.ini from them.
+    for (const char *name : {"config", "controls"})
+    {
+        std::error_code error;
+        const std::filesystem::path own = userDir / (std::string(name) + ".ini");
+        const std::filesystem::path defaults = exeDir / (std::string(name) + ".default.ini");
+        if (!std::filesystem::exists(own, error) && std::filesystem::is_regular_file(defaults, error))
+            std::filesystem::copy_file(defaults, own, error);
+    }
     loadControlsFile(userDir); // controls.ini, PCSX2 format (converted from the controls.ini/controles.ini of older versions)
     loadConfigFile(userDir / "config.ini");
     // Korean translation: files in <user folder>\korean\DATA.CVM\... replace the disc's files inside DATA.CVM (fonts,

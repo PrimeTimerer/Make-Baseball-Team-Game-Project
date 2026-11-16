@@ -37,6 +37,9 @@ namespace Yktk3Launcher
             using (Stream theme = typeof(Program).Assembly.GetManifestResourceStream("Theme.xaml"))
                 app.Resources = (ResourceDictionary)XamlReader.Load(theme);
             var launcher = new Launcher(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/'));
+            int command = CommandLine.Run(launcher, args); // --diagnose, --install-korean (Setup.cs)
+            if (command >= 0)
+                return command;
             bool play = args.Any(a => a.Equals("--play", StringComparison.OrdinalIgnoreCase));
             MainWindow window = null;
             Func<MainWindow> showWindow = delegate
@@ -81,6 +84,34 @@ namespace Yktk3Launcher
             Dir = dir;
             Game.WriteDefaultSettings(dir);
             Runner = new GameRunner(this);
+            UseRememberedDisc();
+        }
+
+        // A release unpacked anywhere on this PC: without a disc of its own, it takes the one another copy of the launcher
+        // found (yktk3.exe reads it from config.ini). A disc it has is recorded for the others.
+        void UseRememberedDisc()
+        {
+            try
+            {
+                string own = Config("Game", "Iso", "");
+                if (own.Length > 0 && File.Exists(own))
+                {
+                    DiscSearch.Remember(own);
+                    return;
+                }
+                string found = Disc.Find(Dir);
+                if (found != null)
+                {
+                    DiscSearch.Remember(found);
+                    return;
+                }
+                string remembered = DiscSearch.Remembered();
+                if (remembered != null && File.Exists(ConfigPath))
+                    SetConfig("Game", "Iso", remembered);
+            }
+            catch (Exception)
+            {
+            }
         }
 
         public string ConfigPath { get { return Path.Combine(Dir, "config.ini"); } }
@@ -332,6 +363,21 @@ namespace Yktk3Launcher
         // missing ones and exits). userDir: where to write them (URBAN_USER_DIR), null = the game's folder.
         public static void WriteDefaultSettings(string dir, string userDir = null)
         {
+            // A release carries its settings as config.default.ini / controls.default.ini, so unpacking a new version over
+            // the folder never replaces the player's own: the first run makes them from these.
+            if (userDir == null)
+                foreach (string name in new[] { "config", "controls" })
+                {
+                    string own = Path.Combine(dir, name + ".ini"), defaults = Path.Combine(dir, name + ".default.ini");
+                    try
+                    {
+                        if (!File.Exists(own) && File.Exists(defaults))
+                            File.Copy(defaults, own);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
             if (userDir == null && File.Exists(Path.Combine(dir, "config.ini")) && File.Exists(Path.Combine(dir, "controls.ini")))
                 return;
             if (!File.Exists(Path.Combine(dir, Exe)))
